@@ -86,7 +86,7 @@ from caster_ui import (
 )
 
 APP_TITLE = "Caster"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 #: How long each discovery protocol listens for replies. SSDP and mDNS
 #: answer over a few seconds rather than at once, so this is the floor on
