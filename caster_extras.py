@@ -1,20 +1,23 @@
-"""Caster extras: UPnP/DLNA renderer control and screen/app-window
-capture sources. Kept free of caster imports to avoid a cycle;
-caster imports THIS module."""
+"""Caster extras: UPnP/DLNA renderer control, local file serving, and
+low-latency screen / app-window / system-audio capture sources.
+
+Kept free of caster imports to avoid a cycle; caster imports THIS module.
+"""
 
 from __future__ import annotations
 
 import functools
 import http.server
+import io
 import os
+import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
-import tempfile
 import threading
 import time
-import traceback
 import urllib.parse
 import urllib.request as _urlreq
 
@@ -48,33 +51,6 @@ def _no_window_kwargs() -> dict:
                 "creationflags": (subprocess.CREATE_NO_WINDOW
                                   | subprocess.CREATE_BREAKAWAY_FROM_JOB)}
     return {}
-
-
-# Mirrored minimal HLS server (same wire format as caster.HlsRelay):
-# CORS headers, correct MIME types, HTTP/1.1 keep-alive.
-
-class ScreenHlsHandler(http.server.SimpleHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    _TYPES = {
-        ".m3u8": "application/vnd.apple.mpegurl",
-        ".ts": "video/mp2t",
-        ".m4s": "video/iso.segment",
-    }
-
-    def guess_type(self, path):
-        import os as _os
-        return self._TYPES.get(_os.path.splitext(path)[1].lower(),
-                               "application/octet-stream")
-
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def log_message(self, format, *args):
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -355,147 +331,685 @@ class FileServer:
 
 
 # ---------------------------------------------------------------------------
-# Screen / app-window casting: ddagrab (desktop duplication) + WASAPI loopback
-# piped into ffmpeg for HLS output served to the chosen receiver.
+# Live system-audio tap: one WASAPI loopback capture, many live consumers
 # ---------------------------------------------------------------------------
 
-class ScreenSource:
-    """Captures this PC's screen (or one app window) plus system audio and
-    serves it as HLS via the same HlsRelay infrastructure.
+class AudioTap:
+    """WASAPI loopback capture of everything this PC is playing.
 
-    Video: ddagrab captures the desktop; a window is isolated by cropping
-    to the window rectangle. Hardware H.264 encodes it.
-    Audio: WASAPI loopback (pyaudiowpatch) written to a temp WAV that
-    ffmpeg mixes in.
+    One capture thread feeds any number of subscribers. Each subscriber gets a
+    bounded queue, and when a consumer falls behind the oldest audio is dropped
+    rather than queued. Latency is the whole point of casting a live screen, so
+    a slow consumer is allowed to lose audio but never to accumulate delay.
     """
 
-    def __init__(self, hwnd: int = 0) -> None:
-        self.hwnd = hwnd
-        self._proc = None
-        self._wav_path = None
-        self._wav_stop = None
-        self.relay = None
-        self.hls_url = ""
-        self.rect = None
-        if hwnd:
-            self.rect = _window_rect(hwnd)
+    #: Capture period. Short enough to be inaudible as delay, long enough that
+    #: the Python loop is not the bottleneck.
+    PERIOD = 0.02
+    #: ~400 ms of slack per subscriber before the oldest audio is dropped.
+    QUEUE_CHUNKS = 20
+
+    def __init__(self) -> None:
+        self.rate = 48000
+        self.channels = 2
+        self._subs: list = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._ready = threading.Event()
+        self._error = None
 
     def start(self) -> None:
-        # 1. System-audio loopback -> temp WAV file.
-        self._wav_path = os.path.join(
-            tempfile.mkdtemp(prefix="caster_scr_"), "loop.wav")
-        self._wav_stop = threading.Event()
-        threading.Thread(target=self._capture_audio, daemon=True).start()
-        time.sleep(1.0)  # let the WAV get some data
-        # 2. HLS server (self-contained: no trailing-edge trimming needed
-        # for a live capture — the encoder IS the live edge).
-        self.root = os.path.dirname(self._wav_path)
-        handler = functools.partial(ScreenHlsHandler, directory=self.root)
-        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
-        self.port = self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        m3u8 = os.path.join(self.root, "live.m3u8")
-        cmd = self._ffmpeg_cmd(m3u8)
-        err_path = os.path.join(self.root, "ffmpeg_err.txt")
-        err_fh = open(err_path, "wb")
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=err_fh,
-            stdin=subprocess.DEVNULL, **_no_window_kwargs())
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            if os.path.exists(m3u8) and sum(
-                    1 for f in os.listdir(self.root)
-                    if f.endswith(".ts")) >= 3:
-                break
-            if self._proc.poll() is not None:
-                err_fh.close()
-                tail = open(err_path, "rb").read().decode("utf-8", "replace")[-800:]
-                raise RuntimeError("screen capture ffmpeg exited early: " + tail)
-            time.sleep(0.25)
-        err_fh.close()
-        self.hls_url = f"http://{_lan_ip()}:{self.port}/live.m3u8"
+        if self._thread:
+            return
+        self._stop.clear()
+        self._ready.clear()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="caster-audiotap")
+        self._thread.start()
+        # ffmpeg's command line needs the device's real rate and channel count,
+        # and those are only known once the loopback stream is open.
+        if not self._ready.wait(10):
+            raise RuntimeError("system audio capture did not start")
+        if self._error:
+            raise RuntimeError(f"system audio capture failed: {self._error}")
 
-    def _ffmpeg_cmd(self, m3u8: str) -> list:
-        # Video: gdigrab. ddagrab (Desktop Duplication) hangs on some
-        # driver/GPU combos — gdigrab is slower (~15fps) but universally
-        # works. A window is captured natively by title.
-        from caster import pick_h264_encoder  # deferred: no cycle
-        if self.hwnd:
-            title = _window_title(self.hwnd)
-            vid_in = ["-f", "gdigrab", "-framerate", "15",
-                      "-i", f"title={title}"]
-        else:
-            vid_in = ["-f", "gdigrab", "-framerate", "15",
-                      "-i", "desktop"]
-        return [
-            _find_ffmpeg(), "-hide_banner", "-loglevel", "error",
-            *vid_in,
-            "-f", "wav", "-i", self._wav_path,
-            "-c:v", pick_h264_encoder(), "-b:v", "4000k",
-            # HLS needs a keyframe per segment (~1s): nvenc's default GOP
-            # (250 frames) would keep the muxer waiting forever.
-            "-g", "15", "-keyint_min", "15",
-            "-force_key_frames", "expr:gte(t,n_forced*1)",
-            "-c:a", "aac", "-b:a", "128k",
-            "-f", "hls",
-            "-hls_time", "1",
-            "-hls_list_size", "10",
-            "-hls_flags", "delete_segments",
-            "-hls_segment_filename", os.path.join(self.root, "seg%05d.ts"),
-            m3u8,
-        ]
+    def subscribe(self) -> "queue.Queue":
+        q: queue.Queue = queue.Queue(maxsize=self.QUEUE_CHUNKS)
+        with self._lock:
+            self._subs.append(q)
+        return q
 
-    def _capture_audio(self) -> None:
-        """Write WASAPI loopback PCM to a WAV file until stopped."""
+    def unsubscribe(self, q) -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
+        try:
+            q.put_nowait(None)      # wake a reader blocked in get()
+        except queue.Full:
+            pass
+
+    def _publish(self, data: bytes) -> None:
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                # Drop the oldest chunk to make room: stay at the live edge
+                # instead of building a backlog the listener would hear as lag.
+                try:
+                    q.get_nowait()
+                    q.put_nowait(data)
+                except (queue.Empty, queue.Full):
+                    pass
+
+    def _run(self) -> None:
+        pa = stream = None
         try:
             import pyaudiowpatch as pw
-            import wave as wavemod
-            with pw.PyAudio() as pa:
-                wasapi = pa.get_host_api_info_by_type(pw.paWASAPI)
-                spk = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
-                if not spk.get("isLoopbackDevice"):
-                    for lb in pa.get_loopback_device_info_generator():
-                        if spk["name"] in lb["name"]:
-                            spk = lb
-                            break
-                ch = int(spk["maxInputChannels"]) or 2
-                rate = int(spk["defaultSampleRate"])
-                frames = int(rate * 0.2)
-                stream = pa.open(
-                    format=pw.paInt16, channels=ch, rate=rate, input=True,
-                    input_device_index=spk["index"],
-                    frames_per_buffer=frames)
-                wf = wavemod.open(self._wav_path, "wb")
-                wf.setnchannels(ch)
-                wf.setsampwidth(2)
-                wf.setframerate(rate)
-                while not self._wav_stop.is_set():
-                    wf.writeframes(
-                        stream.read(frames, exception_on_overflow=False))
-                wf.close()
-                stream.close()
-        except Exception:
-            traceback.print_exc()
+            pa = pw.PyAudio()
+            api = pa.get_host_api_info_by_type(pw.paWASAPI)
+            dev = pa.get_device_info_by_index(api["defaultOutputDevice"])
+            if not dev.get("isLoopbackDevice"):
+                for lb in pa.get_loopback_device_info_generator():
+                    if dev["name"] in lb["name"]:
+                        dev = lb
+                        break
+            if not dev.get("isLoopbackDevice"):
+                raise RuntimeError(
+                    f"no loopback capture for output device {dev['name']!r}")
+            self.channels = int(dev["maxInputChannels"]) or 2
+            self.rate = int(dev["defaultSampleRate"])
+            frames = max(1, int(self.rate * self.PERIOD))
+            stream = pa.open(format=pw.paInt16, channels=self.channels,
+                             rate=self.rate, input=True,
+                             input_device_index=dev["index"],
+                             frames_per_buffer=frames)
+            self._ready.set()
+            while not self._stop.is_set():
+                # Loopback keeps delivering silence when nothing is playing,
+                # which is what keeps the receiver's clock running.
+                self._publish(stream.read(frames, exception_on_overflow=False))
+        except Exception as exc:      # surfaced by start()
+            self._error = exc
+            self._ready.set()
+        finally:
+            for close in (getattr(stream, "close", None),
+                          getattr(pa, "terminate", None)):
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
     def stop(self) -> None:
-        if self._wav_stop:
-            self._wav_stop.set()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread:
+            thread.join(timeout=2)
+        with self._lock:
+            subs, self._subs = list(self._subs), []
+        for q in subs:
             try:
-                self._proc.wait(timeout=5)
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
+
+def wav_header(rate: int, channels: int, data_bytes: int) -> bytes:
+    """A 44-byte canonical PCM WAV header declaring `data_bytes` of samples."""
+    block = channels * 2
+    return b"".join((
+        b"RIFF", struct.pack("<I", min(data_bytes + 36, 0xFFFFFFFF)), b"WAVE",
+        b"fmt ", struct.pack("<IHHIIHH", 16, 1, channels, rate,
+                             rate * block, block, 16),
+        b"data", struct.pack("<I", min(data_bytes, 0xFFFFFFFF)),
+    ))
+
+
+#: Declared payload size of an endless WAV stream.
+#:
+#: Receivers want *a* length -- zero makes several of them stop before the
+#: first sample -- and a live capture has none, so a streaming WAV declares
+#: the largest size its 32-bit header fields can express and simply keeps
+#: going. The Content-Length must be told the same story, or renderers that
+#: trust one over the other disagree about where the stream ends. At 48 kHz
+#: stereo this caps a single session at a little over six hours.
+ENDLESS_WAV_BYTES = 0xFFFFFFFF - 36
+
+
+class LiveWavReader(io.BufferedIOBase):
+    """Blocking, endless WAV stream off an AudioTap subscription.
+
+    AirPlay/RAOP wants a file-like object rather than a URL, and pyatv's
+    decoder needs a WAV header before it sees any samples. Reads block until
+    the next capture period, which is exactly the pacing the receiver wants.
+    """
+
+    def __init__(self, tap: AudioTap) -> None:
+        super().__init__()
+        self._tap = tap
+        self._q = tap.subscribe()
+        self._buf = bytearray(
+            wav_header(tap.rate, tap.channels, ENDLESS_WAV_BYTES))
+        self._eof = False
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        want = 65536 if size in (-1, None) else max(int(size), 1)
+        while not self._eof and len(self._buf) < want:
+            try:
+                chunk = self._q.get(timeout=5)
+            except queue.Empty:
+                break               # capture stalled; hand back what we have
+            if chunk is None:       # unsubscribed
+                self._eof = True
+                break
+            self._buf += chunk
+        data, self._buf = bytes(self._buf[:want]), self._buf[want:]
+        return data
+
+    def close(self) -> None:
+        if not self._eof:
+            self._eof = True
+            self._tap.unsubscribe(self._q)
+        super().close()
+
+
+# ---------------------------------------------------------------------------
+# Screen / app-window capture, served as a progressive live HTTP stream
+# ---------------------------------------------------------------------------
+
+_grabber_cache: str = ""
+
+
+def pick_screen_grabber(timeout: float = 10.0) -> str:
+    """"ddagrab" when the Desktop Duplication API works here, else "gdigrab".
+
+    ddagrab is the GPU path: full frame rate at a fraction of gdigrab's CPU.
+    It also *hangs* rather than failing on some driver, GPU and session
+    combinations (RDP and headless VMs in particular), so it is probed once
+    behind a hard kill and the answer cached for the process.
+    """
+    global _grabber_cache
+    if _grabber_cache:
+        return _grabber_cache
+    cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30",
+           "-frames:v", "10", "-vf", "hwdownload,format=bgra",
+           "-f", "null", "-"]
+    _grabber_cache = "gdigrab"
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, **_no_window_kwargs())
+    except OSError:
+        return _grabber_cache
+    try:
+        if proc.wait(timeout=timeout) == 0:
+            _grabber_cache = "ddagrab"
+    except subprocess.TimeoutExpired:
+        pass                        # hung: gdigrab it is
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
             except Exception:
-                self._proc.kill()
-        self._proc = None
-        if getattr(self, "httpd", None):
-            self.httpd.shutdown()
-            self.httpd.server_close()
-            self.httpd = None
-        import shutil
-        if getattr(self, "root", None):
-            shutil.rmtree(self.root, ignore_errors=True)
-            self.root = None
-        self.hls_url = ""
+                pass
+    return _grabber_cache
+
+
+#: Per-encoder flags that trade compression efficiency for latency. Without
+#: these the encoder holds several frames of lookahead, which is exactly the
+#: delay screen casting cannot afford.
+_LOW_LATENCY_ENCODER_ARGS = {
+    "h264_nvenc": ["-preset", "p1", "-tune", "ll", "-zerolatency", "1",
+                   "-rc", "cbr", "-delay", "0"],
+    "h264_qsv": ["-preset", "veryfast", "-async_depth", "1",
+                 "-low_delay_brc", "1"],
+    "h264_amf": ["-usage", "lowlatency", "-quality", "speed", "-rc", "cbr"],
+    "h264_mf": ["-rate_control", "cbr", "-scenario", "display_remoting"],
+    "libx264": ["-preset", "ultrafast", "-tune", "zerolatency"],
+}
+
+#: container -> (url suffix, MIME type, audio only?)
+CONTAINERS = {
+    "mp4": ("live.mp4", "video/mp4", False),
+    "mpegts": ("live.ts", "video/mpeg", False),
+    "wav": ("live.wav", "audio/wav", True),
+}
+
+
+class ScreenSource:
+    """This PC's screen (or one app window) plus its system audio, served as
+    a progressive live HTTP stream.
+
+    Everything here exists to keep the delay down. Nothing is written to disk
+    and there are no media segments: ffmpeg is spawned per connection and its
+    output goes straight to the receiver's socket, so the receiver joins at the
+    live edge rather than at the start of a playlist. ``container`` picks the
+    wire format the chosen receiver actually understands:
+
+    * ``mp4``    fragmented MP4, for Chromecast
+    * ``mpegts`` MPEG-TS, for DLNA renderers and TVs
+    * ``wav``    system audio only, LPCM, usually with no encoder in the path
+                 at all: the lowest latency this can go, for audio receivers
+                 such as a MusicCast amplifier
+
+    Audio-only casting skips video capture and encoding entirely, which is why
+    it is effectively realtime rather than merely low latency.
+    """
+
+    #: Cap on encoded frame size. A 4K desktop at 30fps buries any encoder and
+    #: no receiver here benefits from more than 1080p.
+    MAX_WIDTH = 1920
+    MAX_HEIGHT = 1080
+    #: How often to emit a keyframe. This is the floor on how long a receiver
+    #: waits before it can show a picture.
+    KEYFRAME_SECONDS = 0.5
+
+    def __init__(self, hwnd: int = 0, container: str = "mp4",
+                 fps: int = 30, bitrate: str = "6M") -> None:
+        if container not in CONTAINERS:
+            raise ValueError(f"unknown container {container!r}")
+        self.hwnd = hwnd
+        self.container = container
+        self.fps = fps
+        self.bitrate = bitrate
+        self.path, self.mime, self.audio_only = CONTAINERS[container]
+        self.tap = AudioTap()
+        self.url = ""
+        self.httpd = None
+        self._procs: set = set()
+        self._procs_lock = threading.Lock()
+        self._stopped = False
+        self.last_error = ""
+        #: Index into _window_specs(); start() falls forward on failure.
+        self._window_spec = 0
+
+    # ---- lifecycle ----
+
+    def start(self, verify: bool = True) -> str:
+        """Start capture and serving; return the URL to hand the receiver.
+
+        With ``verify``, the whole chain is exercised over a local connection
+        before returning, so a broken encoder or a window that has closed is
+        reported here rather than as a receiver that silently plays nothing.
+        """
+        self._open()
+        if verify:
+            self._verify_with_fallbacks()
+        return self.url
+
+    def _verify_with_fallbacks(self) -> None:
+        """Verify, trying each way of naming the window before giving up."""
+        attempts = len(self._window_specs()) if self.hwnd else 1
+        for attempt in range(attempts):
+            self._window_spec = attempt
+            try:
+                self._verify()
+                return
+            except RuntimeError:
+                if attempt == attempts - 1:
+                    raise
+                # _verify() tore the source down on the way out; put it
+                # back so the next naming gets a fair try.
+                self._open()
+
+    def _open(self) -> None:
+        """Start the audio tap and the HTTP server, and publish the URL."""
+        self._stopped = False
+        self.tap.start()
+        handler = functools.partial(_LiveStreamHandler, self)
+        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True,
+                         name="caster-live-http").start()
+        self.url = (f"http://{_lan_ip()}:{self.httpd.server_address[1]}"
+                    f"/{self.path}")
+
+    #: Enough bytes to prove the encoder is producing real media, not just
+    #: a container header it wrote before dying.
+    VERIFY_BYTES = 32768
+
+    def _verify(self) -> None:
+        """Pull from our own URL until real media bytes come back."""
+        deadline = time.monotonic() + 30
+        got = 0
+        try:
+            with _urlreq.urlopen(self.url, timeout=30) as r:
+                while got < self.VERIFY_BYTES and time.monotonic() < deadline:
+                    chunk = r.read(8192)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+        except Exception as exc:
+            self.stop()
+            raise RuntimeError(
+                f"capture failed: {self.last_error or exc}") from exc
+        if got < self.VERIFY_BYTES:
+            self.stop()
+            raise RuntimeError(
+                "capture produced no data: "
+                + (self.last_error or "the encoder stopped immediately"))
+
+    def stop(self) -> None:
+        self._stopped = True
+        with self._procs_lock:
+            procs, self._procs = list(self._procs), set()
+        for proc in procs:
+            _terminate(proc)
+        httpd, self.httpd = self.httpd, None
+        if httpd:
+            # shutdown() waits for serve_forever to notice, and this is called
+            # from the UI thread.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+            httpd.server_close()
+        self.tap.stop()
+        self.url = ""
+
+    # ---- one live connection ----
+
+    def open_wav_reader(self) -> LiveWavReader:
+        """A blocking WAV stream of the system audio, for AirPlay/RAOP."""
+        return LiveWavReader(self.tap)
+
+    def pump(self, write) -> None:
+        """Stream this source to ``write`` until the client goes away."""
+        try:
+            if self.container == "wav" and self.pcm_is_directly_usable():
+                self._pump_pcm(write)
+            else:
+                self._pump_ffmpeg(write)
+        except Exception as exc:
+            # This runs on a connection thread, so an exception here would
+            # otherwise vanish and look like a receiver that plays nothing.
+            self.last_error = str(exc)
+            raise
+
+    def pcm_is_directly_usable(self) -> bool:
+        """True when the loopback PCM can go on the wire untouched.
+
+        Skipping ffmpeg removes a process, a copy and a few tens of
+        milliseconds. Surround or an exotic sample rate still needs
+        normalising, because receivers reject it.
+        """
+        return self.tap.channels <= 2 and self.tap.rate in (44100, 48000)
+
+    def wire_rate(self) -> int:
+        return self.tap.rate if self.pcm_is_directly_usable() else 48000
+
+    def wire_channels(self) -> int:
+        return min(self.tap.channels, 2)
+
+    def _pump_pcm(self, write) -> None:
+        tap = self.tap
+        q = tap.subscribe()
+        try:
+            write(wav_header(tap.rate, tap.channels, ENDLESS_WAV_BYTES))
+            while not self._stopped:
+                try:
+                    chunk = q.get(timeout=5)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                write(chunk)
+        finally:
+            tap.unsubscribe(q)
+
+    def _pump_ffmpeg(self, write) -> None:
+        err_r, err_w = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                self.ffmpeg_cmd(), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=err_w, **_no_window_kwargs())
+        except BaseException:
+            os.close(err_r)
+            raise
+        finally:
+            os.close(err_w)
+        errors: list = []
+        threading.Thread(target=self._drain_stderr, args=(err_r, errors),
+                         daemon=True).start()
+        with self._procs_lock:
+            self._procs.add(proc)
+        q = self.tap.subscribe()
+        feeder = threading.Thread(target=self._feed_audio, args=(proc, q),
+                                  daemon=True, name="caster-live-audio")
+        feeder.start()
+        try:
+            while not self._stopped:
+                # read1, not read: read() would sit on the encoder's output
+                # until a full buffer had accumulated, which on a mostly still
+                # screen is a fraction of a second of pure added delay.
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                write(chunk)
+        finally:
+            self.tap.unsubscribe(q)
+            with self._procs_lock:
+                self._procs.discard(proc)
+            _terminate(proc)
+            feeder.join(timeout=2)
+            if errors:
+                self.last_error = errors[-1]
+
+    @staticmethod
+    def _drain_stderr(fd: int, errors: list) -> None:
+        """Keep the last few ffmpeg errors so a failure can be explained."""
+        with os.fdopen(fd, "rb") as handle:
+            for line in handle:
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    errors.append(text)
+                    del errors[:-8]
+
+    def _feed_audio(self, proc, q) -> None:
+        """Write captured PCM into ffmpeg's stdin for as long as it wants it."""
+        try:
+            while not self._stopped and proc.poll() is None:
+                try:
+                    chunk = q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass                     # ffmpeg exited, or the client hung up
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    # ---- ffmpeg ----
+
+    def ffmpeg_cmd(self) -> list:
+        from caster import pick_h264_encoder   # deferred: avoids an import cycle
+        cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+               "-fflags", "+nobuffer", "-flags", "+low_delay"]
+        if not self.audio_only:
+            cmd += self._video_input()
+        cmd += ["-thread_queue_size", "1024",
+                "-f", "s16le", "-ar", str(self.tap.rate),
+                "-ac", str(self.tap.channels), "-i", "pipe:0"]
+        if self.audio_only:
+            cmd += ["-map", "0:a"]
+        else:
+            cmd += ["-map", "0:v", "-map", "1:a"]
+            encoder = pick_h264_encoder()
+            cmd += ["-vf", self._video_filter(),
+                    "-c:v", encoder,
+                    *_LOW_LATENCY_ENCODER_ARGS.get(encoder, []),
+                    "-b:v", self.bitrate, "-maxrate", self.bitrate,
+                    "-bufsize", self.bitrate,
+                    # A keyframe every half second, so a receiver that joins
+                    # mid-stream or loses a fragment recovers in half a second
+                    # instead of waiting out a default 250-frame GOP. Screen
+                    # grabbers routinely deliver under the requested rate, so
+                    # this is pinned to the clock: a frame count would stretch
+                    # to whatever half a second of *achieved* frames is.
+                    "-g", str(max(self.fps // 2, 1)),
+                    "-keyint_min", str(max(self.fps // 2, 1)),
+                    "-force_key_frames",
+                    f"expr:gte(t,n_forced*{self.KEYFRAME_SECONDS})",
+                    "-bf", "0",     # B-frames reorder, and reordering is delay
+                    "-pix_fmt", "yuv420p"]
+        # Resample against the output clock rather than letting capture jitter
+        # accumulate as drift between the picture and the sound.
+        cmd += ["-af", "aresample=async=1:first_pts=0"]
+        cmd += self._output_args()
+        return cmd + ["pipe:1"]
+
+    def _window_specs(self) -> list:
+        """gdigrab input specs for this window, best first.
+
+        The handle is the honest identifier: window titles change while you
+        watch them (a browser tab, a terminal running a spinner), two windows
+        can share one, and gdigrab resolves a title only at open time. Older
+        ffmpeg builds only understand ``title=``, so that stays as a fallback.
+        """
+        specs = [f"hwnd={self.hwnd}"]
+        title = _window_title(self.hwnd)
+        if title:
+            specs.append(f"title={title}")
+        return specs
+
+    def _video_input(self) -> list:
+        if self.hwnd:
+            # ddagrab can only take a whole output, so a single window is
+            # always the GDI path.
+            specs = self._window_specs()
+            spec = specs[min(self._window_spec, len(specs) - 1)]
+            return ["-thread_queue_size", "1024", "-f", "gdigrab",
+                    "-framerate", str(self.fps), "-draw_mouse", "1",
+                    "-i", spec]
+        if pick_screen_grabber() == "ddagrab":
+            return ["-thread_queue_size", "1024", "-f", "lavfi",
+                    "-i", f"ddagrab=output_idx=0:framerate={self.fps}"]
+        return ["-thread_queue_size", "1024", "-f", "gdigrab",
+                "-framerate", str(self.fps), "-draw_mouse", "1",
+                "-i", "desktop"]
+
+    def _video_filter(self) -> str:
+        # ddagrab hands over frames still on the GPU; these encoders read
+        # system memory.
+        prefix = ("hwdownload,format=bgra,"
+                  if not self.hwnd and pick_screen_grabber() == "ddagrab"
+                  else "")
+        # Cap the size, then force both dimensions even: H.264 4:2:0 requires
+        # it, and a window can be any odd size at all.
+        return (prefix +
+                f"scale=w='min(iw,{self.MAX_WIDTH})':"
+                f"h='min(ih,{self.MAX_HEIGHT})':"
+                "force_original_aspect_ratio=decrease,"
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+    def _output_args(self) -> list:
+        if self.container == "mp4":
+            return ["-c:a", "aac", "-b:a", "160k", "-max_delay", "0",
+                    "-f", "mp4",
+                    # A live MP4 of unknown length: an empty moov up front,
+                    # then short self-contained fragments as they are encoded.
+                    "-movflags",
+                    "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+                    "-frag_duration", "200000"]
+        if self.container == "mpegts":
+            return ["-c:a", "aac", "-b:a", "160k", "-max_delay", "0",
+                    "-f", "mpegts",
+                    # Repeat the tables so a receiver joining mid-stream finds
+                    # the programme without waiting for the next cycle.
+                    "-mpegts_flags", "+resend_headers",
+                    "-flush_packets", "1"]
+        # wav: fold surround or an odd rate down to something every receiver
+        # takes, still uncompressed.
+        return ["-ac", str(self.wire_channels()), "-ar", str(self.wire_rate()),
+                "-c:a", "pcm_s16le", "-f", "wav", "-flush_packets", "1"]
+
+
+def _terminate(proc) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+class _LiveStreamHandler(http.server.BaseHTTPRequestHandler):
+    """Serves one endless live stream per connection.
+
+    Receivers disagree about how an endless body should be framed, and getting
+    it wrong shows up as a device that connects and then plays nothing: DLNA
+    renderers want a Content-Length and the DLNA feature headers, while
+    Chromecast is happy to read until the connection closes.
+    """
+
+    protocol_version = "HTTP/1.1"
+    #: DLNA: streaming transfer, no seeking, live source.
+    DLNA_FLAGS = ("DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS="
+                  "8D500000000000000000000000000000")
+
+    def __init__(self, source: "ScreenSource", *args, **kwargs) -> None:
+        self.source = source
+        super().__init__(*args, **kwargs)
+
+    def do_HEAD(self) -> None:
+        self._serve(body=False)
+
+    def do_GET(self) -> None:
+        self._serve(body=True)
+
+    def _serve(self, body: bool) -> None:
+        src = self.source
+        if self.path.lstrip("/") not in (src.path, ""):
+            self.send_error(404)
+            return
+        endless_wav = src.container == "wav"
+        if not endless_wav:
+            # No length is knowable for a live encode, so closing the
+            # connection is what ends the stream.
+            self.protocol_version = "HTTP/1.0"
+            self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", src.mime)
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("transferMode.dlna.org", "Streaming")
+        if self.headers.get("getcontentFeatures.dlna.org"):
+            self.send_header("contentFeatures.dlna.org", self.DLNA_FLAGS)
+        if endless_wav:
+            self.send_header("Content-Length", str(44 + ENDLESS_WAV_BYTES))
+        else:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        if not body:
+            return
+        try:
+            src.pump(self.wfile.write)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                OSError):
+            pass                     # the receiver stopped, or moved on
+
+    def log_message(self, *args) -> None:
+        pass
 
 
 def _lan_ip() -> str:
@@ -517,15 +1031,6 @@ def _window_title(hwnd: int) -> str:
     buf = ctypes.create_unicode_buffer(n + 1)
     ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
     return buf.value
-
-
-def _window_rect(hwnd: int):
-    """GetWindowRect for a top-level hwnd -> (l, t, r, b) in pixels."""
-    import ctypes
-    from ctypes import wintypes
-    r = wintypes.RECT()
-    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
 
 
 def list_windows() -> list:

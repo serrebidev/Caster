@@ -626,6 +626,7 @@ class MainFrame(wx.Frame):
         self._ffmpeg_proc = None
         self._relay = None
         self._file_server = None
+        self._source = None          # live screen / window / audio capture
         self._updating_slider = False
 
         self._build_ui()
@@ -704,6 +705,10 @@ class MainFrame(wx.Frame):
         mi_window = m.Append(wx.ID_ANY, "Cast &window\tCtrl+W",
                              "Cast a running app window with its audio")
         self.mi_window_id = mi_window.GetId()
+        mi_audio = m.Append(
+            wx.ID_ANY, "Cast system &audio\tCtrl+Shift+A",
+            "Cast this PC's sound only, at the lowest possible delay")
+        self.mi_audio_id = mi_audio.GetId()
         m.AppendSeparator()
         mi_file = m.Append(wx.ID_ANY, "&Open file...\tCtrl+O",
                            "Cast a local media file")
@@ -719,7 +724,10 @@ class MainFrame(wx.Frame):
                   lambda e: wx.MessageBox(
                       f"{APP_TITLE} {APP_VERSION}\n\n"
                       "Cast URLs, files, screens and apps to "
-                      "Chromecast, UPnP/DLNA and AirPlay devices.",
+                      "Chromecast, UPnP/DLNA and AirPlay devices.\n\n"
+                      "Ctrl+S casts the screen, Ctrl+W an app window, and "
+                      "Ctrl+Shift+A this PC's sound alone at the lowest "
+                      "delay.",
                       APP_TITLE, wx.ICON_INFORMATION),
                   mi_about)
         mb.Append(m, "&Device")
@@ -733,6 +741,8 @@ class MainFrame(wx.Frame):
                   id=self.mi_screen_id)
         self.Bind(wx.EVT_MENU, lambda e: self.cast_window(),
                   id=self.mi_window_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.cast_audio(),
+                  id=self.mi_audio_id)
         self.Bind(wx.EVT_MENU, lambda e: self.open_file(),
                   id=self.mi_file_id)
         self.btn_cast.Bind(wx.EVT_BUTTON, lambda e: self.play())
@@ -884,11 +894,20 @@ class MainFrame(wx.Frame):
 
     # ---- UPnP/DLNA ----
 
-    def _play_upnp(self, dev: Device, url: str) -> None:
+    def _play_upnp(self, dev: Device, url: str, mime: str = "",
+                   title: str = APP_TITLE) -> None:
         """Serve the URL through the local HLS relay when needed, then push
-        it to the renderer via AVTransport."""
+        it to the renderer via AVTransport.
+
+        `mime` short-circuits probing for streams this app is generating
+        itself; probing a live capture would spawn a second encoder just to
+        read the first few bytes and then throw it away.
+        """
         def worker() -> None:
             try:
+                if mime:
+                    self._upnp_push(dev, url, mime, title)
+                    return
                 probe = probe_media(url)
                 if probe["mime"] == "video/mp2t":
                     relay = HlsRelay(url)
@@ -903,24 +922,45 @@ class MainFrame(wx.Frame):
                         relay = HlsRelay(url)  # may fail for non-media
                         play_url = relay.start()
                         self._relay = relay
-                meta = (f"<DIDL-Lite xmlns:urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/>"
-                        f"<item id=\"\" parentID=\"0\" restricted=\"1\">"
-                        f"<dc:title xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
-                        f"Caster</dc:title>"
-                        f"<upnp:class xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
-                        f"object.item.videoItem</upnp:class>"
-                        f"<res>{play_url}</res></item></DIDL-Lite>")
-                upnp_play(dev.key["control_url"], play_url, meta)
-                self._ui(self.set_status, f"Playing on {dev.name}.")
+                # The relay republishes the source as HLS, so what the
+                # renderer is being handed is a playlist, not the probed type.
+                self._upnp_push(
+                    dev, play_url,
+                    probe["mime"] if play_url == url
+                    else "application/vnd.apple.mpegurl",
+                    title)
             except Exception as exc:
-                self._ui(self.set_status, f"UPnP error: {exc}")
+                message = f"UPnP error: {exc}"
+                self._ui(self.set_status, message)
                 self._stop_relay()
         threading.Thread(target=worker, daemon=True).start()
         self.set_status(f"Connecting to {dev.name}...")
 
+    def _upnp_push(self, dev: Device, play_url: str, mime: str,
+                   title: str) -> None:
+        """SetAVTransportURI + Play, with the DIDL metadata the renderer
+        needs to accept the stream."""
+        control_url = dev.key["control_url"]
+        # MusicCast receivers ignore a pushed URL unless the input is already
+        # switched to the network source, and give no error when they do.
+        host = upnp_host(control_url)
+        if host and yxc_available(host):
+            yxc_set_input(host)
+        upnp_play(control_url, play_url, title, mime,
+                  "object.item.audioItem.musicTrack"
+                  if mime.startswith("audio/") else "object.item.videoItem")
+        self._ui(self.set_status, f"Playing on {dev.name}.")
+
     # ---- Chromecast ----
 
-    def _play_chromecast(self, dev: Device, url: str) -> None:
+    def _play_chromecast(self, dev: Device, url: str, mime: str = "",
+                         is_live: Optional[bool] = None) -> None:
+        """Load `url` on a Chromecast.
+
+        `mime` and `is_live` short-circuit probing for streams this app is
+        generating itself: probing a live capture would spawn a second
+        encoder just to read its first bytes and then throw it away.
+        """
         def worker() -> None:
             try:
                 host = dev.key["host"]
@@ -951,10 +991,13 @@ class MainFrame(wx.Frame):
                     yt.play_video(vid)
                     self._ui(self.set_status, f"YouTube {vid} on {dev.name}.")
                 else:
-                    self._ui(self.set_status, "Probing...")
-                    probe = probe_media(url)
-                    mime = probe["mime"]
                     mc = cast.media_controller
+                    if mime:
+                        probe = {"mime": mime, "is_live": bool(is_live)}
+                    else:
+                        self._ui(self.set_status, "Probing...")
+                        probe = probe_media(url)
+                    load_mime = probe["mime"]
                     if probe["mime"] == "video/mp2t" and not url.lower().split("?")[0].endswith(".m3u8"):
                         # Cast receivers reject raw MPEG-TS; remux via the
                         # local relay (runs only while playing).
@@ -963,6 +1006,7 @@ class MainFrame(wx.Frame):
                         HlsFileHandler.relay_requests.clear()
                         play_url = relay.start()
                         self._relay = relay
+                        load_mime = "application/vnd.apple.mpegurl"
                     else:
                         play_url = url
                     # Live channels must be LIVE; VOD must be BUFFERED or
@@ -972,7 +1016,8 @@ class MainFrame(wx.Frame):
                     # no-ops (LOADING -> IDLE/FINISHED). Launch it explicitly.
                     cast.start_app("CC1AD845", force_launch=True)
                     time.sleep(2.5)
-                    mc.play_media(play_url, mime if play_url == url else "application/vnd.apple.mpegurl", stream_type=stream_type)
+                    mc.play_media(play_url, load_mime,
+                                  stream_type=stream_type)
                     mc.block_until_active(15)
                     settled = False
                     for _ in range(8):
@@ -984,11 +1029,8 @@ class MainFrame(wx.Frame):
                         if state == "IDLE" and mc.status.idle_reason:
                             # Load rejected; flip stream type and retry once.
                             other = "BUFFERED" if stream_type == "LIVE" else "LIVE"
-                            mc.play_media(
-                                play_url,
-                                mime if play_url == url else "application/vnd.apple.mpegurl",
-                                stream_type=other,
-                            )
+                            mc.play_media(play_url, load_mime,
+                                          stream_type=other)
                             mc.block_until_active(15)
                             stream_type = other
                             continue
@@ -1013,7 +1055,14 @@ class MainFrame(wx.Frame):
 
     # ---- AirPlay ----
 
-    def _play_airplay(self, dev: Device, url: str) -> None:
+    def _play_airplay(self, dev: Device, url: str, source=None) -> None:
+        """Stream `url` to an AirPlay receiver over RAOP.
+
+        `source` is a live ScreenSource instead of a URL. RAOP carries audio
+        only -- pyatv cannot mirror a screen -- so a live source contributes
+        its system audio, read straight off the capture tap with no encoder,
+        no container and no HTTP hop in between.
+        """
         # AirPlay state shared with the transport handlers on the UI thread.
         self._air_kind = None          # "audio" | "video" | "youtube"
         self._air_is_live = False
@@ -1032,13 +1081,19 @@ class MainFrame(wx.Frame):
             self._air_wake = wake
             self._air_shutdown = shutdown
             try:
-                # Probe once up front (executor thread).
-                probe = await asyncio.get_running_loop().run_in_executor(
-                    None, probe_media, url)
-                vid = youtube_id(url)
-                self._air_kind = "youtube" if vid else (
-                    "audio" if probe["is_audio"] else "video")
-                self._air_is_live = bool(probe["is_live"]) and self._air_kind == "video"
+                if source is not None:
+                    vid = None
+                    self._air_kind = "live"
+                    self._air_is_live = True
+                else:
+                    # Probe once up front (executor thread).
+                    probe = await asyncio.get_running_loop().run_in_executor(
+                        None, probe_media, url)
+                    vid = youtube_id(url)
+                    self._air_kind = "youtube" if vid else (
+                        "audio" if probe["is_audio"] else "video")
+                    self._air_is_live = (bool(probe["is_live"])
+                                         and self._air_kind == "video")
 
                 self._ui(self.set_status, f"Connecting to {dev.name}...")
                 atv = await pyatv.connect(dev.key, self.loop_thread.loop,
@@ -1051,14 +1106,15 @@ class MainFrame(wx.Frame):
                 # on `wake` while KEEPING the RAOP session alive; resume/seek
                 # sets `wake` and the loop reopens the source (with seek).
                 while not shutdown.is_set():
-                    source = await self._raop_source(url, vid)
+                    stream = (source.open_wav_reader() if source is not None
+                              else await self._raop_source(url, vid))
                     if self._air_play_t0 is None:
                         self._air_play_t0 = time.monotonic()
                     self._air_state = "playing"
                     wake.clear()
                     self._ui(self.set_status, f"Streaming to {dev.name}...")
                     self.stream_task = asyncio.create_task(
-                        atv.stream.stream_file(source)
+                        atv.stream.stream_file(stream)
                     )
                     stop_wait = asyncio.create_task(shutdown.wait())
                     wake_wait = asyncio.create_task(wake.wait())
@@ -1090,7 +1146,8 @@ class MainFrame(wx.Frame):
             except asyncio.CancelledError:
                 cancelled = True
             except Exception as exc:
-                self._ui(lambda: self.set_status(f"AirPlay error: {exc}"))
+                message = f"AirPlay error: {exc}"
+                self._ui(self.set_status, message)
             finally:
                 st = self.stream_task
                 self.stream_task = None
@@ -1196,25 +1253,94 @@ class MainFrame(wx.Frame):
         _raop_source directly."""
         return await self._raop_source(url, youtube_id(url))
 
-    # ---- screen / app-window casting ----
+    # ---- screen / app-window / system-audio casting ----
 
     def cast_screen(self) -> None:
-        """Cast the whole desktop + system audio to the selected device."""
+        """Cast the whole desktop plus system audio to the selected device."""
+        self._cast_capture("Screen")
+
+    def cast_audio(self) -> None:
+        """Cast this PC's sound with nothing else in the path.
+
+        No screen capture and no video encoder means the delay is a capture
+        period plus the receiver's own buffer, which is as close to realtime
+        as this gets.
+        """
+        self._cast_capture("System audio", audio_only=True)
+
+    def cast_window(self) -> None:
+        """Pick a visible top-level window and cast it with system audio."""
+        picks = list_windows()
+        if not picks:
+            self.set_status("No windows found.")
+            return
+        dlg = wx.SingleChoiceDialog(self, "Window:", "Cast app",
+                                    [t for _, t in picks], wx.CHOICEDLG_STYLE)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        hwnd, title = picks[dlg.GetSelection()]
+        dlg.Destroy()
+        self._cast_capture(title, hwnd=hwnd)
+
+    def _capture_container(self, dev: Device, audio_only: bool) -> str:
+        """The wire format `dev` can actually play.
+
+        AirPlay is audio whatever was asked for: pyatv speaks RAOP, which
+        carries no video and cannot mirror a screen.
+        """
+        if audio_only or dev.kind == "airplay":
+            return "wav"
+        # Chromecast plays progressive fragmented MP4; DLNA renderers and TVs
+        # want MPEG-TS and reject fragmented MP4 outright.
+        return "mp4" if dev.kind == "chromecast" else "mpegts"
+
+    def _cast_capture(self, label: str, hwnd: int = 0,
+                      audio_only: bool = False) -> None:
+        """Start a live capture and hand it to the selected device.
+
+        Starting the capture verifies the whole chain, which takes a few
+        seconds, so it runs off the UI thread -- and its failures are reported
+        rather than leaving a device that quietly plays nothing.
+        """
         dev = self.selected_device()
         if not dev:
             self.set_status("Pick a device first.")
             return
         self.stop_silent()
         self.current = dev
-        src = ScreenSource()
-        self._source = src
         self._stop_flag = False
-        if dev.kind == "chromecast":
-            self._play_chromecast(dev, src.hls_url)
-        elif dev.kind == "upnp":
-            self._play_upnp(dev, src.hls_url)
-        else:
-            self._play_airplay(dev, src.hls_url)
+        airplay = dev.kind == "airplay"
+        container = self._capture_container(dev, audio_only)
+        # An AirPlay receiver gets sound even when the screen was asked for.
+        # Say so, rather than looking like a failure to send the picture.
+        kind = "audio" if container == "wav" else "video and audio"
+        self.set_status(f"Starting {label.lower()} capture ({kind})...")
+
+        def worker() -> None:
+            try:
+                src = ScreenSource(hwnd=hwnd, container=container)
+                # AirPlay reads the tap directly, so there is no HTTP stream
+                # to verify -- and nothing would connect to it if there were.
+                url = src.start(verify=not airplay)
+            except Exception as exc:
+                message = f"Capture failed: {exc}"
+                self._ui(self.set_status, message)
+                return
+            if self._stop_flag:
+                src.stop()
+                return
+            self._source = src
+            if airplay:
+                self._ui(self._play_airplay, dev, "", src)
+            elif dev.kind == "chromecast":
+                self._ui(self._play_chromecast, dev, url, src.mime, True)
+            else:
+                self._ui(self._play_upnp, dev, url, src.mime,
+                         f"{APP_TITLE}: {label}")
+
+        threading.Thread(target=worker, daemon=True,
+                         name="caster-capture").start()
 
     # ---- local file casting ----
 
@@ -1256,36 +1382,6 @@ class MainFrame(wx.Frame):
             self._play_upnp(dev, url)
         else:
             self._play_airplay(dev, url)
-
-    def cast_window(self) -> None:
-        """Pick a visible top-level window and cast it with system audio."""
-        picks = list_windows()
-        if not picks:
-            self.set_status("No windows found.")
-            return
-        names = [t for h, t in picks]
-        dlg = wx.SingleChoiceDialog(self, "Window:", "Cast app",
-                                    names, wx.CHOICEDLG_STYLE)
-        if dlg.ShowModal() != wx.ID_OK:
-            dlg.Destroy()
-            return
-        hwnd, _ = picks[dlg.GetSelection()]
-        dlg.Destroy()
-        dev = self.selected_device()
-        if not dev:
-            self.set_status("Pick a device first.")
-            return
-        self.stop_silent()
-        self.current = dev
-        src = ScreenSource(hwnd=hwnd)
-        self._source = src
-        self._stop_flag = False
-        if dev.kind == "chromecast":
-            self._play_chromecast(dev, src.hls_url)
-        elif dev.kind == "upnp":
-            self._play_upnp(dev, src.hls_url)
-        else:
-            self._play_airplay(dev, src.hls_url)
 
     # ---- teardown ----
 
