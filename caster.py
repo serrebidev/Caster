@@ -298,6 +298,7 @@ class HlsRelay:
         self.video_transcoded = False  # True: source video not H.264
         self._trail_drop = None   # segments hidden from the served playlist
         self._last_good = None    # last known-good playlist bytes
+        self._restarted = 0       # upstream-drop restarts (diagnostics)
 
     def start(self, prime_segments: int = 4) -> str:
         import tempfile
@@ -313,10 +314,7 @@ class HlsRelay:
                          name="caster-hls").start()
 
         m3u8 = os.path.join(self.root, "live.m3u8")
-        cmd = self._ffmpeg_cmd(m3u8)
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, **_no_window_kwargs())
+        self._spawn_ffmpeg()
         # Prime: accumulate a few segments BEFORE the receiver starts so it
         # begins playing with seconds of backlog already buffered.
         deadline = time.monotonic() + 25
@@ -330,10 +328,52 @@ class HlsRelay:
             if self.proc.poll() is not None:
                 raise RuntimeError("ffmpeg exited early while starting relay")
             time.sleep(0.25)
+
         else:
             self.stop()
             raise RuntimeError("relay produced no HLS playlist in time")
+        # IPTV sources drop connections mid-stream (server reset, idle-timeout,
+        # route flap). ffmpeg's reconnect flags cover reconnectable HTTP errors
+        # but ffmpeg EXITS on a dead read; a supervisor restarts it in place so
+        # the playlist keeps advancing and the receiver never notices.
+        threading.Thread(target=self._supervise, daemon=True,
+                         name="caster-relay-supervisor").start()
         return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
+
+    def _spawn_ffmpeg(self) -> None:
+        """(Re)start the ffmpeg encoder process for this relay."""
+        m3u8 = os.path.join(self.root, "live.m3u8")
+        cmd = self._ffmpeg_cmd(m3u8)
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, **_no_window_kwargs())
+
+    def _supervise(self) -> None:
+        """Restart ffmpeg if it dies while the relay is up.
+
+        A dead encoder freezes the playlist and the receiver eventually gives
+        up ("stream disconnected"). Restarting with the SAME segment filename
+        pattern and directory keeps the HLS continuity: the playlist is
+        rewritten fresh with a monotonic MEDIA-SEQUENCE via trailing_playlist,
+        and the receiver just sees the stream continue (a few seconds of
+        repeats/jump at most).
+        """
+        while self.httpd is not None:
+            time.sleep(2)
+            if self.httpd is None:
+                break   # stopped while sleeping
+            proc = self.proc
+            if proc is None or proc.poll() is None:
+                continue
+            # ffmpeg exited on its own: upstream dropped and reconnect flags
+            # gave up. Restart it unless we are shutting down.
+            if self.httpd is None:
+                break
+            self._restarted += 1
+            try:
+                self._spawn_ffmpeg()
+            except Exception:
+                pass
 
     def _ffmpeg_cmd(self, m3u8: str) -> list:
         """ffmpeg command producing HLS for this relay's source."""
@@ -432,17 +472,17 @@ class HlsRelay:
             s.close()
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except Exception:
-                self.proc.kill()
-        self.proc = None
-        if self.httpd:
-            self.httpd.shutdown()
-            self.httpd.server_close()
+        # Tear the supervisor's loop condition down FIRST: httpd=None makes
+        # _supervise exit, so it never restarts a relay being torn down.
         self.httpd = None
+        proc = self.proc
+        self.proc = None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
         if self.root:
             shutil.rmtree(self.root, ignore_errors=True)
         self.root = None
