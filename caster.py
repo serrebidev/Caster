@@ -59,7 +59,7 @@ from caster_extras import (
 )
 
 APP_TITLE = "Caster"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 YT_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})"
