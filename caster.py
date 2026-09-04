@@ -21,7 +21,6 @@ import re
 import shutil
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import traceback
@@ -37,7 +36,6 @@ import pyatv
 import zeroconf
 from pyatv.const import Protocol
 from pychromecast.const import CAST_TYPE_CHROMECAST
-from pychromecast.controllers.media import MediaController
 from pychromecast.controllers.youtube import YouTubeController
 from pychromecast.models import CastInfo, HostServiceInfo
 
@@ -48,14 +46,44 @@ except ImportError:
 
 from caster_extras import (
     list_windows,
+    list_output_devices,
+    list_input_devices,
     ScreenSource,
     upnp_discover,
     upnp_play,
     upnp_stop,
+    upnp_set_volume,
     FileServer,
     yxc_available,
     yxc_set_input,
     upnp_host,
+)
+
+from caster_config import Settings, preset
+from caster_devices import (
+    kodi_discover,
+    kodi_pause,
+    kodi_play,
+    kodi_set_volume,
+    kodi_stop,
+    looks_like_sonos,
+    roku_discover,
+    roku_key,
+    roku_play,
+    roku_stop,
+    sonos_discover,
+    sonos_group,
+    sonos_play,
+    sonos_set_volume,
+    sonos_stop,
+)
+from caster_ui import (
+    HotkeyManager,
+    NvdaSpeaker,
+    SettingsDialog,
+    TrayIcon,
+    labelled,
+    name_control,
 )
 
 APP_TITLE = "Caster"
@@ -601,11 +629,37 @@ class LoopThread(threading.Thread):
         asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 
+#: How each receiver kind is shown in the device list.
+KIND_LABELS = {
+    "chromecast": "Cast",
+    "airplay": "AirPlay",
+    "upnp": "UPnP",
+    "sonos": "Sonos",
+    "roku": "Roku",
+    "kodi": "Kodi",
+}
+
+#: Receivers that can show a picture. Sonos is speakers, and AirPlay here is
+#: RAOP, which carries audio only -- pyatv cannot mirror a screen.
+VIDEO_KINDS = {"chromecast", "upnp", "roku", "kodi"}
+
+
 class Device:
     def __init__(self, kind: str, name: str, key: Any) -> None:
-        self.kind = kind  # "chromecast" | "airplay" | "upnp"
+        self.kind = kind          # a key of KIND_LABELS
         self.name = name
         self.key = key
+
+    @property
+    def supports_video(self) -> bool:
+        return self.kind in VIDEO_KINDS
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({KIND_LABELS.get(self.kind, self.kind)})"
+
+    def __repr__(self) -> str:
+        return f"Device({self.kind}, {self.name!r})"
 
 
 class MainFrame(wx.Frame):
@@ -626,15 +680,39 @@ class MainFrame(wx.Frame):
         self._ffmpeg_proc = None
         self._relay = None
         self._file_server = None
-        self._source = None          # live screen / window / audio capture
+        #: Live captures. Usually one; a selection spanning receivers that
+        #: need different wire formats gets one per format.
+        self._sources: list = []
+        self._targets: list = []     # every device currently being cast to
         self._updating_slider = False
+        self._muted = False
+        self._pre_mute_volume = 100
+        self._cast_started = 0.0
+        self._tray = None
+
+        self.settings = Settings()
+        self.speaker = NvdaSpeaker()
+        self._last_spoken = ""
 
         self._build_ui()
         self._bind_events()
         self.status_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_status_timer, self.status_timer)
         self.status_timer.Start(1500)
+        # Sleep timer and reconnect share one slow tick; neither needs to be
+        # prompt, and a second timer would just be more to shut down.
+        self.watchdog_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_watchdog, self.watchdog_timer)
+        self.watchdog_timer.Start(15000)
+
+        self.hotkeys = HotkeyManager(self, self._on_hotkey_action)
+        if self.settings["global_hotkeys"]:
+            self.hotkeys.register_all()
+
+        self.vol_slider.SetValue(int(self.settings["volume"]))
         self.Show()
+        if self.settings["discover_on_launch"]:
+            self.discover()
 
     # ---------- UI ----------
 
@@ -644,36 +722,44 @@ class MainFrame(wx.Frame):
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
 
-        self.device_list = wx.ListBox(panel, style=wx.LB_SINGLE)
-        self.device_list.SetHelpText("Discovered devices.")
-        vbox.Add(self.device_list, 1, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
+        # A checkable list rather than a multi-selection one: arrowing
+        # through a wxLB_MULTIPLE list toggles every device it passes over,
+        # which makes picking one of ten a fight. Here the arrows move,
+        # space ticks, and a screen reader announces the tick state --
+        # so casting to one device stays a single keystroke and casting to
+        # a whole room is space on each.
+        self.device_list = wx.CheckListBox(panel, choices=[])
+        labelled(panel, vbox,
+                 "Device &list (space ticks extra ones for multi-room):",
+                 self.device_list, proportion=1)
 
-        self.url_box = wx.TextCtrl(panel)
-        self.url_box.SetHelpText("URL to cast.")
-        vbox.Add(self.url_box, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
+        # A combo box, so previously cast URLs are reachable with the arrow
+        # keys instead of being retyped.
+        self.url_box = wx.ComboBox(panel, style=wx.TE_PROCESS_ENTER)
+        labelled(panel, vbox, "URL to &cast:", self.url_box)
 
         self.btn_cast = wx.Button(panel, label="&Play")
         self.btn_cast.SetDefault()
         vbox.Add(self.btn_cast, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
 
         row = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_playpause = wx.Button(panel, label="&Pause")
+        self.btn_playpause = wx.Button(panel, label="Pa&use")
         self.btn_stop = wx.Button(panel, label="S&top")
-        self.btn_back = wx.Button(panel, label="&-10s")
-        self.btn_fwd = wx.Button(panel, label="&+10s")
+        self.btn_back = wx.Button(panel, label="&Back 10s")
+        self.btn_fwd = wx.Button(panel, label="For&ward 10s")
         for b in (self.btn_playpause, self.btn_stop, self.btn_back, self.btn_fwd):
             row.Add(b, 1, wx.RIGHT, 8)
         vbox.Add(row, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
 
-        self.pos_slider = wx.Slider(panel, value=0, minValue=0, maxValue=100,
-                                    style=wx.SL_HORIZONTAL | wx.SL_LABELS)
-        self.pos_slider.SetHelpText("Position. Arrows move it.")
-        vbox.Add(self.pos_slider, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 8)
+        self.pos_slider = name_control(
+            wx.Slider(panel, value=0, minValue=0, maxValue=100,
+                      style=wx.SL_HORIZONTAL | wx.SL_LABELS), "Position")
+        labelled(panel, vbox, "P&osition in seconds:", self.pos_slider)
 
-        self.vol_slider = wx.Slider(panel, value=100, minValue=0, maxValue=100,
-                                    style=wx.SL_HORIZONTAL | wx.SL_LABELS)
-        self.vol_slider.SetHelpText("Volume. Arrows adjust it.")
-        vbox.Add(self.vol_slider, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 8)
+        self.vol_slider = name_control(
+            wx.Slider(panel, value=100, minValue=0, maxValue=100,
+                      style=wx.SL_HORIZONTAL | wx.SL_LABELS), "Volume")
+        labelled(panel, vbox, "&Volume percent:", self.vol_slider)
 
         self.status_bar = wx.StatusBar(self)
         self.SetStatusBar(self.status_bar)
@@ -687,6 +773,7 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord("U"), self._acc_url_id),
             (wx.ACCEL_CTRL, ord("O"), self.mi_file_id),
         ]))
+        self._refresh_recent()
         self.Bind(wx.EVT_MENU, lambda e: self.url_box.SetFocus(),
                   id=self._acc_url_id)
         self.Bind(wx.EVT_CLOSE, self._on_close)
@@ -714,25 +801,54 @@ class MainFrame(wx.Frame):
                            "Cast a local media file")
         self.mi_file_id = mi_file.GetId()
         m.AppendSeparator()
+        mi_copy = m.Append(wx.ID_ANY, "&Copy stream address\tCtrl+Shift+C",
+                           "Copy the live stream's address so any player "
+                           "can open it")
+        self.mi_copy_id = mi_copy.GetId()
+        mi_mute = m.Append(wx.ID_ANY, "&Mute\tCtrl+M",
+                           "Silence the receiver without stopping the cast")
+        self.mi_mute_id = mi_mute.GetId()
+        m.AppendSeparator()
+        mi_settings = m.Append(wx.ID_PREFERENCES, "&Settings...\tCtrl+,",
+                               "Capture quality, audio source and more")
+        self.mi_settings_id = mi_settings.GetId()
         mi_quit = m.Append(wx.ID_EXIT, "E&xit\tAlt+F4")
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), mi_quit)
         self._menu_device = m
+
+        # Favourites
+        self._menu_favourites = wx.Menu()
+        mi_add_fav = self._menu_favourites.Append(
+            wx.ID_ANY, "&Add current URL...\tCtrl+B",
+            "Save the URL in the box under a name you choose")
+        self.mi_add_fav_id = mi_add_fav.GetId()
+        mi_del_fav = self._menu_favourites.Append(
+            wx.ID_ANY, "&Remove...", "Delete a saved favourite")
+        self.mi_del_fav_id = mi_del_fav.GetId()
+        self._menu_favourites.AppendSeparator()
+        self._fav_item_ids: dict = {}
         # Help menu
         h = wx.Menu()
+        mi_keys = h.Append(wx.ID_ANY, "&Keyboard shortcuts")
+        self.Bind(wx.EVT_MENU, lambda e: self._show_shortcuts(), mi_keys)
         mi_about = h.Append(wx.ID_ABOUT, "&About")
         self.Bind(wx.EVT_MENU,
                   lambda e: wx.MessageBox(
                       f"{APP_TITLE} {APP_VERSION}\n\n"
                       "Cast URLs, files, screens and apps to "
-                      "Chromecast, UPnP/DLNA and AirPlay devices.\n\n"
+                      "Chromecast, Sonos, Roku, Kodi, UPnP/DLNA and "
+                      "AirPlay devices.\n\n"
                       "Ctrl+S casts the screen, Ctrl+W an app window, and "
                       "Ctrl+Shift+A this PC's sound alone at the lowest "
-                      "delay.",
+                      "delay. Tick several devices for multi-room.\n\n"
+                      "See Help, Keyboard shortcuts for the full list.",
                       APP_TITLE, wx.ICON_INFORMATION),
                   mi_about)
         mb.Append(m, "&Device")
+        mb.Append(self._menu_favourites, "&Favourites")
         mb.Append(h, "&Help")
         self.SetMenuBar(mb)
+        self._rebuild_favourites()
 
     def _bind_events(self) -> None:
         self.Bind(wx.EVT_MENU, lambda e: self.discover(),
@@ -743,6 +859,17 @@ class MainFrame(wx.Frame):
                   id=self.mi_window_id)
         self.Bind(wx.EVT_MENU, lambda e: self.cast_audio(),
                   id=self.mi_audio_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.copy_stream_url(),
+                  id=self.mi_copy_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.toggle_mute(),
+                  id=self.mi_mute_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.show_settings(),
+                  id=self.mi_settings_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.add_favourite(),
+                  id=self.mi_add_fav_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.remove_favourite(),
+                  id=self.mi_del_fav_id)
+        self.url_box.Bind(wx.EVT_TEXT_ENTER, lambda e: self.play())
         self.Bind(wx.EVT_MENU, lambda e: self.open_file(),
                   id=self.mi_file_id)
         self.btn_cast.Bind(wx.EVT_BUTTON, lambda e: self.play())
@@ -750,7 +877,8 @@ class MainFrame(wx.Frame):
         self.btn_stop.Bind(wx.EVT_BUTTON, lambda e: self.stop())
         self.btn_back.Bind(wx.EVT_BUTTON, lambda e: self.seek_relative(-10))
         self.btn_fwd.Bind(wx.EVT_BUTTON, lambda e: self.seek_relative(10))
-        self.device_list.Bind(wx.EVT_LISTBOX, lambda e: self._on_device_selected())
+        self.device_list.Bind(wx.EVT_LISTBOX,
+                              lambda e: self._on_device_selected())
         self.vol_slider.Bind(wx.EVT_SLIDER, self._on_volume)
         self.pos_slider.Bind(wx.EVT_SCROLL_THUMBRELEASE, self._on_seek_release)
         self.pos_slider.Bind(wx.EVT_SCROLL_CHANGED, self._on_seek_release)
@@ -758,14 +886,80 @@ class MainFrame(wx.Frame):
 
     # ---------- helpers ----------
 
-    def set_status(self, text: str) -> None:
+    def set_status(self, text: str, speak: bool = True) -> None:
         self.status_bar.SetStatusText(text)
+        # A status bar is read on request, not when it changes, so without
+        # this the outcome of a cast is silent. Repeats are dropped: the
+        # position tick rewrites this every 1.5 seconds.
+        if speak and text != self._last_spoken and self.settings["speak_status"]:
+            self._last_spoken = text
+            self.speaker.speak(text)
+
+    def _ensure_tray(self) -> bool:
+        if self._tray is not None:
+            return True
+        try:
+            self._tray = TrayIcon(self, [
+                ("&Show Caster", lambda: self._tray.restore()),
+                ("-", None),
+                ("Cast system &audio", self.cast_audio),
+                ("Cast &screen", self.cast_screen),
+                ("&Stop casting", self.stop),
+                ("-", None),
+                ("&Quit", self._quit_from_tray),
+            ])
+            return True
+        except Exception:
+            self._tray = None
+            return False
+
+    def _quit_from_tray(self) -> None:
+        self.settings.set("minimise_to_tray", False)
+        wx.CallAfter(self.Close)
+
+    def _show_shortcuts(self) -> None:
+        wx.MessageBox(
+            "In the window:\n"
+            "Ctrl+D scan for devices\n"
+            "Ctrl+U jump to the URL box\n"
+            "Ctrl+S cast the screen\n"
+            "Ctrl+W cast an app window\n"
+            "Ctrl+Shift+A cast system audio only\n"
+            "Ctrl+O cast a local file\n"
+            "Ctrl+B save the URL as a favourite\n"
+            "Ctrl+Shift+C copy the stream address\n"
+            "Ctrl+M mute\n"
+            "Space in the device list ticks a device for multi-room\n\n"
+            "Anywhere in Windows:\n" + HotkeyManager.describe(),
+            "Keyboard shortcuts", wx.ICON_INFORMATION)
+
+    def selected_devices(self) -> list:
+        """Every ticked device, or just the highlighted one if none is ticked.
+
+        Ticking is for multi-room. Casting to a single device should not
+        require ticking it first, so the cursor position stands in when
+        nothing is ticked.
+        """
+        indices = list(self.device_list.GetCheckedItems())
+        if not indices:
+            current = self.device_list.GetSelection()
+            if current == wx.NOT_FOUND:
+                return []
+            indices = [current]
+        return [dev for dev in
+                (self.devices.get(self.device_list.GetString(i))
+                 for i in indices)
+                if dev is not None]
 
     def selected_device(self) -> Optional[Device]:
-        sel = self.device_list.GetStringSelection()
-        if not sel:
-            return None
-        return self.devices.get(sel)
+        """The primary device: the first selection.
+
+        Transport controls act on this one. Volume and stop act on every
+        selected device, because those are the ones that make sense to apply
+        to a whole room at once.
+        """
+        chosen = self.selected_devices()
+        return chosen[0] if chosen else None
 
     def _ui(self, fn, *args) -> None:
         wx.CallAfter(fn, *args)
@@ -834,34 +1028,173 @@ class MainFrame(wx.Frame):
                 self.loop_thread.loop,
             )
             for cfg in futs.result(20):
-                if cfg.name:
-                    found.setdefault(
-                        cfg.name,
-                        Device("airplay", cfg.name, cfg),
-                    )
+                if not cfg.name:
+                    continue
+                # Sonos advertises AirPlay 2, and streaming to it that way
+                # fails: it demands MFi hardware authentication no Python
+                # client can perform, and refuses the audio port. Its own
+                # protocol is discovered separately and works.
+                if looks_like_sonos(cfg.name, str(
+                        getattr(cfg, "device_info", ""))):
+                    continue
+                found.setdefault(cfg.name, Device("airplay", cfg.name, cfg))
         except Exception:
             traceback.print_exc()
         try:
-            for name, url in upnp_discover(timeout=8):
+            for name, url, maker in upnp_discover(timeout=8):
+                # A Sonos answers UPnP too, but wants its own transport
+                # handling and its own grouping; it is discovered natively
+                # below. Listing it twice would just offer the worse path.
+                if looks_like_sonos(name, maker):
+                    continue
                 found.setdefault(
                     name, Device("upnp", name,
                                  {"control_url": url.replace("&amp;", "&")}))
+        except Exception:
+            traceback.print_exc()
+        try:
+            for name, ip in sonos_discover(
+                    timeout=5, seed_ips=self.settings["sonos_seed_ips"]):
+                found[name] = Device("sonos", name, {"ip": ip})
+        except Exception:
+            traceback.print_exc()
+        try:
+            for name, base in roku_discover(timeout=4):
+                found.setdefault(name, Device("roku", name, {"base": base}))
+        except Exception:
+            traceback.print_exc()
+        try:
+            for name, base in kodi_discover(timeout=4):
+                found.setdefault(name, Device("kodi", name, {"base": base}))
         except Exception:
             traceback.print_exc()
 
         self._ui(self._apply_devices, found)
 
     def _apply_devices(self, found: dict[str, Device]) -> None:
-        self.devices = found
+        # Keyed by display label only: the list box hands back a label, and
+        # keeping bare names in here too meant two entries per device.
+        self.devices = {dev.label: dev for dev in found.values()}
         self.device_list.Clear()
-        for name, dev in sorted(found.items()):
-            kind = {"chromecast": "Cast", "airplay": "AirPlay",
-                    "upnp": "UPnP"}[dev.kind]
-            label = f"{name} ({kind})"
+        for label in sorted(self.devices):
             self.device_list.Append(label)
-            # map display label back to key
-            self.devices[label] = dev
-        self.set_status(f"{len(found)} device(s).")
+        self.set_status(f"{len(self.devices)} device(s).")
+        if self.settings["reselect_last_device"]:
+            self._reselect_last_device()
+
+    def _reselect_last_device(self) -> None:
+        """Select the most recently used device that is on the network.
+
+        Without this every launch starts with nothing selected, and the
+        first action is always the same hunt through the list.
+        """
+        for label in self.settings["last_devices"]:
+            index = self.device_list.FindString(label)
+            if index != wx.NOT_FOUND:
+                self.device_list.SetSelection(index)
+                try:
+                    self.device_list.EnsureVisible(index)
+                except Exception:
+                    pass
+                self._on_device_selected()
+                self.set_status(f"{len(self.devices)} device(s). "
+                                f"{label} selected.")
+                return
+
+    def _refresh_recent(self) -> None:
+        """Reload the URL box's drop-down without disturbing what is typed."""
+        typed = self.url_box.GetValue()
+        self.url_box.Set(self.settings["recent_urls"])
+        self.url_box.SetValue(typed)
+
+    def _rebuild_favourites(self) -> None:
+        for item_id in list(self._fav_item_ids):
+            item = self._menu_favourites.FindItemById(item_id)
+            if item:
+                self._menu_favourites.Delete(item)
+        self._fav_item_ids.clear()
+        for fav in self.settings["favourites"]:
+            item = self._menu_favourites.Append(
+                wx.ID_ANY, fav["name"], fav["url"])
+            self._fav_item_ids[item.GetId()] = fav["url"]
+            self.Bind(wx.EVT_MENU,
+                      lambda e, u=fav["url"]: self._play_favourite(u), item)
+
+    def _play_favourite(self, url: str) -> None:
+        self.url_box.SetValue(url)
+        self.play()
+
+    def add_favourite(self) -> None:
+        url = self.url_box.GetValue().strip()
+        if not url:
+            self.set_status("Enter a URL first.")
+            self.url_box.SetFocus()
+            return
+        dlg = wx.TextEntryDialog(self, "Name for this favourite:",
+                                 "Add favourite")
+        if dlg.ShowModal() == wx.ID_OK and dlg.GetValue().strip():
+            name = dlg.GetValue().strip()
+            self.settings.add_favourite(name, url)
+            self._rebuild_favourites()
+            self.set_status(f"Saved {name}.")
+        dlg.Destroy()
+
+    def remove_favourite(self) -> None:
+        names = [f["name"] for f in self.settings["favourites"]]
+        if not names:
+            self.set_status("No favourites saved.")
+            return
+        dlg = wx.SingleChoiceDialog(self, "Remove which favourite?",
+                                    "Remove favourite", names)
+        if dlg.ShowModal() == wx.ID_OK:
+            name = names[dlg.GetSelection()]
+            self.settings.remove_favourite(name)
+            self._rebuild_favourites()
+            self.set_status(f"Removed {name}.")
+        dlg.Destroy()
+
+    def copy_stream_url(self) -> None:
+        """Put the live stream's address on the clipboard.
+
+        Anything that plays HTTP -- VLC, a browser, a phone, a receiver this
+        app has no protocol for -- can then open it. It is the catch-all for
+        every device not in the list.
+        """
+        if not self._sources:
+            self.set_status("Nothing is being captured.")
+            return
+        urls = [src.url for src in self._sources if src.url]
+        if not urls:
+            self.set_status("This capture has no address to copy.")
+            return
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject("\n".join(urls)))
+            wx.TheClipboard.Close()
+            self.set_status(f"Copied {urls[0]}")
+        else:
+            self.set_status("Could not open the clipboard.")
+
+    def show_settings(self) -> None:
+        dlg = SettingsDialog(self, self.settings,
+                             list_output_devices(), list_input_devices())
+        if dlg.ShowModal() == wx.ID_OK:
+            dlg.apply()
+            if self.settings["global_hotkeys"]:
+                self.hotkeys.unregister_all()
+                self.hotkeys.register_all()
+            else:
+                self.hotkeys.unregister_all()
+            self.set_status("Settings saved.")
+        dlg.Destroy()
+
+    def _on_hotkey_action(self, action: str) -> None:
+        {"cast_audio": self.cast_audio,
+         "cast_screen": self.cast_screen,
+         "stop": self.stop,
+         "mute": self.toggle_mute,
+         "volume_up": lambda: self.nudge_volume(5),
+         "volume_down": lambda: self.nudge_volume(-5)}.get(
+            action, lambda: None)()
 
     def _on_device_selected(self) -> None:
         # All transport controls work on all device kinds.
@@ -872,9 +1205,9 @@ class MainFrame(wx.Frame):
     # ---------- playback ----------
 
     def play(self) -> None:
-        dev = self.selected_device()
+        devices = self.selected_devices()
         url = self.url_box.GetValue().strip()
-        if not dev:
+        if not devices:
             self.set_status("Pick a device first.")
             return
         if not url:
@@ -882,15 +1215,100 @@ class MainFrame(wx.Frame):
             self.url_box.SetFocus()
             return
         self.stop_silent()
-        self.current = dev
+        self.current = devices[0]
+        self._targets = list(devices)
         self._runner_fut = None
         self._stop_flag = False
+        self.settings.add_recent_url(url)
+        self.settings.note_device(devices[0].label)
+        self._refresh_recent()
+        for dev in self._group_sonos(devices):
+            self._dispatch(dev, url)
+
+    def _group_sonos(self, devices: list) -> list:
+        """Collapse several Sonos speakers into one grouped coordinator.
+
+        Sending the same stream to each speaker independently leaves them
+        audibly out of step. Grouping them means Sonos itself keeps them in
+        sync, and only the coordinator is told to play.
+        """
+        sonos = [d for d in devices if d.kind == "sonos"]
+        if len(sonos) < 2:
+            return devices
+        try:
+            coordinator_ip = sonos_group([d.key["ip"] for d in sonos])
+        except Exception as exc:
+            self.set_status(f"Sonos grouping failed: {exc}")
+            return devices
+        keep = [d for d in sonos if d.key["ip"] == coordinator_ip] or sonos[:1]
+        return [d for d in devices if d.kind != "sonos"] + keep
+
+    def _dispatch(self, dev: Device, url: str, mime: str = "",
+                  is_live: Optional[bool] = None,
+                  title: str = APP_TITLE) -> None:
+        """Send `url` to one device by whatever protocol it speaks."""
         if dev.kind == "chromecast":
-            self._play_chromecast(dev, url)
+            self._play_chromecast(dev, url, mime, is_live)
         elif dev.kind == "upnp":
-            self._play_upnp(dev, url)
+            self._play_upnp(dev, url, mime, title)
+        elif dev.kind == "sonos":
+            self._play_sonos(dev, url, mime, title)
+        elif dev.kind == "roku":
+            self._play_roku(dev, url, mime, title)
+        elif dev.kind == "kodi":
+            self._play_kodi(dev, url)
         else:
             self._play_airplay(dev, url)
+
+    # ---- Sonos ----
+
+    def _play_sonos(self, dev: Device, url: str, mime: str = "",
+                    title: str = APP_TITLE) -> None:
+        def worker() -> None:
+            try:
+                sonos_play(dev.key["ip"], url,
+                           title, mime or "audio/wav")
+                self._ui(self.set_status, f"Playing on {dev.name}.")
+            except Exception as exc:
+                message = f"Sonos error: {exc}"
+                self._ui(self.set_status, message)
+        threading.Thread(target=worker, daemon=True, name="sonos-play").start()
+        self.set_status(f"Connecting to {dev.name}...")
+
+    # ---- Roku ----
+
+    def _play_roku(self, dev: Device, url: str, mime: str = "",
+                   title: str = APP_TITLE) -> None:
+        def worker() -> None:
+            try:
+                roku_play(dev.key["base"], url, mime or "video/mp4", title)
+                self._ui(self.set_status, f"Playing on {dev.name}.")
+            except Exception as exc:
+                message = f"Roku error: {exc}"
+                self._ui(self.set_status, message)
+        threading.Thread(target=worker, daemon=True, name="roku-play").start()
+        self.set_status(f"Connecting to {dev.name}...")
+
+    # ---- Kodi ----
+
+    def _kodi_auth(self) -> tuple:
+        return (self.settings["kodi_username"], self.settings["kodi_password"])
+
+    def _play_kodi(self, dev: Device, url: str) -> None:
+        def worker() -> None:
+            try:
+                kodi_play(dev.key["base"], url, self._kodi_auth())
+                self._ui(self.set_status, f"Playing on {dev.name}.")
+            except urllib.error.HTTPError as exc:
+                message = ("Kodi refused the request; set a username and "
+                           "password in settings."
+                           if exc.code == 401 else f"Kodi error: {exc}")
+                self._ui(self.set_status, message)
+            except Exception as exc:
+                message = f"Kodi error: {exc}"
+                self._ui(self.set_status, message)
+        threading.Thread(target=worker, daemon=True, name="kodi-play").start()
+        self.set_status(f"Connecting to {dev.name}...")
 
     # ---- UPnP/DLNA ----
 
@@ -1044,7 +1462,7 @@ class MainFrame(wx.Frame):
                         self._stop_relay()
                 vol = cast.status.volume_level
                 self._ui(lambda: (self.vol_slider.SetValue(int(vol * 100)) if vol else None,
-                                  self.btn_playpause.SetLabel("&Pause")))
+                                  self.btn_playpause.SetLabel("Pa&use")))
             except Exception as exc:
                 self._ui(self.set_status, f"Cast error: {exc}")
                 # Playback never started; don't leave the relay running.
@@ -1286,58 +1704,101 @@ class MainFrame(wx.Frame):
     def _capture_container(self, dev: Device, audio_only: bool) -> str:
         """The wire format `dev` can actually play.
 
-        AirPlay is audio whatever was asked for: pyatv speaks RAOP, which
-        carries no video and cannot mirror a screen.
+        A receiver that cannot show a picture gets sound whatever was asked
+        for -- Sonos is speakers, and AirPlay here is RAOP, which carries no
+        video at all.
         """
-        if audio_only or dev.kind == "airplay":
+        if audio_only or not dev.supports_video:
             return "wav"
-        # Chromecast plays progressive fragmented MP4; DLNA renderers and TVs
-        # want MPEG-TS and reject fragmented MP4 outright.
-        return "mp4" if dev.kind == "chromecast" else "mpegts"
+        if dev.kind == "chromecast":
+            return "mp4"        # progressive fragmented MP4
+        if dev.kind == "roku":
+            # Roku's media player handles MP4 and HLS but has no MPEG-TS.
+            return "mp4"
+        return "mpegts"         # DLNA renderers, TVs and Kodi
+
+    def _capture_source(self, container: str, hwnd: int) -> ScreenSource:
+        """A capture configured from the saved quality and audio settings."""
+        chosen = preset(self.settings["capture_quality"])
+        return ScreenSource(
+            hwnd=hwnd, container=container,
+            fps=chosen["fps"], bitrate=chosen["bitrate"],
+            max_width=chosen["max_width"], max_height=chosen["max_height"],
+            keyframe_seconds=chosen["keyframe_seconds"],
+            audio_device=self.settings["capture_audio_device"],
+            mic_device=self.settings["capture_mic_device"],
+            av_offset_ms=int(self.settings["av_offset_ms"]))
 
     def _cast_capture(self, label: str, hwnd: int = 0,
                       audio_only: bool = False) -> None:
-        """Start a live capture and hand it to the selected device.
+        """Start a live capture and hand it to every selected device.
 
-        Starting the capture verifies the whole chain, which takes a few
-        seconds, so it runs off the UI thread -- and its failures are reported
-        rather than leaving a device that quietly plays nothing.
+        Receivers disagree about wire formats, so a selection spanning a
+        Chromecast and a DLNA amplifier needs two encodes of the same
+        capture. They are grouped by format and one source is started per
+        format -- the ordinary single-device case is unchanged, and the
+        mixed case costs an extra encoder rather than silently sending one
+        of them something it cannot play.
+
+        Starting a capture verifies the whole chain, which takes a few
+        seconds, so this runs off the UI thread and its failures are
+        reported rather than leaving a device that quietly plays nothing.
         """
-        dev = self.selected_device()
-        if not dev:
+        devices = self.selected_devices()
+        if not devices:
             self.set_status("Pick a device first.")
             return
         self.stop_silent()
-        self.current = dev
+        devices = self._group_sonos(devices)
+        self.current = devices[0]
+        self._targets = list(devices)
         self._stop_flag = False
-        airplay = dev.kind == "airplay"
-        container = self._capture_container(dev, audio_only)
-        # An AirPlay receiver gets sound even when the screen was asked for.
-        # Say so, rather than looking like a failure to send the picture.
-        kind = "audio" if container == "wav" else "video and audio"
-        self.set_status(f"Starting {label.lower()} capture ({kind})...")
+
+        # AirPlay reads the capture tap directly rather than over HTTP, so it
+        # needs a source to exist but not a stream to be served.
+        airplay = [d for d in devices if d.kind == "airplay"]
+        by_container: dict = {}
+        for dev in devices:
+            if dev.kind == "airplay":
+                continue
+            by_container.setdefault(
+                self._capture_container(dev, audio_only), []).append(dev)
+        if airplay and not by_container:
+            by_container["wav"] = []
+
+        formats = ", ".join(sorted(by_container)) or "audio"
+        names = ", ".join(d.name for d in devices)
+        self.set_status(f"Starting {label.lower()} capture "
+                        f"({formats}) for {names}...")
 
         def worker() -> None:
-            try:
-                src = ScreenSource(hwnd=hwnd, container=container)
-                # AirPlay reads the tap directly, so there is no HTTP stream
-                # to verify -- and nothing would connect to it if there were.
-                url = src.start(verify=not airplay)
-            except Exception as exc:
-                message = f"Capture failed: {exc}"
-                self._ui(self.set_status, message)
-                return
-            if self._stop_flag:
-                src.stop()
-                return
-            self._source = src
-            if airplay:
-                self._ui(self._play_airplay, dev, "", src)
-            elif dev.kind == "chromecast":
-                self._ui(self._play_chromecast, dev, url, src.mime, True)
-            else:
-                self._ui(self._play_upnp, dev, url, src.mime,
-                         f"{APP_TITLE}: {label}")
+            started = []
+            for container, group in by_container.items():
+                try:
+                    src = self._capture_source(container, hwnd)
+                    # Nothing will connect to a source that only exists to
+                    # feed AirPlay, so there is nothing to verify.
+                    src.start(verify=bool(group))
+                except Exception as exc:
+                    for done in started:
+                        done.stop()
+                    message = f"Capture failed: {exc}"
+                    self._ui(self.set_status, message)
+                    return
+                started.append(src)
+                if self._stop_flag:
+                    for done in started:
+                        done.stop()
+                    return
+                for dev in group:
+                    self._ui(self._dispatch, dev, src.url, src.mime, True,
+                             f"{APP_TITLE}: {label}")
+            self._sources = started
+            self._cast_started = time.monotonic()
+            for dev in airplay:
+                self._ui(self._play_airplay, dev, "", started[0])
+            for dev in devices:
+                self.settings.note_device(dev.label)
 
         threading.Thread(target=worker, daemon=True,
                          name="caster-capture").start()
@@ -1397,12 +1858,29 @@ class MainFrame(wx.Frame):
         self._runner_fut = None
         self._kill_ffmpeg()
         self._stop_relay()
-        src = getattr(self, "_source", None)
-        if src:
-            src.stop()
-            self._source = None
-        if self.current and self.current.kind == "upnp":
-            upnp_stop(self.current.key["control_url"])
+        for src in self._sources:
+            try:
+                src.stop()
+            except Exception:
+                pass
+        self._sources = []
+        self._cast_started = 0.0
+        # Every device that was being cast to, not just the primary one:
+        # otherwise a multi-room cast leaves the other speakers running with
+        # nothing left to feed them.
+        for dev in (self._targets or ([self.current] if self.current else [])):
+            try:
+                if dev.kind == "upnp":
+                    upnp_stop(dev.key["control_url"])
+                elif dev.kind == "sonos":
+                    sonos_stop(dev.key["ip"])
+                elif dev.kind == "roku":
+                    roku_stop(dev.key["base"])
+                elif dev.kind == "kodi":
+                    kodi_stop(dev.key["base"], self._kodi_auth())
+            except Exception:
+                pass
+        self._targets = []
         if self.cast:
             try:
                 self.cast.stop_app()
@@ -1447,17 +1925,37 @@ class MainFrame(wx.Frame):
                 mc = self.cast.media_controller
                 if mc.status.player_state == "PLAYING":
                     mc.pause()
-                    self.btn_playpause.SetLabel("&Play")
+                    self.btn_playpause.SetLabel("&Resume")
                     self.set_status("Paused.")
                 else:
                     mc.play()
-                    self.btn_playpause.SetLabel("&Pause")
+                    self.btn_playpause.SetLabel("Pa&use")
                     self.set_status("Playing.")
             except Exception as exc:
                 self.set_status(f"Error: {exc}")
             return
         if self.atv:
             self._airplay_pause()
+            return
+        primary = self.current
+        if primary and primary.kind == "kodi":
+            try:
+                kodi_pause(primary.key["base"], self._kodi_auth())
+                self.set_status("Play or pause sent to Kodi.")
+            except Exception as exc:
+                self.set_status(f"Kodi error: {exc}")
+            return
+        if primary and primary.kind == "roku":
+            try:
+                roku_key(primary.key["base"], "Play")
+                self.set_status("Play or pause sent to Roku.")
+            except Exception as exc:
+                self.set_status(f"Roku error: {exc}")
+            return
+        if primary and primary.kind in ("upnp", "sonos"):
+            # A live capture has nothing to pause into: there is no buffer
+            # to resume from, so stopping is the honest action.
+            self.set_status("This device has no pause; use Stop.")
             return
         self.set_status("Nothing playing.")
 
@@ -1470,13 +1968,13 @@ class MainFrame(wx.Frame):
                 self._air_pos += time.monotonic() - self._air_play_t0
                 self._air_play_t0 = None
             self._kill_ffmpeg()
-            self.btn_playpause.SetLabel("&Play")
+            self.btn_playpause.SetLabel("&Resume")
             self.set_status("Paused.")
         elif self._air_state == "paused" and self._air_wake:
             self._air_state = "playing"
             self._air_play_t0 = time.monotonic()
             self.loop_thread.submit(self._set_event(self._air_wake))
-            self.btn_playpause.SetLabel("&Pause")
+            self.btn_playpause.SetLabel("Pa&use")
             self.set_status("Playing.")
 
     def seek_relative(self, seconds: int) -> None:
@@ -1531,15 +2029,69 @@ class MainFrame(wx.Frame):
         return pos
 
     def _on_volume(self, event) -> None:
-        level = self.vol_slider.GetValue()
+        self.apply_volume(self.vol_slider.GetValue())
+
+    def apply_volume(self, level: int, remember: bool = True) -> None:
+        """Set the volume on every device being cast to.
+
+        Each protocol has its own way of being told, and a room is only
+        usefully quieter if all of it gets quieter.
+        """
+        level = max(0, min(100, int(level)))
+        if remember:
+            self.settings.set("volume", level)
         try:
             if self.cast:
                 self.cast.set_volume(level / 100.0)
             if self.atv:
-                atv = self.atv
-                self.loop_thread.submit(_set_atv_volume(atv, float(level)))
+                self.loop_thread.submit(_set_atv_volume(self.atv, float(level)))
         except Exception:
             pass
+
+        def worker() -> None:
+            for dev in list(self._targets):
+                try:
+                    if dev.kind == "sonos":
+                        sonos_set_volume(dev.key["ip"], level)
+                    elif dev.kind == "kodi":
+                        kodi_set_volume(dev.key["base"], level,
+                                        self._kodi_auth())
+                    elif dev.kind == "upnp":
+                        upnp_set_volume(dev.key["control_url"], level)
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True, name="volume").start()
+
+    def nudge_volume(self, delta: int) -> None:
+        level = max(0, min(100, self.vol_slider.GetValue() + delta))
+        self.vol_slider.SetValue(level)
+        self.apply_volume(level)
+        self.set_status(f"Volume {level} percent.")
+
+    def toggle_mute(self) -> None:
+        """Silence the receivers without ending the cast.
+
+        Restoring the previous level rather than a fixed one matters: coming
+        back from mute to full volume in a quiet house is unpleasant.
+        """
+        if self._muted:
+            self._muted = False
+            self.vol_slider.SetValue(self._pre_mute_volume)
+            self.apply_volume(self._pre_mute_volume)
+            self.set_status(f"Unmuted, volume {self._pre_mute_volume} percent.")
+        else:
+            self._muted = True
+            self._pre_mute_volume = self.vol_slider.GetValue()
+            self.vol_slider.SetValue(0)
+            self.apply_volume(0, remember=False)
+            self.set_status("Muted.")
+        # Roku has no volume API, only the remote's own keys.
+        for dev in list(self._targets):
+            if dev.kind == "roku":
+                try:
+                    roku_key(dev.key["base"], "VolumeMute")
+                except Exception:
+                    pass
 
     def _on_seek_release(self, event) -> None:
         self._seek_slider(self.pos_slider.GetValue())
@@ -1599,6 +2151,66 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
+    def _on_watchdog(self, event) -> None:
+        """Slow housekeeping: the sleep timer, and keeping a cast alive."""
+        self._check_sleep_timer()
+        if self.settings["auto_reconnect"]:
+            self._check_reconnect()
+
+    def _check_sleep_timer(self) -> None:
+        minutes = int(self.settings["sleep_timer_minutes"])
+        if not minutes or not self._cast_started:
+            return
+        if time.monotonic() - self._cast_started >= minutes * 60:
+            self.stop_silent()
+            self.set_status(f"Stopped after {minutes} minutes.")
+
+    def _check_reconnect(self) -> None:
+        """Put a cast back that ended without being asked to.
+
+        Only the two cases that can actually be detected are handled. A
+        Chromecast reports going idle, and a Sonos reports its transport
+        state; everything else pulls the stream over HTTP, where a device
+        that goes away simply closes the connection and there is nothing
+        left to ask.
+        """
+        if self._stop_flag or not self._sources or not self._targets:
+            return
+        source = self._sources[0]
+        if self.cast:
+            try:
+                if (self.cast.media_controller.status.player_state == "IDLE"
+                        and self.current):
+                    self.set_status("Receiver dropped; reconnecting...")
+                    self._dispatch(self.current, source.url, source.mime, True)
+                    return
+            except Exception:
+                pass
+        self._check_sonos_resync(source)
+
+    def _check_sonos_resync(self, source) -> None:
+        """Periodically hand Sonos a fresh connection.
+
+        A Sonos connection left open for hours drifts: the delay between
+        this machine and the speaker creeps upward with nothing on this side
+        causing it, and only a new connection resets it. Reconnecting on a
+        schedule buys that reset for a brief re-buffering gap instead of
+        requiring the app to be restarted.
+        """
+        hours = int(self.settings["sonos_resync_hours"])
+        if not hours or not self._cast_started:
+            return
+        if time.monotonic() - self._cast_started < hours * 3600:
+            return
+        sonos = [d for d in self._targets if d.kind == "sonos"]
+        if not sonos:
+            return
+        self._cast_started = time.monotonic()
+        for dev in sonos:
+            self._play_sonos(dev, source.url, source.mime,
+                             f"{APP_TITLE}: system audio")
+        self.set_status("Refreshed the Sonos connection.")
+
     def _reset_sliders(self) -> None:
         self._updating_slider = True
         self.pos_slider.SetValue(0)
@@ -1607,6 +2219,24 @@ class MainFrame(wx.Frame):
     # ---------- shutdown ----------
 
     def _on_close(self, event) -> None:
+        # Closing to the tray keeps the hotkeys live, which is the point of
+        # having them: casting the PC's sound should not need this window.
+        if (self.settings["minimise_to_tray"] and event.CanVeto()
+                and self._ensure_tray()):
+            self.Hide()
+            event.Veto()
+            return
+        try:
+            self.settings.set("volume", self.vol_slider.GetValue())
+            self.hotkeys.unregister_all()
+            self.status_timer.Stop()
+            self.watchdog_timer.Stop()
+            if self._tray:
+                self._tray.RemoveIcon()
+                self._tray.Destroy()
+                self._tray = None
+        except Exception:
+            pass
         try:
             self.stop_silent()
             fut = self._runner_fut
@@ -1647,7 +2277,8 @@ async def _set_atv_volume(atv, level: float) -> None:
 def main() -> None:
     app = wx.App(False)
     frame = MainFrame()
-    frame.set_status("Ready. Ctrl+D to scan.")
+    if not frame.settings["discover_on_launch"]:
+        frame.set_status("Ready. Ctrl+D to scan.")
     app.MainLoop()
 
 

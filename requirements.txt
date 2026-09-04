@@ -1,0 +1,10 @@
+# Caster runtime dependencies.
+wxPython
+pychromecast
+pyatv
+zeroconf
+yt-dlp
+pyaudiowpatch
+# Sonos. Optional: without it every other protocol still works and Sonos
+# speakers simply do not appear in the device list.
+soco

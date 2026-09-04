@@ -21,6 +21,14 @@ a = Analysis(
         "aiohttp",
         "pyaudiowpatch",
         "caster_extras",
+        "caster_config",
+        "caster_devices",
+        "caster_ui",
+        "wx.adv",
+        # Sonos; optional at runtime, but bundle it when it is installed.
+        "soco",
+        "soco.discovery",
+        "soco.services",
         # pyatv protocols are loaded dynamically via entry points
         "pyatv.protocols.raop",
         "pyatv.protocols.airplay",

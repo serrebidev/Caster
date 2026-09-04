@@ -60,7 +60,10 @@ def _no_window_kwargs() -> dict:
 def upnp_discover(timeout: int = 6) -> list:
     """SSDP M-SEARCH for AVTransport media renderers.
 
-    Returns [(friendly_name, control_url), ...].
+    Returns [(friendly_name, control_url, manufacturer), ...]. The
+    manufacturer is what lets a caller recognise a renderer that has its own
+    better-suited protocol -- a Sonos answers here too, and driving it as
+    plain DLNA misses its grouping and its transport quirks.
     """
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
@@ -99,8 +102,8 @@ def upnp_discover(timeout: int = 6) -> list:
 
 
 def _upnp_fetch_control(location: str):
-    """Fetch a UPnP device description XML and return its AVTransport
-    control URL plus friendly name."""
+    """Fetch a UPnP device description XML and return its friendly name,
+    AVTransport control URL and manufacturer."""
     try:
         with _urlreq.urlopen(location, timeout=5) as r:
             body = r.read().decode("utf-8", "replace")
@@ -109,6 +112,8 @@ def _upnp_fetch_control(location: str):
     import html as _html
     name_m = re.search(r"<friendlyName>([^<]+)</friendlyName>", body)
     name = _html.unescape(name_m.group(1).strip()) if name_m else location
+    maker_m = re.search(r"<manufacturer>([^<]+)</manufacturer>", body)
+    maker = _html.unescape(maker_m.group(1).strip()) if maker_m else ""
     for svc_m in re.finditer(r"<service>(.*?)</service>", body, re.S):
         svc = svc_m.group(1)
         if "AVTransport" not in svc:
@@ -120,7 +125,7 @@ def _upnp_fetch_control(location: str):
         # both root-absolute "/x" and relative "x" controlURLs).
         import urllib.parse as _up
         url = _up.urljoin(location, ctl.group(1))
-        return (name, url)
+        return (name, url, maker)
     return None
 
 
@@ -222,6 +227,37 @@ def yxc_set_input(host: str, yxc_input: str = "server") -> bool:
             return b'"response_code":0' in r.read(200)
     except Exception:
         return False
+
+
+def upnp_set_volume(control_url: str, level: int) -> None:
+    """Set a renderer's volume through RenderingControl.
+
+    The control URL for it is not the AVTransport one, but on every
+    renderer seen so far it is the same path with the service name swapped,
+    which is what the UPnP device description would say anyway.
+    """
+    rendering_url = re.sub(r"AVTransport", "RenderingControl", control_url)
+    args = (
+        '<u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">'
+        "<InstanceID>0</InstanceID><Channel>Master</Channel>"
+        f"<DesiredVolume>{max(0, min(100, int(level)))}</DesiredVolume>"
+        "</u:SetVolume>"
+    )
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>" + args + "</s:Body></s:Envelope>"
+    )
+    req = _urlreq.Request(
+        rendering_url, data=body.encode("utf-8"), method="POST",
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPACTION":
+                '"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"',
+        })
+    with _urlreq.urlopen(req, timeout=6) as r:
+        r.read()
 
 
 def upnp_stop(control_url: str) -> None:
@@ -349,7 +385,11 @@ class AudioTap:
     #: ~400 ms of slack per subscriber before the oldest audio is dropped.
     QUEUE_CHUNKS = 20
 
-    def __init__(self) -> None:
+    def __init__(self, device_name: str = "") -> None:
+        #: Substring of the output device to capture. Empty means whatever
+        #: Windows is currently playing through by default.
+        self.device_name = device_name
+        self.device_label = ""
         self.rate = 48000
         self.channels = 2
         self._subs: list = []
@@ -410,16 +450,8 @@ class AudioTap:
         try:
             import pyaudiowpatch as pw
             pa = pw.PyAudio()
-            api = pa.get_host_api_info_by_type(pw.paWASAPI)
-            dev = pa.get_device_info_by_index(api["defaultOutputDevice"])
-            if not dev.get("isLoopbackDevice"):
-                for lb in pa.get_loopback_device_info_generator():
-                    if dev["name"] in lb["name"]:
-                        dev = lb
-                        break
-            if not dev.get("isLoopbackDevice"):
-                raise RuntimeError(
-                    f"no loopback capture for output device {dev['name']!r}")
+            dev = _pick_loopback_device(pa, pw, self.device_name)
+            self.device_label = dev["name"]
             self.channels = int(dev["maxInputChannels"]) or 2
             self.rate = int(dev["defaultSampleRate"])
             frames = max(1, int(self.rate * self.PERIOD))
@@ -458,6 +490,93 @@ class AudioTap:
                 pass
 
 
+def _pick_loopback_device(pa, pw, wanted: str = ""):
+    """The WASAPI loopback device to capture.
+
+    `wanted` is matched against the device name; empty means the current
+    default output. Windows exposes loopback as a separate *input* device
+    shadowing each output, so the default output has to be mapped onto its
+    loopback twin before it can be recorded.
+    """
+    loopbacks = list(pa.get_loopback_device_info_generator())
+    if wanted:
+        lowered = wanted.lower()
+        for dev in loopbacks:
+            if lowered in dev["name"].lower():
+                return dev
+        # Named device is gone (unplugged headphones, a dock removed).
+        # Fall through to the default rather than refusing to cast.
+    api = pa.get_host_api_info_by_type(pw.paWASAPI)
+    dev = pa.get_device_info_by_index(api["defaultOutputDevice"])
+    if dev.get("isLoopbackDevice"):
+        return dev
+    for lb in loopbacks:
+        if dev["name"] in lb["name"]:
+            return lb
+    if loopbacks:
+        return loopbacks[0]
+    raise RuntimeError(
+        f"no loopback capture available for output device {dev['name']!r}")
+
+
+def list_output_devices() -> list:
+    """Capturable outputs as [(label, name), ...], default first."""
+    try:
+        import pyaudiowpatch as pw
+    except ImportError:
+        return []
+    devices = [("Default output", "")]
+    pa = None
+    try:
+        pa = pw.PyAudio()
+        for dev in pa.get_loopback_device_info_generator():
+            # Windows suffixes every loopback name; the bare name is what a
+            # person recognises, and what _pick_loopback_device matches on.
+            name = dev["name"].replace(" [Loopback]", "").strip()
+            devices.append((name, name))
+    except Exception:
+        pass
+    finally:
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+    seen = set()
+    unique = []
+    for label, name in devices:
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        unique.append((label, name))
+    return unique
+
+
+def list_input_devices() -> list:
+    """Microphones as [(label, dshow name), ...], default first.
+
+    Read from ffmpeg rather than pyaudiowpatch because the mic is mixed in
+    by ffmpeg's own DirectShow input, and only the name DirectShow uses
+    will actually open there.
+    """
+    devices = [("No microphone", "")]
+    try:
+        proc = subprocess.run(
+            [_find_ffmpeg(), "-hide_banner", "-list_devices", "true",
+             "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=20, **_no_window_kwargs())
+    except Exception:
+        return devices
+    # ffmpeg lists devices on stderr, audio ones tagged "(audio)".
+    for line in (proc.stderr or "").splitlines():
+        if "(audio)" not in line:
+            continue
+        match = re.search(r'"([^"]+)"', line)
+        if match:
+            devices.append((match.group(1), match.group(1)))
+    return devices
+
+
 def wav_header(rate: int, channels: int, data_bytes: int) -> bytes:
     """A 44-byte canonical PCM WAV header declaring `data_bytes` of samples."""
     block = channels * 2
@@ -472,12 +591,15 @@ def wav_header(rate: int, channels: int, data_bytes: int) -> bytes:
 #: Declared payload size of an endless WAV stream.
 #:
 #: Receivers want *a* length -- zero makes several of them stop before the
-#: first sample -- and a live capture has none, so a streaming WAV declares
-#: the largest size its 32-bit header fields can express and simply keeps
-#: going. The Content-Length must be told the same story, or renderers that
-#: trust one over the other disagree about where the stream ends. At 48 kHz
-#: stereo this caps a single session at a little over six hours.
-ENDLESS_WAV_BYTES = 0xFFFFFFFF - 36
+#: first sample -- and a live capture has none, so a streaming WAV declares a
+#: very large size and simply keeps going. The Content-Length must be told the
+#: same story, or renderers that trust one over the other disagree about where
+#: the stream ends. This is the largest *signed* 32-bit value rather than the
+#: unsigned ceiling: receivers that read the RIFF sizes into a signed int --
+#: Sonos among them -- see anything above it as negative. At 48 kHz stereo it
+#: caps one session at about three hours, after which the receiver ends the
+#: track and the reconnect watchdog starts a fresh one.
+ENDLESS_WAV_BYTES = 0x7FFFFFFF
 
 
 class LiveWavReader(io.BufferedIOBase):
@@ -608,24 +730,32 @@ class ScreenSource:
     it is effectively realtime rather than merely low latency.
     """
 
-    #: Cap on encoded frame size. A 4K desktop at 30fps buries any encoder and
-    #: no receiver here benefits from more than 1080p.
-    MAX_WIDTH = 1920
-    MAX_HEIGHT = 1080
-    #: How often to emit a keyframe. This is the floor on how long a receiver
-    #: waits before it can show a picture.
-    KEYFRAME_SECONDS = 0.5
-
     def __init__(self, hwnd: int = 0, container: str = "mp4",
-                 fps: int = 30, bitrate: str = "6M") -> None:
+                 fps: int = 30, bitrate: str = "6M",
+                 max_width: int = 1920, max_height: int = 1080,
+                 keyframe_seconds: float = 0.5,
+                 audio_device: str = "", mic_device: str = "",
+                 av_offset_ms: int = 0) -> None:
         if container not in CONTAINERS:
             raise ValueError(f"unknown container {container!r}")
         self.hwnd = hwnd
         self.container = container
         self.fps = fps
         self.bitrate = bitrate
+        #: Cap on encoded frame size. A 4K desktop at 60fps buries any
+        #: encoder, and no receiver here benefits from more than 1080p.
+        self.max_width = max_width
+        self.max_height = max_height
+        #: How often to emit a keyframe: the floor on how long a receiver
+        #: waits before it can show a picture.
+        self.keyframe_seconds = keyframe_seconds
+        #: DirectShow microphone to mix into the system audio, or "".
+        self.mic_device = mic_device
+        #: Positive delays the sound behind the picture, for a receiver that
+        #: runs audio early. Negative delays the picture instead.
+        self.av_offset_ms = av_offset_ms
         self.path, self.mime, self.audio_only = CONTAINERS[container]
-        self.tap = AudioTap()
+        self.tap = AudioTap(audio_device)
         self.url = ""
         self.httpd = None
         self._procs: set = set()
@@ -742,7 +872,9 @@ class ScreenSource:
         milliseconds. Surround or an exotic sample rate still needs
         normalising, because receivers reject it.
         """
-        return self.tap.channels <= 2 and self.tap.rate in (44100, 48000)
+        return (not self.mic_device
+                and self.tap.channels <= 2
+                and self.tap.rate in (44100, 48000))
 
     def wire_rate(self) -> int:
         return self.tap.rate if self.pcm_is_directly_usable() else 48000
@@ -840,15 +972,39 @@ class ScreenSource:
         from caster import pick_h264_encoder   # deferred: avoids an import cycle
         cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error",
                "-fflags", "+nobuffer", "-flags", "+low_delay"]
+        offset = self.av_offset_ms / 1000.0
         if not self.audio_only:
+            # A receiver that plays sound ahead of picture is corrected by
+            # holding one input back; which one depends on the sign.
+            if offset < 0:
+                cmd += ["-itsoffset", f"{-offset:.3f}"]
             cmd += self._video_input()
+        if not self.audio_only and offset > 0:
+            cmd += ["-itsoffset", f"{offset:.3f}"]
         cmd += ["-thread_queue_size", "1024",
                 "-f", "s16le", "-ar", str(self.tap.rate),
                 "-ac", str(self.tap.channels), "-i", "pipe:0"]
-        if self.audio_only:
-            cmd += ["-map", "0:a"]
+        # Input order decides every -map below: [video] system-audio [mic].
+        system_audio = "0:a" if self.audio_only else "1:a"
+        mic_input = ("1" if self.audio_only else "2") if self.mic_device else ""
+        if self.mic_device:
+            cmd += ["-thread_queue_size", "1024", "-f", "dshow",
+                    "-i", f"audio={self.mic_device}"]
+        if not self.audio_only:
+            cmd += ["-map", "0:v"]
+        if self.mic_device:
+            # amix rather than two audio tracks: receivers play the first
+            # audio stream and ignore the rest, so narration has to land in
+            # the same one. dropout_transition=0 stops amix from ducking the
+            # system audio every time the microphone falls quiet.
+            cmd += ["-filter_complex",
+                    f"[{system_audio}][{mic_input}:a]"
+                    "amix=inputs=2:duration=longest:dropout_transition=0,"
+                    "aresample=async=1:first_pts=0[aout]",
+                    "-map", "[aout]"]
         else:
-            cmd += ["-map", "0:v", "-map", "1:a"]
+            cmd += ["-map", system_audio]
+        if not self.audio_only:
             encoder = pick_h264_encoder()
             cmd += ["-vf", self._video_filter(),
                     "-c:v", encoder,
@@ -864,12 +1020,14 @@ class ScreenSource:
                     "-g", str(max(self.fps // 2, 1)),
                     "-keyint_min", str(max(self.fps // 2, 1)),
                     "-force_key_frames",
-                    f"expr:gte(t,n_forced*{self.KEYFRAME_SECONDS})",
+                    f"expr:gte(t,n_forced*{self.keyframe_seconds})",
                     "-bf", "0",     # B-frames reorder, and reordering is delay
                     "-pix_fmt", "yuv420p"]
-        # Resample against the output clock rather than letting capture jitter
-        # accumulate as drift between the picture and the sound.
-        cmd += ["-af", "aresample=async=1:first_pts=0"]
+        if not self.mic_device:
+            # Resample against the output clock rather than letting capture
+            # jitter accumulate as drift between picture and sound. With a
+            # microphone this already happens inside the filter graph.
+            cmd += ["-af", "aresample=async=1:first_pts=0"]
         cmd += self._output_args()
         return cmd + ["pipe:1"]
 
@@ -912,8 +1070,8 @@ class ScreenSource:
         # Cap the size, then force both dimensions even: H.264 4:2:0 requires
         # it, and a window can be any odd size at all.
         return (prefix +
-                f"scale=w='min(iw,{self.MAX_WIDTH})':"
-                f"h='min(ih,{self.MAX_HEIGHT})':"
+                f"scale=w='min(iw,{self.max_width})':"
+                f"h='min(ih,{self.max_height})':"
                 "force_original_aspect_ratio=decrease,"
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2")
 

@@ -9,6 +9,7 @@ dist/
 # Logs and local test artifacts
 *.log
 *.txt
+!requirements.txt
 
 # Workspace
 .freebuff/
