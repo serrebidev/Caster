@@ -146,4 +146,4 @@ By inspection, not reproduced:
   for a window. Binary can be `ffmpeg.EXE` — match case-insensitively.
 - Bash heredocs eat backslashes: `\n` inside one becomes a real newline. Use the Write tool
   or `chr(92)` for anything with backslashes.
-- `AGENTS.local.md` is generated. Not this file — keep this one about Caster only.
+Update this with new important information like what is in this file if you notice changes, or something new that should be added here.
