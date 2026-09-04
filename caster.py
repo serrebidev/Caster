@@ -88,6 +88,12 @@ from caster_ui import (
 APP_TITLE = "Caster"
 APP_VERSION = "1.1.1"
 
+#: How long each discovery protocol listens for replies. SSDP and mDNS
+#: answer over a few seconds rather than at once, so this is the floor on
+#: how quick a scan can be -- and, because the protocols now run in
+#: parallel, very nearly the whole cost of one.
+DISCOVER_SECONDS = 5
+
 YT_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})"
 )
@@ -965,104 +971,201 @@ class MainFrame(wx.Frame):
         self.set_status("Scanning...")
         threading.Thread(target=self._discover_sync, daemon=True).start()
 
-    def _discover_sync(self) -> None:
+    def _scan_chromecast(self, zc) -> dict:
+        """Cast devices, by browsing _googlecast._tcp directly.
+
+        pychromecast's own browser misses some Cast devices (e.g. the FFM
+        smart TVs here), so read the TXT records ourselves. Each service is
+        resolved the moment it is announced instead of after the browse
+        window closes: resolving them one at a time, several seconds
+        apiece, was most of what made a scan feel slow.
+        """
+        if zc is None:
+            return {}
+        import socket as socket_mod
+
         found: dict[str, Device] = {}
-        # pychromecast's own browser misses some Cast devices (e.g. the FFM
-        # smart TVs here), so browse _googlecast._tcp directly and read the
-        # TXT records ourselves.
+        seen: set[str] = set()
+        lock = threading.Lock()
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="cast-resolve")
+
+        def resolve(type_: str, name: str) -> None:
+            try:
+                info = zc.get_service_info(type_, name, 3000)
+            except Exception:
+                return
+            if not info or not info.addresses:
+                return
+            props = {}
+            for k, v in info.properties.items():
+                kd = k.decode() if isinstance(k, bytes) else k
+                vd = (
+                    v.decode(errors="replace")
+                    if isinstance(v, bytes)
+                    else (v or "")
+                )
+                props[kd] = vd
+            host = socket_mod.inet_ntoa(info.addresses[0])
+            fn = props.get("fn") or name.split(".")[0]
+            device = Device("chromecast", fn, {
+                "host": host,
+                "port": info.port or 8009,
+                "uuid": props.get("id") or uuidlib.uuid4().hex,
+                "model": props.get("md") or "Chromecast",
+            })
+            with lock:
+                found[fn] = device
+
+        class _Listener:
+            def add_service(self, zc_, type_, name):
+                with lock:
+                    if name in seen:
+                        return
+                    seen.add(name)
+                pool.submit(resolve, type_, name)
+
+            def update_service(self, zc_, type_, name):
+                pass
+
+            def remove_service(self, zc_, type_, name):
+                pass
+
+        browser = None
         try:
-            import socket as socket_mod
-            from zeroconf import ServiceBrowser, Zeroconf
-
-            hits: list[tuple[str, str]] = []
-
-            class _Listener:
-                def add_service(self, zc, type_, name):
-                    hits.append((type_, name))
-
-                def update_service(self, zc, type_, name):
-                    pass
-
-                def remove_service(self, zc, type_, name):
-                    pass
-
-            zc = Zeroconf()
-            ServiceBrowser(zc, "_googlecast._tcp.local.", _Listener())
-            time.sleep(8)
-            for type_, name in hits:
+            browser = zeroconf.ServiceBrowser(
+                zc, "_googlecast._tcp.local.", _Listener())
+            time.sleep(DISCOVER_SECONDS)
+        finally:
+            if browser is not None:
                 try:
-                    info = zc.get_service_info(type_, name, 4000)
+                    browser.cancel()
                 except Exception:
-                    continue
-                if not info or not info.addresses:
-                    continue
-                props = {}
-                for k, v in info.properties.items():
-                    kd = k.decode() if isinstance(k, bytes) else k
-                    vd = (
-                        v.decode(errors="replace")
-                        if isinstance(v, bytes)
-                        else (v or "")
-                    )
-                    props[kd] = vd
-                host = socket_mod.inet_ntoa(info.addresses[0])
-                fn = props.get("fn") or name.split(".")[0]
-                found[fn] = Device("chromecast", fn, {
-                    "host": host,
-                    "port": info.port or 8009,
-                    "uuid": props.get("id") or uuidlib.uuid4().hex,
-                    "model": props.get("md") or "Chromecast",
-                })
-            zc.close()
-        except Exception:
-            traceback.print_exc()
-        try:
-            futs = asyncio.run_coroutine_threadsafe(
-                pyatv.scan(self.loop_thread.loop, timeout=6,
-                           protocol={Protocol.RAOP, Protocol.AirPlay}),
-                self.loop_thread.loop,
-            )
-            for cfg in futs.result(20):
-                if not cfg.name:
-                    continue
-                # Sonos advertises AirPlay 2, and streaming to it that way
-                # fails: it demands MFi hardware authentication no Python
-                # client can perform, and refuses the audio port. Its own
-                # protocol is discovered separately and works.
-                if looks_like_sonos(cfg.name, str(
-                        getattr(cfg, "device_info", ""))):
-                    continue
-                found.setdefault(cfg.name, Device("airplay", cfg.name, cfg))
-        except Exception:
-            traceback.print_exc()
-        try:
-            for name, url, maker in upnp_discover(timeout=8):
-                # A Sonos answers UPnP too, but wants its own transport
-                # handling and its own grouping; it is discovered natively
-                # below. Listing it twice would just offer the worse path.
-                if looks_like_sonos(name, maker):
-                    continue
-                found.setdefault(
-                    name, Device("upnp", name,
-                                 {"control_url": url.replace("&amp;", "&")}))
-        except Exception:
-            traceback.print_exc()
-        try:
+                    pass
+            # Waits for the resolves already in flight; they were started
+            # while the browse window was still open, so this is a tail of
+            # a fraction of a second rather than another full round.
+            pool.shutdown(wait=True)
+        return found
+
+    def _scan_airplay(self) -> dict:
+        found: dict[str, Device] = {}
+        futs = asyncio.run_coroutine_threadsafe(
+            pyatv.scan(self.loop_thread.loop, timeout=DISCOVER_SECONDS,
+                       protocol={Protocol.RAOP, Protocol.AirPlay}),
+            self.loop_thread.loop,
+        )
+        for cfg in futs.result(DISCOVER_SECONDS + 15):
+            if not cfg.name:
+                continue
+            # Sonos advertises AirPlay 2, and streaming to it that way
+            # fails: it demands MFi hardware authentication no Python
+            # client can perform, and refuses the audio port. Its own
+            # protocol is discovered separately and works.
+            if looks_like_sonos(cfg.name, str(
+                    getattr(cfg, "device_info", ""))):
+                continue
+            found.setdefault(cfg.name, Device("airplay", cfg.name, cfg))
+        return found
+
+    def _scan_upnp(self) -> dict:
+        found: dict[str, Device] = {}
+        for name, url, maker in upnp_discover(timeout=DISCOVER_SECONDS):
+            # A Sonos answers UPnP too, but wants its own transport
+            # handling and its own grouping; it is discovered natively
+            # by _scan_sonos. Listing it twice would just offer the
+            # worse path.
+            if looks_like_sonos(name, maker):
+                continue
+            found.setdefault(
+                name, Device("upnp", name,
+                             {"control_url": url.replace("&amp;", "&")}))
+        return found
+
+    def _scan_sonos(self) -> dict:
+        return {
+            name: Device("sonos", name, {"ip": ip})
             for name, ip in sonos_discover(
-                    timeout=5, seed_ips=self.settings["sonos_seed_ips"]):
-                found[name] = Device("sonos", name, {"ip": ip})
-        except Exception:
-            traceback.print_exc()
+                timeout=DISCOVER_SECONDS,
+                seed_ips=self.settings["sonos_seed_ips"])
+        }
+
+    def _scan_roku(self) -> dict:
+        return {name: Device("roku", name, {"base": base})
+                for name, base in roku_discover(timeout=DISCOVER_SECONDS)}
+
+    def _scan_kodi(self, zc) -> dict:
+        return {name: Device("kodi", name, {"base": base})
+                for name, base in kodi_discover(
+                    timeout=DISCOVER_SECONDS, zc=zc)}
+
+    def _discover_sync(self) -> None:
+        """Scan every protocol at once.
+
+        Each of these waits out a fixed listen window -- SSDP, mDNS and
+        pyatv all collect replies over several seconds rather than
+        answering at once -- so run one after another the scan cost the
+        sum of six windows, well over half a minute. Run together it
+        costs the longest single window instead.
+        """
         try:
-            for name, base in roku_discover(timeout=4):
-                found.setdefault(name, Device("roku", name, {"base": base}))
+            # One Zeroconf for both mDNS scans. A second instance would
+            # bind port 5353 again and send the same queries twice for
+            # nothing; the two browsers on it are independent.
+            zc = zeroconf.Zeroconf()
         except Exception:
             traceback.print_exc()
+            zc = None
+
+        scans = [
+            ("chromecast", lambda: self._scan_chromecast(zc)),
+            ("airplay", self._scan_airplay),
+            ("upnp", self._scan_upnp),
+            ("sonos", self._scan_sonos),
+            ("roku", self._scan_roku),
+            ("kodi", lambda: self._scan_kodi(zc)),
+        ]
+
+        def run(scan) -> dict:
+            try:
+                return scan() or {}
+            except Exception:
+                # One missing protocol should cost its own devices and
+                # nothing else, so a failure here is never raised out.
+                traceback.print_exc()
+                return {}
+
+        results: dict[str, dict] = {}
         try:
-            for name, base in kodi_discover(timeout=4):
-                found.setdefault(name, Device("kodi", name, {"base": base}))
-        except Exception:
-            traceback.print_exc()
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(scans),
+                    thread_name_prefix="discover") as pool:
+                futures = {pool.submit(run, scan): key for key, scan in scans}
+                for done, fut in enumerate(
+                        concurrent.futures.as_completed(futures), start=1):
+                    results[futures[fut]] = fut.result()
+                    # Deliberately not spoken: six progress lines in a row
+                    # would talk over the result that actually matters.
+                    self._ui(self.set_status,
+                             f"Scanning... {done} of {len(scans)} done.",
+                             False)
+        finally:
+            if zc is not None:
+                try:
+                    zc.close()
+                except Exception:
+                    pass
+
+        # Merged in a fixed order rather than in the order the scans
+        # happened to finish, so which protocol answered first cannot
+        # change what ends up in the list. Sonos is applied last and wins
+        # outright: it answers AirPlay and UPnP as well, and only its own
+        # protocol actually plays.
+        found: dict[str, Device] = {}
+        for key in ("chromecast", "airplay", "upnp", "roku", "kodi"):
+            for name, device in results.get(key, {}).items():
+                found.setdefault(name, device)
+        found.update(results.get("sonos", {}))
 
         self._ui(self._apply_devices, found)
 

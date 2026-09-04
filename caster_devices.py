@@ -13,6 +13,7 @@ almost every AV receiver, so those are not separate integrations.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 import socket
@@ -72,21 +73,30 @@ def sonos_discover(timeout: int = 5, seed_ips: list | None = None) -> list:
     soco = _soco()
     if soco is None:
         return []
-    zones = set()
-    try:
-        zones |= soco.discover(timeout=timeout) or set()
-    except Exception:
-        pass
-    for ip in (seed_ips or []):
-        ip = str(ip).strip()
-        if not ip:
-            continue
+    seeds = [str(ip).strip() for ip in (seed_ips or []) if str(ip).strip()]
+
+    def from_seed(ip):
         try:
             device = soco.SoCo(ip)
             _ = device.player_name          # warm the topology cache
-            zones |= (device.visible_zones or {device})
+            return device.visible_zones or {device}
+        except Exception:
+            return set()
+
+    zones = set()
+    # The multicast sweep and each seed are independent waits, and a seed
+    # that is switched off costs the full request timeout. Overlapping them
+    # keeps a household on another subnet from adding seconds per address.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1 + len(seeds), thread_name_prefix="sonos") as pool:
+        sweep = pool.submit(lambda: soco.discover(timeout=timeout) or set())
+        seeded = [pool.submit(from_seed, ip) for ip in seeds]
+        try:
+            zones |= sweep.result() or set()
         except Exception:
             pass
+        for fut in seeded:
+            zones |= fut.result()
     found = []
     for zone in zones:
         try:
@@ -226,18 +236,24 @@ ROKU_AUDIO_FORMATS = {"audio/wav": "wav", "audio/mpeg": "mp3",
 
 def roku_discover(timeout: int = 4) -> list:
     """Rokus as [(name, base_url), ...], via SSDP."""
-    responses = _ssdp_search("roku:ecp", timeout)
-    found = []
-    for location in responses:
-        base = location.rstrip("/")
+    bases = []
+    for location in _ssdp_search("roku:ecp", timeout):
         # The SSDP LOCATION points at the device description; ECP lives at
         # the server root.
-        parts = urllib.parse.urlsplit(base)
+        parts = urllib.parse.urlsplit(location.rstrip("/"))
         base = f"{parts.scheme}://{parts.netloc}"
-        name = _roku_name(base)
-        if name:
-            found.append((name, base))
-    return sorted(set(found))
+        if base not in bases:
+            bases.append(base)
+    if not bases:
+        return []
+    # Asking each Roku its name is a separate HTTP round trip that can time
+    # out; done one at a time, a household of Rokus costs several seconds
+    # after the SSDP window has already closed.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(bases)),
+            thread_name_prefix="roku-name") as pool:
+        names = list(pool.map(_roku_name, bases))
+    return sorted({(name, base) for name, base in zip(names, bases) if name})
 
 
 def _roku_name(base: str) -> str:
@@ -297,44 +313,74 @@ def _post(url: str, timeout: int = 6) -> bytes:
 KODI_SERVICE = "_xbmc-jsonrpc-h._tcp.local."
 
 
-def kodi_discover(timeout: int = 4) -> list:
-    """Kodi instances as [(name, base_url), ...], over mDNS."""
+def kodi_discover(timeout: int = 4, zc=None) -> list:
+    """Kodi instances as [(name, base_url), ...], over mDNS.
+
+    Pass ``zc`` to browse on a Zeroconf someone else already owns -- two
+    instances in one process each bind port 5353 and send the same queries
+    twice for nothing. A borrowed instance is left open for its owner.
+    """
     try:
         from zeroconf import ServiceBrowser, Zeroconf
     except ImportError:
         return []
     hits: list = []
+    seen: set = set()
+    lock = threading.Lock()
 
     class _Listener:
-        def add_service(self, zc, type_, name):
+        def add_service(self, zc_, type_, name):
+            with lock:
+                if name in seen:
+                    return
+                seen.add(name)
             hits.append((type_, name))
 
-        def update_service(self, zc, type_, name):
+        def update_service(self, zc_, type_, name):
             pass
 
-        def remove_service(self, zc, type_, name):
+        def remove_service(self, zc_, type_, name):
             pass
 
-    found = []
-    zc = Zeroconf()
+    borrowed = zc is not None
+    zc = zc or Zeroconf()
+    browser = None
     try:
-        ServiceBrowser(zc, KODI_SERVICE, _Listener())
+        browser = ServiceBrowser(zc, KODI_SERVICE, _Listener())
         time.sleep(timeout)
-        for type_, name in list(hits):
+
+        def resolve(hit):
+            type_, name = hit
             try:
                 info = zc.get_service_info(type_, name, 3000)
             except Exception:
-                continue
+                return None
             if not info or not info.addresses:
-                continue
+                return None
             host = socket.inet_ntoa(info.addresses[0])
             label = name.split(".")[0] or host
-            found.append((label, f"http://{host}:{info.port or 8080}"))
+            return (label, f"http://{host}:{info.port or 8080}")
+
+        pending = list(hits)
+        if not pending:
+            return []
+        # Each resolve waits up to three seconds on its own; in a row that
+        # is the whole browse window over again per instance.
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(pending)),
+                thread_name_prefix="kodi-resolve") as pool:
+            found = [r for r in pool.map(resolve, pending) if r]
     finally:
-        try:
-            zc.close()
-        except Exception:
-            pass
+        if browser is not None:
+            try:
+                browser.cancel()
+            except Exception:
+                pass
+        if not borrowed:
+            try:
+                zc.close()
+            except Exception:
+                pass
     return sorted(set(found))
 
 

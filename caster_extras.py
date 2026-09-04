@@ -6,6 +6,7 @@ Kept free of caster imports to avoid a cycle; caster imports THIS module.
 
 from __future__ import annotations
 
+import concurrent.futures
 import functools
 import http.server
 import io
@@ -75,10 +76,9 @@ def upnp_discover(timeout: int = 6) -> list:
     ).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.settimeout(timeout)
+    locations = []
     try:
         sock.sendto(msg, ("239.255.255.250", 1900))
-        seen = set()
-        hits = []
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -91,14 +91,20 @@ def upnp_discover(timeout: int = 6) -> list:
                 if line.lower().startswith("location:"):
                     loc = line.split(":", 1)[1].strip()
                     break
-            if loc and loc not in seen:
-                seen.add(loc)
-                dev = _upnp_fetch_control(loc)
-                if dev:
-                    hits.append(dev)
+            if loc and loc not in locations:
+                locations.append(loc)
     finally:
         sock.close()
-    return hits
+    if not locations:
+        return []
+    # Descriptions are fetched after the socket closes, not from inside the
+    # receive loop: one renderer that answers SSDP but then stalls its HTTP
+    # used to hold the loop for its full five-second timeout, and every
+    # reply that arrived meanwhile was simply missed.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(12, len(locations)),
+            thread_name_prefix="upnp-desc") as pool:
+        return [dev for dev in pool.map(_upnp_fetch_control, locations) if dev]
 
 
 def _upnp_fetch_control(location: str):
