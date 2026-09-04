@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """GUI services for Caster: screen-reader speech, global hotkeys, the tray
 icon, accessible control labelling and the settings dialog.
 
@@ -175,20 +178,33 @@ class HotkeyManager:
         self._registered: dict = {}
 
     def register_all(self) -> list:
-        """Register every default hotkey; returns the actions that failed."""
+        """Register every default hotkey; returns the actions that failed.
+
+        A hotkey another program already owns is an ordinary outcome, not an
+        error worth interrupting anyone over -- but wx logs the failure, and
+        its default log target on Windows is a modal dialog. That dialog
+        appears behind the main window during startup, blocks the UI thread
+        waiting for a click nobody knows to give, and takes the screen reader
+        down with it. So the log is suppressed for the duration and the
+        failures are returned for the caller to mention quietly instead.
+        """
         failed = []
-        for index, (action, (mods, key, _)) in enumerate(
-                DEFAULT_HOTKEYS.items()):
-            hotkey_id = self.BASE_ID + index
-            try:
-                if self.frame.RegisterHotKey(hotkey_id, mods, key):
-                    self._registered[hotkey_id] = action
-                    self.frame.Bind(wx.EVT_HOTKEY, self._on_hotkey,
-                                    id=hotkey_id)
-                else:
+        blocker = wx.LogNull()          # released at the end of this call
+        try:
+            for index, (action, (mods, key, _)) in enumerate(
+                    DEFAULT_HOTKEYS.items()):
+                hotkey_id = self.BASE_ID + index
+                try:
+                    if self.frame.RegisterHotKey(hotkey_id, mods, key):
+                        self._registered[hotkey_id] = action
+                        self.frame.Bind(wx.EVT_HOTKEY, self._on_hotkey,
+                                        id=hotkey_id)
+                    else:
+                        failed.append(action)
+                except Exception:
                     failed.append(action)
-            except Exception:
-                failed.append(action)
+        finally:
+            del blocker
         return failed
 
     def unregister_all(self) -> None:
@@ -306,6 +322,31 @@ class SettingsDialog(wx.Dialog):
         self.mic.SetSelection(self._index(self._inputs,
                                           settings["capture_mic_device"]))
 
+        # Values the Yamaha spec defines, with "leave alone" first so the
+        # default changes nothing on a receiver the user has already set up.
+        self._link_controls = ["", "speed", "standard", "stability"]
+        self.link_control = labelled(
+            panel, box, "MusicCast &link control:",
+            lambda p: wx.Choice(p, choices=[
+                "Leave as the receiver has it",
+                "Speed (shallowest buffer, least delay)",
+                "Standard",
+                "Stability boost (deepest buffer)"]))
+        self.link_control.SetSelection(
+            self._pick(self._link_controls, settings["musiccast_link_control"]))
+
+        self._link_delays = ["", "audio_sync", "balanced", "lip_sync"]
+        self.link_delay = labelled(
+            panel, box, "MusicCast link audio &delay:",
+            lambda p: wx.Choice(p, choices=[
+                "Leave as the receiver has it",
+                "Audio sync (least delay)",
+                "Balanced",
+                "Lip sync (most delay)"]))
+        self.link_delay.SetSelection(
+            self._pick(self._link_delays,
+                       settings["musiccast_link_audio_delay"]))
+
         self.offset = labelled(
             panel, box, "&Audio delay in ms (negative delays picture):",
             lambda p: wx.SpinCtrl(p, min=-2000, max=2000,
@@ -337,7 +378,10 @@ class SettingsDialog(wx.Dialog):
                 ("global_hotkeys", "System-&wide hotkeys"),
                 ("minimise_to_tray", "Close to the &notification area"),
                 ("auto_reconnect", "&Reconnect if a device drops"),
-                ("speak_status", "Speak status through N&VDA")):
+                ("speak_status", "Speak status through N&VDA"),
+                ("musiccast_power_on", "Turn a &MusicCast receiver on to cast"),
+                ("musiccast_restore_input",
+                 "Put a MusicCast receiver back on its previous &input")):
             check = wx.CheckBox(panel, label=label)
             check.SetValue(bool(settings[key]))
             box.Add(check, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
@@ -367,8 +411,17 @@ class SettingsDialog(wx.Dialog):
                 return i
         return 0
 
+    @staticmethod
+    def _pick(values: list, current) -> int:
+        """Index of `current` in `values`, or 0 for anything unrecognised."""
+        return values.index(current) if current in values else 0
+
     def apply(self) -> None:
         self.settings.update(
+            musiccast_link_control=self._link_controls[
+                max(self.link_control.GetSelection(), 0)],
+            musiccast_link_audio_delay=self._link_delays[
+                max(self.link_delay.GetSelection(), 0)],
             capture_quality=self._quality_keys[max(self.quality.GetSelection(), 0)],
             capture_audio_device=self._outputs[max(self.output.GetSelection(), 0)][1],
             capture_mic_device=self._inputs[max(self.mic.GetSelection(), 0)][1],

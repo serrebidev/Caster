@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """Caster extras: UPnP/DLNA renderer control, local file serving, and
 low-latency screen / app-window / system-audio capture sources.
 
@@ -58,13 +61,22 @@ def _no_window_kwargs() -> dict:
 # UPnP / DLNA renderer support (SSDP discovery + AVTransport control)
 # ---------------------------------------------------------------------------
 
+#: How many times an SSDP search is repeated inside its window. Three is what
+#: it takes for a device on a congested wireless link to be found reliably;
+#: one was enough to miss a receiver in roughly one scan out of two.
+SSDP_SEARCHES = 3
+
+
 def upnp_discover(timeout: int = 6) -> list:
     """SSDP M-SEARCH for AVTransport media renderers.
 
-    Returns [(friendly_name, control_url, manufacturer), ...]. The
-    manufacturer is what lets a caller recognise a renderer that has its own
-    better-suited protocol -- a Sonos answers here too, and driving it as
-    plain DLNA misses its grouping and its transport quirks.
+    Returns [(friendly_name, control_url, manufacturer, sink_mimes), ...].
+    The manufacturer is what lets a caller recognise a renderer that has its
+    own better-suited protocol -- a Sonos answers here too, and driving it as
+    plain DLNA misses its grouping and its transport quirks. `sink_mimes` is
+    the set of content types the renderer says it accepts, which is the only
+    honest way to know whether it can show a picture: "UPnP renderer" spans
+    televisions and amplifiers, and an amplifier handed H.264 just fails.
     """
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
@@ -75,15 +87,31 @@ def upnp_discover(timeout: int = 6) -> list:
         "\r\n"
     ).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(timeout)
+    sock.settimeout(0.5)
     locations = []
     try:
-        sock.sendto(msg, ("239.255.255.250", 1900))
+        # SSDP is UDP multicast and lossy by design: a reply that collides or
+        # meets a busy Wi-Fi link is simply gone, and one lost reply is one
+        # device missing from the list. So the search is repeated across the
+        # window rather than asked once and hoped for -- a device that already
+        # answered just answers again and is deduplicated here.
         deadline = time.monotonic() + timeout
+        next_search = 0.0
+        searches = 0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_search and searches < SSDP_SEARCHES:
+                try:
+                    sock.sendto(msg, ("239.255.255.250", 1900))
+                except OSError:
+                    pass
+                searches += 1
+                next_search = now + timeout / (SSDP_SEARCHES + 1)
             try:
                 data, addr = sock.recvfrom(65536)
             except socket.timeout:
+                continue
+            except OSError:
                 break
             text = data.decode("utf-8", "replace")
             loc = None
@@ -109,30 +137,75 @@ def upnp_discover(timeout: int = 6) -> list:
 
 def _upnp_fetch_control(location: str):
     """Fetch a UPnP device description XML and return its friendly name,
-    AVTransport control URL and manufacturer."""
+    AVTransport control URL, manufacturer and accepted content types."""
     try:
         with _urlreq.urlopen(location, timeout=5) as r:
             body = r.read().decode("utf-8", "replace")
     except Exception:
         return None
     import html as _html
+    import urllib.parse as _up
     name_m = re.search(r"<friendlyName>([^<]+)</friendlyName>", body)
     name = _html.unescape(name_m.group(1).strip()) if name_m else location
     maker_m = re.search(r"<manufacturer>([^<]+)</manufacturer>", body)
     maker = _html.unescape(maker_m.group(1).strip()) if maker_m else ""
+    av_url = cm_url = ""
     for svc_m in re.finditer(r"<service>(.*?)</service>", body, re.S):
         svc = svc_m.group(1)
-        if "AVTransport" not in svc:
-            continue
         ctl = re.search(r"<controlURL>([^<]+)</controlURL>", svc)
         if not ctl:
             continue
         # Resolve per UPnP spec: relative to the description URL (handles
         # both root-absolute "/x" and relative "x" controlURLs).
-        import urllib.parse as _up
         url = _up.urljoin(location, ctl.group(1))
-        return (name, url, maker)
-    return None
+        if "AVTransport" in svc and not av_url:
+            av_url = url
+        elif "ConnectionManager" in svc and not cm_url:
+            cm_url = url
+    if not av_url:
+        return None
+    return (name, av_url, maker, upnp_sink_mimes(cm_url))
+
+
+def upnp_sink_mimes(connection_manager_url: str) -> frozenset:
+    """Content types a renderer accepts, from ConnectionManager.
+
+    Empty means "it did not say", which callers must treat as unknown rather
+    than as "nothing" -- plenty of renderers answer this badly or not at all,
+    and refusing to send them anything would be worse than guessing.
+    """
+    if not connection_manager_url:
+        return frozenset()
+    args = ('<u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:'
+            'ConnectionManager:1"/>')
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>" + args + "</s:Body></s:Envelope>"
+    )
+    req = _urlreq.Request(
+        connection_manager_url, data=body.encode("utf-8"), method="POST",
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": '"urn:schemas-upnp-org:service:ConnectionManager:1'
+                          '#GetProtocolInfo"',
+        })
+    try:
+        with _urlreq.urlopen(req, timeout=5) as r:
+            xml = r.read().decode("utf-8", "replace")
+    except Exception:
+        return frozenset()
+    sink = re.search(r"<Sink>(.*?)</Sink>", xml, re.S)
+    if not sink:
+        return frozenset()
+    mimes = set()
+    for entry in sink.group(1).split(","):
+        # protocol:network:contentFormat:additionalInfo
+        parts = entry.strip().split(":")
+        if len(parts) >= 3 and "/" in parts[2]:
+            mimes.add(parts[2].split(";")[0].strip().lower())
+    return frozenset(mimes)
 
 
 def _soap(control_url: str, action: str, inner: str) -> None:
@@ -211,28 +284,6 @@ def upnp_host(control_url: str) -> str:
     """Host part of a control URL (for MusicCast side-channel calls)."""
     import urllib.parse as _up
     return (_up.urlsplit(control_url).hostname or "")
-
-
-def yxc_available(host: str) -> bool:
-    """True if the device speaks MusicCast (YamahaExtendedControl)."""
-    try:
-        with _urlreq.urlopen(
-                f"http://{host}/YamahaExtendedControl/v1/main/getStatus",
-                timeout=4) as r:
-            return b"response_code" in r.read(400)
-    except Exception:
-        return False
-
-
-def yxc_set_input(host: str, yxc_input: str = "server") -> bool:
-    """Switch a MusicCast device's input (upnp push needs input=server)."""
-    try:
-        with _urlreq.urlopen(
-                f"http://{host}/YamahaExtendedControl/v1/main/setInput?input={yxc_input}",
-                timeout=4) as r:
-            return b'"response_code":0' in r.read(200)
-    except Exception:
-        return False
 
 
 def upnp_set_volume(control_url: str, level: int) -> None:
@@ -656,33 +707,82 @@ class LiveWavReader(io.BufferedIOBase):
 # ---------------------------------------------------------------------------
 
 _grabber_cache: str = ""
+_grabber_lock = threading.Lock()
+
+#: Hooks the app installs so the probe result survives a restart. Left unset,
+#: everything below still works and simply re-probes each launch; keeping the
+#: persistence out here is what stops this module needing the settings file.
+grabber_cache_load = None      # () -> str
+grabber_cache_store = None     # (str) -> None
 
 
-def pick_screen_grabber(timeout: float = 10.0) -> str:
+def grabber_machine_key() -> str:
+    """What the ddagrab answer depends on, as a string.
+
+    The two things that flip it are the machine and the kind of session:
+    ddagrab needs a real console with a real GPU behind it, and the same box
+    reached over RDP has neither. Anything else -- a driver update, a new
+    card -- is rare enough to be worth the one bad launch it would cost.
+    """
+    return "{}|{}".format(os.environ.get("COMPUTERNAME", "?"),
+                          os.environ.get("SESSIONNAME", "?"))
+
+
+def pick_screen_grabber(timeout: float = 2.5) -> str:
     """"ddagrab" when the Desktop Duplication API works here, else "gdigrab".
 
     ddagrab is the GPU path: full frame rate at a fraction of gdigrab's CPU.
     It also *hangs* rather than failing on some driver, GPU and session
-    combinations (RDP and headless VMs in particular), so it is probed once
-    behind a hard kill and the answer cached for the process.
+    combinations (RDP and headless VMs in particular), so it is probed behind
+    a hard kill.
+
+    That probe is the single most expensive thing in the connect path when it
+    hangs, and a box where it hangs hangs every time, so the answer is cached
+    to settings and read back on the next launch. The timeout is short on
+    purpose: a working ddagrab delivers ten frames in well under a second, so
+    everything past a couple of seconds is the hang, not a slow success.
     """
     global _grabber_cache
-    if _grabber_cache:
+    with _grabber_lock:
+        if _grabber_cache:
+            return _grabber_cache
+        if grabber_cache_load is not None:
+            try:
+                remembered = grabber_cache_load()
+            except Exception:
+                remembered = ""
+            if remembered in ("ddagrab", "gdigrab"):
+                _grabber_cache = remembered
+                return _grabber_cache
+        _grabber_cache = _probe_screen_grabber(timeout)
+        if grabber_cache_store is not None:
+            try:
+                grabber_cache_store(_grabber_cache)
+            except Exception:
+                pass                # unwritable profile: probe again next run
         return _grabber_cache
-    cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+
+
+def _probe_screen_grabber(timeout: float) -> str:
+    """Run the ddagrab probe once. Always answers; never raises."""
+    try:
+        ff = _find_ffmpeg()
+    except Exception:
+        return "gdigrab"
+    cmd = [ff, "-hide_banner", "-loglevel", "error",
            "-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30",
            "-frames:v", "10", "-vf", "hwdownload,format=bgra",
            "-f", "null", "-"]
-    _grabber_cache = "gdigrab"
+    answer = "gdigrab"
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL, **_no_window_kwargs())
     except OSError:
-        return _grabber_cache
+        return answer
     try:
         if proc.wait(timeout=timeout) == 0:
-            _grabber_cache = "ddagrab"
+            answer = "ddagrab"
     except subprocess.TimeoutExpired:
         pass                        # hung: gdigrab it is
     finally:
@@ -692,7 +792,19 @@ def pick_screen_grabber(timeout: float = 10.0) -> str:
                 proc.wait(timeout=5)
             except Exception:
                 pass
-    return _grabber_cache
+    return answer
+
+
+def prewarm_screen_grabber() -> None:
+    """Settle the grabber question in the background, off the connect path.
+
+    Nothing waits on this. By the time a device has been picked the answer is
+    usually already cached, and if it is not, pick_screen_grabber() blocks on
+    the same lock and gets it as soon as the probe finishes -- so this only
+    ever moves the cost earlier, never adds one.
+    """
+    threading.Thread(target=pick_screen_grabber, daemon=True,
+                     name="caster-grabber-probe").start()
 
 
 #: Per-encoder flags that trade compression efficiency for latency. Without
@@ -768,37 +880,83 @@ class ScreenSource:
         self._procs_lock = threading.Lock()
         self._stopped = False
         self.last_error = ""
-        #: Index into _window_specs(); start() falls forward on failure.
+        #: Index into _window_specs(); chosen by start() before serving.
         self._window_spec = 0
+        #: Media actually handed to a client, and the flag that says enough of
+        #: it has flowed to prove the encoder is alive. This is what stands in
+        #: for the old self-connect check: the receiver's own connection is
+        #: the proof, so nothing has to be encoded twice to get it.
+        self._served = 0
+        self._flowing = threading.Event()
 
     # ---- lifecycle ----
 
     def start(self, verify: bool = True) -> str:
         """Start capture and serving; return the URL to hand the receiver.
 
-        With ``verify``, the whole chain is exercised over a local connection
-        before returning, so a broken encoder or a window that has closed is
-        reported here rather than as a receiver that silently plays nothing.
+        With ``verify``, the parts that cannot be checked any other way are
+        checked now: the audio tap opens synchronously, and a window capture
+        settles which of gdigrab's two ways of naming the window works. What
+        is deliberately NOT done here is running the encoder to look at its
+        output -- ffmpeg is spawned per connection, so pulling a sample would
+        start an encoder, throw it away, and leave the receiver waiting
+        through a second cold start. wait_for_media() reports that failure
+        from the receiver's own connection instead, after the URL is out.
         """
+        if verify and self.hwnd:
+            self._pick_window_spec()
         self._open()
-        if verify:
-            self._verify_with_fallbacks()
         return self.url
 
-    def _verify_with_fallbacks(self) -> None:
-        """Verify, trying each way of naming the window before giving up."""
-        attempts = len(self._window_specs()) if self.hwnd else 1
-        for attempt in range(attempts):
-            self._window_spec = attempt
+    #: How long a live receiver may take to pull real media before the
+    #: capture is declared broken. Generous: it covers the receiver
+    #: connecting at all, not just the encoder starting.
+    MEDIA_TIMEOUT = 12.0
+
+    def wait_for_media(self, timeout: float = 0.0) -> None:
+        """Block until media has reached a client, or raise saying why not.
+
+        Meant to run after the URL has been dispatched, so the wait overlaps
+        the receiver connecting rather than delaying it.
+        """
+        if self._flowing.wait(timeout or self.MEDIA_TIMEOUT):
+            return
+        if self._stopped:
+            return                  # torn down while waiting; not a failure
+        raise RuntimeError(
+            "capture produced no data: "
+            + (self.last_error or "nothing connected to the stream"))
+
+    def _pick_window_spec(self) -> None:
+        """Settle how to name this window to gdigrab, cheaply.
+
+        Titles change while you watch them (a browser tab, a terminal running
+        a spinner), two windows can share one, and older ffmpeg builds only
+        understand ``title=`` -- so both forms need trying. Opening the
+        grabber for a single frame answers that, and costs a fraction of
+        running the whole capture-encode-serve chain to look at its output.
+        """
+        specs = self._window_specs()
+        for index, spec in enumerate(specs):
+            cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+                   "-f", "gdigrab", "-framerate", "1", "-i", spec,
+                   "-frames:v", "1", "-f", "null", "-"]
             try:
-                self._verify()
+                done = subprocess.run(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL, timeout=6,
+                    **_no_window_kwargs())
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if done.returncode == 0:
+                self._window_spec = index
                 return
-            except RuntimeError:
-                if attempt == attempts - 1:
-                    raise
-                # _verify() tore the source down on the way out; put it
-                # back so the next naming gets a fair try.
-                self._open()
+            lines = done.stderr.decode("utf-8", "replace").strip().splitlines()
+            if lines:
+                self.last_error = lines[-1]
+        raise RuntimeError(
+            "cannot capture that window: "
+            + (self.last_error or "it may have closed"))
 
     def _open(self) -> None:
         """Start the audio tap and the HTTP server, and publish the URL."""
@@ -812,33 +970,13 @@ class ScreenSource:
         self.url = (f"http://{_lan_ip()}:{self.httpd.server_address[1]}"
                     f"/{self.path}")
 
-    #: Enough bytes to prove the encoder is producing real media, not just
-    #: a container header it wrote before dying.
-    VERIFY_BYTES = 32768
-
-    def _verify(self) -> None:
-        """Pull from our own URL until real media bytes come back."""
-        deadline = time.monotonic() + 30
-        got = 0
-        try:
-            with _urlreq.urlopen(self.url, timeout=30) as r:
-                while got < self.VERIFY_BYTES and time.monotonic() < deadline:
-                    chunk = r.read(8192)
-                    if not chunk:
-                        break
-                    got += len(chunk)
-        except Exception as exc:
-            self.stop()
-            raise RuntimeError(
-                f"capture failed: {self.last_error or exc}") from exc
-        if got < self.VERIFY_BYTES:
-            self.stop()
-            raise RuntimeError(
-                "capture produced no data: "
-                + (self.last_error or "the encoder stopped immediately"))
+    #: Enough bytes to prove real media is moving, not just a container
+    #: header the encoder wrote before dying.
+    MEDIA_BYTES = 32768
 
     def stop(self) -> None:
         self._stopped = True
+        self._flowing.set()          # release anyone in wait_for_media()
         with self._procs_lock:
             procs, self._procs = list(self._procs), set()
         for proc in procs:
@@ -860,11 +998,16 @@ class ScreenSource:
 
     def pump(self, write) -> None:
         """Stream this source to ``write`` until the client goes away."""
+        def counted(data):
+            write(data)
+            self._served += len(data)
+            if self._served >= self.MEDIA_BYTES:
+                self._flowing.set()
         try:
             if self.container == "wav" and self.pcm_is_directly_usable():
-                self._pump_pcm(write)
+                self._pump_pcm(counted)
             else:
-                self._pump_ffmpeg(write)
+                self._pump_ffmpeg(counted)
         except Exception as exc:
             # This runs on a connection thread, so an exception here would
             # otherwise vanish and look like a receiver that plays nothing.

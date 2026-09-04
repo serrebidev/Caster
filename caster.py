@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """Caster — send any URL, screen, or system audio to a Chromecast,
 UPnP/DLNA renderer, or AirPlay device.
 
@@ -11,6 +14,7 @@ Usage: py caster.py
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import functools
 import http.server
@@ -44,6 +48,7 @@ try:
 except ImportError:
     yt_dlp = None  # type: ignore[assignment]
 
+import caster_extras as ce
 from caster_extras import (
     list_windows,
     list_output_devices,
@@ -54,8 +59,6 @@ from caster_extras import (
     upnp_stop,
     upnp_set_volume,
     FileServer,
-    yxc_available,
-    yxc_set_input,
     upnp_host,
 )
 
@@ -75,6 +78,20 @@ from caster_devices import (
     sonos_group,
     sonos_play,
     sonos_set_volume,
+    yxc_available,
+    yxc_set_input,
+    yxc_set_power,
+    yxc_set_volume,
+    yxc_set_mute,
+    yxc_get_volume,
+    yxc_volume_db,
+    yxc_current_input,
+    yxc_status,
+    yxc_set_link_control,
+    yxc_set_link_audio_delay,
+    musiccast_discover_at,
+    musiccast_group,
+    musiccast_ungroup,
     sonos_stop,
 )
 from caster_ui import (
@@ -86,7 +103,28 @@ from caster_ui import (
 )
 
 APP_TITLE = "Caster"
-APP_VERSION = "1.1.2"
+APP_VERSION = "0.5.0"
+
+#: Diagnostic timeline, off unless CASTER_TRACE names a file. Buffering is a
+#: timing problem and timing problems are invisible from a status bar, so this
+#: records what happened and when: every probe, every encoder, every state the
+#: receiver reported. Costs one environment lookup when it is off.
+_TRACE_PATH = os.environ.get("CASTER_TRACE", "")
+_trace_lock = threading.Lock()
+_trace_t0 = time.monotonic()
+
+
+def trace(event: str, detail: str = "") -> None:
+    if not _TRACE_PATH:
+        return
+    line = (f"{time.monotonic() - _trace_t0:8.2f}s  "
+            f"{threading.current_thread().name:22} {event:26} {detail}\n")
+    try:
+        with _trace_lock:
+            with open(_TRACE_PATH, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except OSError:
+        pass
 
 #: How long each discovery protocol listens for replies. SSDP and mDNS
 #: answer over a few seconds rather than at once, so this is the floor on
@@ -123,6 +161,26 @@ _CT_AUDIO = {"audio/mpeg", "audio/aac", "audio/aacp", "audio/mp4", "audio/x-m4a"
              "audio/ogg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav"}
 
 
+def _looks_like_mpegts(head: bytes) -> bool:
+    """Whether these first bytes are really MPEG-TS.
+
+    The sync byte is 0x47, which is also ASCII "G", so on its own it says
+    almost nothing: a text file, a subtitle or a GIF starting with that
+    letter all pass it. What identifies the format is the byte repeating
+    at the packet stride -- every 188 bytes, or every 192 for M2TS.
+
+    Too few bytes to check the stride is an unproven claim, not a
+    generous one: a buffer this small is either a file far too short to
+    be a stream, or a server that sent almost nothing. Either way the
+    extension is a better guide than one coincidental byte.
+    """
+    if not head.startswith(b"\x47"):
+        return False
+    if len(head) >= 189 and head[188:189] == b"\x47":
+        return True                     # 188-byte packets
+    return len(head) >= 193 and head[192:193] == b"\x47"   # M2TS
+
+
 def probe_media(url: str) -> dict:
     """Probe a URL for content type, audio-ness and live-ness.
 
@@ -143,7 +201,11 @@ def probe_media(url: str) -> dict:
         try:
             with open(path, "rb") as f:
                 head = f.read(193)
-            if head.startswith(b"\x47"):
+            # One sync byte proves nothing: 0x47 is also ASCII "G", so a
+            # local file that merely begins with that letter was being
+            # sent down the live-remux path. Confirm the packet stride,
+            # exactly as the HTTP branch does.
+            if _looks_like_mpegts(head):
                 result["mime"], result["is_audio"], result["is_live"] = \
                     "video/mp2t", False, False
         except OSError:
@@ -164,13 +226,7 @@ def probe_media(url: str) -> dict:
         result["is_live"] = True
         return result
     is_audio = None
-    ts_sync = (
-        head.startswith(b"\x47")
-        and (len(head) < 189
-             or head[188:189] == b"\x47"      # 188-byte packets
-             or (len(head) >= 193 and head[192:193] == b"\x47"))  # 192-byte M2TS
-    )
-    if ts_sync:
+    if _looks_like_mpegts(head):
         # MPEG-TS sync bytes: live IPTV channel, whatever the header claims
         is_audio, mime = False, "video/mp2t"
     elif head.startswith(b"ID3") or head.startswith(b"\xff\xfb") or head.startswith(b"\xff\xf3"):
@@ -278,27 +334,31 @@ def pick_h264_encoder() -> str:
     return best
 
 
-def _probe_codecs(url: str) -> list:
+def _probe_codecs(url: str, timeout: float = 8.0) -> list:
     """Return codec names for the URL's streams (video first). Parses the
-    `ffmpeg -i` banner. Empty list on failure."""
+    `ffmpeg -i` banner. Empty list on failure.
+
+    Bounded twice over, because this runs in the connect path. ffmpeg is told
+    how little of the stream to inspect -- the defaults spend five seconds
+    analysing an MPEG-TS before saying a word -- and it is killed outright if
+    it stops talking. A server that accepts the connection and then goes
+    quiet would otherwise block this read with no timeout at all.
+    """
     import re as _re
     import subprocess as _sp
+    args = [_find_ffmpeg(), "-hide_banner",
+            "-analyzeduration", "2000000", "-probesize", "2000000",
+            "-i", url]
     try:
-        p = _sp.Popen(
-            [_find_ffmpeg(), "-hide_banner", "-i", url],
-            stdout=_sp.DEVNULL, stderr=_sp.PIPE, stdin=_sp.DEVNULL,
-            **_no_window_kwargs())
+        done = _sp.run(args, stdout=_sp.DEVNULL, stderr=_sp.PIPE,
+                       stdin=_sp.DEVNULL, timeout=timeout,
+                       **_no_window_kwargs())
+        raw = done.stderr
+    except _sp.TimeoutExpired as exc:
+        raw = exc.stderr or b""     # whatever it managed before the kill
     except OSError:
         return []
-    try:
-        banner = p.stderr.read(65536).decode("utf-8", "replace")
-    except Exception:
-        banner = ""
-    finally:
-        try:
-            p.kill()
-        except Exception:
-            pass
+    banner = raw.decode("utf-8", "replace") if raw else ""
     codecs = []
     for m in _re.finditer(
             r"Stream #0:\d+\S*\[?[^:]*\]?: (Video|Audio): (\w+)", banner):
@@ -318,12 +378,28 @@ class HlsRelay:
     # Segments the RECEIVER is shown. The encoder keeps more on disk; hiding
     # the newest ones puts the receiver a few seconds behind the live edge so
     # upstream IPTV jitter lands in a cushion instead of stalling playback.
-    # 6 segments (~16s) also clears the cast receiver's minimum-buffer rule
-    # of 3x TARGETDURATION, below which it refuses to start at all.
+    # That cushion is also the delay, second for second, which is why the
+    # quality preset gets to set it: a stuttering IPTV feed wants it deep, a
+    # clean one wants the picture up sooner. The floor is the cast receiver's
+    # minimum-buffer rule of 3x TARGETDURATION, below which it refuses to
+    # start at all.
     TRAIL_KEEP = 6
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
+                 trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None
+                 ) -> None:
         self.url = url
+        #: Segment length. Shorter means the receiver can start sooner, since
+        #: everything below is counted in segments, not seconds.
+        self.hls_time = max(1, int(hls_time))
+        #: Segments to accumulate before the URL is handed over. Three is the
+        #: floor, not a preference: it is what clears 3x TARGETDURATION.
+        self.prime_segments = max(3, int(prime_segments))
+        self.trail_keep = max(3, int(trail_keep))
+        #: Stream codecs, when the caller has already paid to find them out.
+        #: Probing costs a whole extra connection to the source, and IPTV
+        #: servers are slow to accept one and slower to authorise it.
+        self.codecs = codecs
         self.proc = None
         self.httpd = None
         self.port = 0
@@ -331,40 +407,54 @@ class HlsRelay:
         self.video_transcoded = False  # True: source video not H.264
         self._trail_drop = None   # segments hidden from the served playlist
         self._last_good = None    # last known-good playlist bytes
+        #: Highest EXT-X-MEDIA-SEQUENCE ever served. An HLS client treats a
+        #: sequence that goes backwards as an instruction to replay, so this
+        #: is a ratchet: whatever ffmpeg's own numbering does across a
+        #: restart, what leaves here never decreases.
+        self._served_seq = None
         self._restarted = 0       # upstream-drop restarts (diagnostics)
 
-    def start(self, prime_segments: int = 4) -> str:
+    def start(self, prime_segments: int = 0) -> str:
         import tempfile
+        want = max(3, int(prime_segments or self.prime_segments))
         self.root = tempfile.mkdtemp(prefix="caster_hls_")
-        handler = functools.partial(HlsFileHandler, directory=self.root)
-        # ThreadingHTTPServer + HTTP/1.1 keep-alive: the receiver reuses one
-        # connection for playlist polls and segment fetches instead of a new
-        # TCP handshake per request (visible as mid-playback stalls).
-        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
-        self.httpd.relay = self
-        self.port = self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True,
-                         name="caster-hls").start()
+        try:
+            handler = functools.partial(HlsFileHandler, directory=self.root)
+            # ThreadingHTTPServer + HTTP/1.1 keep-alive: the receiver reuses
+            # one connection for playlist polls and segment fetches instead of
+            # a new TCP handshake per request (visible as mid-playback stalls).
+            self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0),
+                                                         handler)
+            self.httpd.relay = self
+            self.port = self.httpd.server_address[1]
+            threading.Thread(target=self.httpd.serve_forever, daemon=True,
+                             name="caster-hls").start()
 
-        m3u8 = os.path.join(self.root, "live.m3u8")
-        self._spawn_ffmpeg()
-        # Prime: accumulate a few segments BEFORE the receiver starts so it
-        # begins playing with seconds of backlog already buffered.
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            segs = 0
-            if os.path.exists(m3u8):
-                segs = sum(1 for f in os.listdir(self.root)
-                           if f.endswith(".ts") or f.endswith(".m4s"))
-                if segs >= prime_segments:
-                    break
-            if self.proc.poll() is not None:
-                raise RuntimeError("ffmpeg exited early while starting relay")
-            time.sleep(0.25)
-
-        else:
+            m3u8 = os.path.join(self.root, "live.m3u8")
+            self._spawn_ffmpeg()
+            # Prime: accumulate the minimum backlog the receiver will accept
+            # BEFORE handing it the URL. On a live source these segments
+            # arrive in real time, so every one asked for here is a second of
+            # the wait -- which is why this is the floor and not a cushion.
+            # The cushion is trail_keep, and that costs nothing up front.
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if os.path.exists(m3u8):
+                    segs = sum(1 for f in os.listdir(self.root)
+                               if f.endswith(".ts") or f.endswith(".m4s"))
+                    if segs >= want:
+                        break
+                if self.proc.poll() is not None:
+                    raise RuntimeError(
+                        "ffmpeg exited early while starting relay")
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("relay produced no HLS playlist in time")
+        except BaseException:
+            # Every exit from here leaks a server, its thread, an ffmpeg and
+            # a temp directory if it does not tear them down itself.
             self.stop()
-            raise RuntimeError("relay produced no HLS playlist in time")
+            raise
         # IPTV sources drop connections mid-stream (server reset, idle-timeout,
         # route flap). ffmpeg's reconnect flags cover reconnectable HTTP errors
         # but ffmpeg EXITS on a dead read; a supervisor restarts it in place so
@@ -373,10 +463,28 @@ class HlsRelay:
                          name="caster-relay-supervisor").start()
         return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
 
+    def _next_segment_number(self) -> int:
+        """The number a restarted encoder must resume from.
+
+        Without this a restart begins again at seg00000, and the receiver --
+        which has already played that name and may still be holding it -- is
+        handed a file it believes it knows. What comes out of the speakers is
+        audio from the start of the stream: playback jumps backwards.
+        """
+        highest = -1
+        try:
+            for name in os.listdir(self.root):
+                match = re.fullmatch(r"seg(\d+)\.ts", name)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+        except OSError:
+            pass
+        return highest + 1
+
     def _spawn_ffmpeg(self) -> None:
         """(Re)start the ffmpeg encoder process for this relay."""
         m3u8 = os.path.join(self.root, "live.m3u8")
-        cmd = self._ffmpeg_cmd(m3u8)
+        cmd = self._ffmpeg_cmd(m3u8, self._next_segment_number())
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, **_no_window_kwargs())
@@ -385,11 +493,11 @@ class HlsRelay:
         """Restart ffmpeg if it dies while the relay is up.
 
         A dead encoder freezes the playlist and the receiver eventually gives
-        up ("stream disconnected"). Restarting with the SAME segment filename
-        pattern and directory keeps the HLS continuity: the playlist is
-        rewritten fresh with a monotonic MEDIA-SEQUENCE via trailing_playlist,
-        and the receiver just sees the stream continue (a few seconds of
-        repeats/jump at most).
+        up ("stream disconnected"). Restarting in the same directory but continuing the
+        segment numbering keeps the HLS continuity: names are never reused,
+        the playlist is appended to rather than started over, and its
+        MEDIA-SEQUENCE stays monotonic via trailing_playlist. The receiver
+        just sees the stream continue.
         """
         while self.httpd is not None:
             time.sleep(2)
@@ -408,36 +516,78 @@ class HlsRelay:
             except Exception:
                 pass
 
-    def _ffmpeg_cmd(self, m3u8: str) -> list:
+    def _ffmpeg_cmd(self, m3u8: str, start_number: int = 0) -> list:
         """ffmpeg command producing HLS for this relay's source."""
-        cmd = [
-            _find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+        cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
+        if self.url.lower().startswith(("http://", "https://")):
             # Survive IPTV sources dropping/jittering instead of stalling.
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
-            "-rw_timeout", "5000000",     # 5s read timeout on the source
-            "-i", self.url,
+            # These belong to the HTTP protocol handler and nothing else:
+            # handed a local path, ffmpeg refuses the whole command with
+            # "Option reconnect not found" and opens no input at all.
+            cmd += [
+                # A live stream has no byte positions to come back to. Left
+                # to itself ffmpeg reconnects with "Range: bytes=<offset>"
+                # after every drop -- and this server drops every ten to
+                # twenty seconds -- so it asks to resume at an offset the
+                # server cannot honour, gets handed the current live edge
+                # instead, and splices that in as though it followed on.
+                # The overlap is media the listener has already heard: the
+                # stream jumps backwards, with a seam of corrupt packets.
+                # Declaring the source unseekable stops the Range request.
+                # Measured on this channel over 90s: 1.88x of real time
+                # produced (i.e. most of it arriving twice), 8 byte-offset
+                # resumes and 7 corrupt packets -- against 0.89x, 0 and 0
+                # with this set.
+                "-seekable", "0",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
+                "-rw_timeout", "5000000",   # 5s read timeout on the source
+            ]
+        # Inspect as little of the source as it takes to identify it. The
+        # defaults spend five seconds on an MPEG-TS before writing anything,
+        # and that is five seconds of nothing at the start of every channel.
+        cmd += ["-analyzeduration", "1000000", "-probesize", "1000000"]
+        cmd += [
+            # An input flag: it fills in timestamps the source omits, so it
+            # has to be set on the demuxer, before -i. After -i it lands on
+            # the muxer, where it means nothing.
             "-fflags", "+genpts",         # smooth over source timestamp jumps
+            "-i", self.url,
         ]
         # Cast receivers play H.264-in-TS but reject anything else (HEVC,
         # AV1...). H.264 sources stay bit-exact; anything else gets the
         # video transcoded with the fastest hardware encoder available
         # while audio is copied untouched.
-        codecs = _probe_codecs(self.url)
+        codecs = self.codecs
+        if codecs is None:
+            codecs = _probe_codecs(self.url)
         bad_video = {"hevc", "h265", "av1", "mpeg2video", "mpeg4", "vp9"}
         self.video_transcoded = any(c in bad_video for c in codecs)
         if self.video_transcoded:
             cmd += ["-c:v", pick_h264_encoder(), "-c:a", "copy"]
         else:
             cmd += ["-c", "copy"]   # remux only: bit-exact, no quality loss
+        # Put the H.264 parameter sets in front of every keyframe. An HLS
+        # segment has to be decodable on its own -- a receiver may join at any
+        # one of them -- and a live TS carries those sets only occasionally,
+        # so without this the first segment of a channel can arrive describing
+        # frames with nothing to describe them by. Costs a few bytes a
+        # keyframe and nothing else.
+        if not self.video_transcoded:
+            cmd += ["-bsf:v", "dump_extra=freq=keyframe"]
         cmd += [
             "-f", "hls",
-            "-hls_time", "2",
+            "-hls_time", str(self.hls_time),
             # Wide window: old segments stay listed/fetchable longer, so a
             # slow playlist poll never races the delete of a needed file.
             "-hls_list_size", "12",
-            "-hls_flags", "delete_segments",
+            # append_list continues the existing playlist across a restart
+            # instead of truncating it, which would strip the segments the
+            # receiver is still working through.
+            "-hls_flags",
+            "delete_segments+append_list" if start_number else "delete_segments",
+            "-start_number", str(start_number),
             "-hls_segment_filename", os.path.join(self.root, "seg%05d.ts"),
             m3u8,
         ]
@@ -468,16 +618,16 @@ class HlsRelay:
         except (StopIteration, ValueError):
             return None
         segs = [i for i, l in enumerate(lines) if l and not l.startswith("#")]
-        if len(segs) <= self.TRAIL_KEEP:
+        if not segs:
             return None
-        drop = max(0, len(segs) - self.TRAIL_KEEP)
+        drop = max(0, len(segs) - self.trail_keep)
         # Monotonic: a receiver re-polling an older view must never see
         # segments reappear (HLS clients treat that as a broken stream).
         if self._trail_drop is None or drop > self._trail_drop:
             self._trail_drop = drop
-        drop = self._trail_drop
-        if drop == 0:
-            return None
+        # ...but never past the end of a playlist that has since got shorter,
+        # which is what a restarted encoder produces.
+        drop = min(self._trail_drop, len(segs) - 1)
 
         def block_start(uri_idx: int) -> int:
             # Index of the first comment line belonging to this segment's
@@ -489,8 +639,17 @@ class HlsRelay:
 
         header_end = block_start(segs[0])   # comments after MEDIA-SEQUENCE
         keep_from = block_start(segs[drop])
+        # The ratchet. A restarted encoder numbers from wherever it likes, and
+        # handing the receiver a sequence lower than one it has already seen
+        # tells it to play those segments again -- heard as the stream jumping
+        # backwards. Serving a short playlist raw did exactly that, which is
+        # why this rewrite now happens for every playlist, not only long ones.
+        seq = base_seq + drop
+        if self._served_seq is not None and seq < self._served_seq:
+            seq = self._served_seq
+        self._served_seq = seq
         out = lines[:seq_idx]
-        out.append(f"#EXT-X-MEDIA-SEQUENCE:{base_seq + drop}")
+        out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}")
         out.extend(lines[seq_idx + 1:header_end])  # version/targetduration
         out.extend(lines[keep_from:])
         return ("\n".join(out) + "\n").encode("utf-8")
@@ -507,15 +666,21 @@ class HlsRelay:
     def stop(self) -> None:
         # Tear the supervisor's loop condition down FIRST: httpd=None makes
         # _supervise exit, so it never restarts a relay being torn down.
-        self.httpd = None
-        proc = self.proc
-        self.proc = None
+        httpd, self.httpd = self.httpd, None
+        proc, self.proc = self.proc, None
         if proc and proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+        if httpd:
+            # Without these the port stays bound and the serving thread stays
+            # alive for the life of the app, once per relay. shutdown() waits
+            # for serve_forever to notice, and stop() is called from the UI
+            # thread, so it goes on a thread of its own.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+            httpd.server_close()
         if self.root:
             shutil.rmtree(self.root, ignore_errors=True)
         self.root = None
@@ -572,7 +737,10 @@ class SyncStreamReader(io.BufferedIOBase):
 class HlsFileHandler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive: fewer TCP handshakes
 
-    relay_requests: list = []  # diagnostic record of every fetch
+    #: Diagnostic record of recent fetches. Bounded: a long IPTV cast fetches
+    #: a segment every couple of seconds for hours, and an unbounded list of
+    #: them is a slow leak for something only ever read while debugging.
+    relay_requests = collections.deque(maxlen=200)
 
     _TYPES = {
         ".m3u8": "application/vnd.apple.mpegurl",
@@ -642,6 +810,7 @@ KIND_LABELS = {
     "sonos": "Sonos",
     "roku": "Roku",
     "kodi": "Kodi",
+    "musiccast": "MusicCast zone",
 }
 
 #: Receivers that can show a picture. Sonos is speakers, and AirPlay here is
@@ -650,13 +819,46 @@ VIDEO_KINDS = {"chromecast", "upnp", "roku", "kodi"}
 
 
 class Device:
-    def __init__(self, kind: str, name: str, key: Any) -> None:
+    def __init__(self, kind: str, name: str, key: Any,
+                 sinks: frozenset = frozenset()) -> None:
         self.kind = kind          # a key of KIND_LABELS
         self.name = name
         self.key = key
+        #: Content types the receiver said it accepts, empty when it did not
+        #: say. See Device.supports_video.
+        self.sinks = sinks
+        #: {"host", "zone"} when this device also answers MusicCast, which is
+        #: a control channel rather than a transport -- see caster_devices.
+        self.musiccast: Optional[dict] = None
+
+    @property
+    def host(self) -> str:
+        """The device's address, however its protocol happens to record it."""
+        key = self.key
+        if isinstance(key, dict):
+            if key.get("host"):
+                return str(key["host"])
+            if key.get("ip"):
+                return str(key["ip"])
+            for field in ("control_url", "base"):
+                if key.get(field):
+                    return upnp_host(str(key[field]))
+            return ""
+        return str(getattr(key, "address", "") or "")
 
     @property
     def supports_video(self) -> bool:
+        """Whether sending this device a picture is worth doing.
+
+        A renderer that published its accepted content types has answered
+        this outright, and is believed: "UPnP renderer" covers televisions
+        and stereo amplifiers alike, and encoding H.264 for an amplifier
+        costs a whole encoder to produce something it will refuse. Silence
+        falls back to the kind, because plenty of renderers answer
+        GetProtocolInfo badly or not at all.
+        """
+        if self.sinks:
+            return any(m.startswith("video/") for m in self.sinks)
         return self.kind in VIDEO_KINDS
 
     @property
@@ -677,6 +879,9 @@ class MainFrame(wx.Frame):
         self.devices: dict[str, Device] = {}
         self.current: Optional[Device] = None
         self.cast: Optional[pychromecast.Chromecast] = None
+        #: One Zeroconf for every cast connection this session, closed on
+        #: exit. See _cast_zeroconf().
+        self._cast_zc = None
         self.yt: Optional[YouTubeController] = None
         self.atv = None  # pyatv AppleTV
         self.stream_task: Optional[asyncio.Task] = None
@@ -693,9 +898,17 @@ class MainFrame(wx.Frame):
         self._muted = False
         self._pre_mute_volume = 100
         self._cast_started = 0.0
+        #: {(host, zone): input} to put back when the cast ends, and the hosts
+        #: currently linked into one MusicCast group.
+        self._mc_restore: dict = {}
+        self._mc_grouped: list = []
+        #: Bumped per cast so a restore from an earlier one can tell it is
+        #: stale and stand down. See _musiccast_prepare.
+        self._mc_epoch = 0
         self._tray = None
 
         self.settings = Settings()
+        self._install_grabber_cache()
         self.speaker = NvdaSpeaker()
         self._last_spoken = ""
 
@@ -712,7 +925,7 @@ class MainFrame(wx.Frame):
 
         self.hotkeys = HotkeyManager(self, self._on_hotkey_action)
         if self.settings["global_hotkeys"]:
-            self.hotkeys.register_all()
+            self._report_lost_hotkeys(self.hotkeys.register_all())
 
         self.vol_slider.SetValue(int(self.settings["volume"]))
         self.Show()
@@ -962,8 +1175,24 @@ class MainFrame(wx.Frame):
         chosen = self.selected_devices()
         return chosen[0] if chosen else None
 
-    def _ui(self, fn, *args) -> None:
-        wx.CallAfter(fn, *args)
+    def _report_lost_hotkeys(self, failed: list) -> None:
+        """Say which system-wide hotkeys another program already owns.
+
+        Silently losing one is worse than it sounds: the hotkey still does
+        something, just in whichever program claimed it first, so the only
+        symptom is Caster appearing to ignore a key it documents.
+        """
+        if not failed:
+            return
+        names = ", ".join(sorted(failed))
+        self.set_status(f"Hotkeys already used by another program: {names}.",
+                        speak=False)
+
+    def _ui(self, fn, *args, **kwargs) -> None:
+        # Keywords forwarded too: set_status(speak=False) is the common case,
+        # and dropping them here turned a status line into a TypeError that
+        # surfaced as "Cast error" with the real failure nowhere in sight.
+        wx.CallAfter(fn, *args, **kwargs)
 
     # ---------- discovery ----------
 
@@ -1068,9 +1297,187 @@ class MainFrame(wx.Frame):
             found.setdefault(cfg.name, Device("airplay", cfg.name, cfg))
         return found
 
+    # ---- MusicCast ----
+    #
+    # MusicCast is a control channel, not a transport: a Yamaha receiver takes
+    # its audio over AirPlay or DLNA like anything else, and answers YXC on
+    # port 80 alongside. So it is attached to whichever device entry won
+    # discovery rather than being a device kind of its own -- the alternative
+    # is a second entry for the same box that plays nothing.
+
+    def _attach_musiccast(self, found: dict) -> None:
+        """Attach MusicCast control to any discovered device that speaks it,
+        and add an entry for each extra zone the unit has."""
+        by_host: dict = {}
+        for device in found.values():
+            host = device.host
+            if host:
+                by_host.setdefault(host, device)
+        if not by_host:
+            return
+        try:
+            units = musiccast_discover_at(list(by_host))
+        except Exception:
+            traceback.print_exc()
+            return
+        for host, info in units.items():
+            device = by_host[host]
+            device.musiccast = {"host": host, "zone": "main",
+                                "model": info.get("model", "")}
+            # Extra zones are separate amplifiers fed by the same stream, so
+            # they are worth offering as their own targets: ticking one wakes
+            # it and puts it on the same input. It is not a separate cast --
+            # the audio still arrives once, by whatever protocol the unit's
+            # main entry uses.
+            for zone in info.get("zones", [])[1:]:
+                label = f"{device.name} {zone.replace('zone', 'Zone ')}"
+                if label in found:
+                    continue
+                extra = Device("musiccast", label,
+                               {"host": host, "zone": zone,
+                                "follows": device.name})
+                extra.musiccast = {"host": host, "zone": zone,
+                                   "model": info.get("model", "")}
+                found[label] = extra
+
+    def _musiccast_targets(self) -> list:
+        """(host, zone) for every selected device that speaks MusicCast."""
+        seen, out = set(), []
+        for device in (self._targets or []):
+            mc = device.musiccast
+            if not mc:
+                continue
+            pair = (mc["host"], mc["zone"])
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+        return out
+
+    def _musiccast_prepare(self, devices: list) -> None:
+        """Wake and aim every MusicCast zone about to be cast to.
+
+        A receiver in network standby accepts a stream and plays it into a
+        powered-down amplifier, which is indistinguishable from a cast that
+        failed; and the network input has to be selected before the push, or
+        a MusicCast unit ignores it and says nothing. Both are done here,
+        before a byte is sent, and neither is allowed to fail the cast.
+        """
+        # Every cast gets a number. A restore belonging to an older cast
+        # must never run: it would switch the receiver off the stream that is
+        # playing right now. Casting, stopping, and casting again within a few
+        # seconds is ordinary use, and that is exactly when it happened --
+        # the previous cast's restore landed in the middle of the next one and
+        # put the amplifier back on the television, silently.
+        self._mc_epoch += 1
+        wanted = {}
+        for device in devices:
+            mc = device.musiccast
+            if not mc:
+                continue
+            want = "server"
+            if device.kind == "airplay":
+                # RAOP makes the receiver select its own AirPlay input as the
+                # session opens. Setting it here as well is at best redundant
+                # and at worst a fight with the receiver over which input it
+                # should be on while the stream is starting.
+                want = ""
+            elif device.kind == "musiccast":
+                # A follower zone plays whatever the main zone is fed.
+                want = ""
+            wanted[(mc["host"], mc["zone"])] = want
+        for (host, zone), want in wanted.items():
+            try:
+                previous = yxc_status(host, zone)
+                if previous.get("input") and (host, zone) not in self._mc_restore:
+                    self._mc_restore[(host, zone)] = previous["input"]
+                if self.settings["musiccast_power_on"]:
+                    yxc_set_power(host, True, zone)
+                # The receiver's own volume is the authority, and the slider
+                # follows it. The reverse -- pushing a remembered percentage
+                # onto the amplifier as a cast begins -- turns a slider left
+                # at 100 into 161 of 161 on an AV receiver, which is a room
+                # at full output with no warning. Never do that implicitly.
+                current = yxc_get_volume(host, zone)
+                if current >= 0 and zone == "main":
+                    self._ui(self._sync_volume_slider, current)
+                if want:
+                    yxc_set_input(host, want, zone)
+                control = self.settings["musiccast_link_control"]
+                delay = self.settings["musiccast_link_audio_delay"]
+                if control:
+                    yxc_set_link_control(host, control, zone)
+                # Documented as ignored while Link Control is on Stability
+                # Boost, so it is not even attempted there.
+                if delay and control != "stability":
+                    yxc_set_link_audio_delay(host, delay, zone)
+            except Exception:
+                traceback.print_exc()
+
+    def _musiccast_restore(self) -> None:
+        """Put every MusicCast zone back on the input it was showing.
+
+        Without this a cast leaves the receiver parked on its network input
+        with nothing playing, and the television it was on before is silent
+        until someone finds the remote.
+        """
+        restore, self._mc_restore = dict(self._mc_restore), {}
+        if not restore or not self.settings["musiccast_restore_input"]:
+            return
+        epoch = self._mc_epoch
+
+        def worker() -> None:
+            # The transport is still tearing down when stop() returns: an
+            # AirPlay session that has not finished closing puts the receiver
+            # back on its own input a moment later, undoing a restore sent too
+            # early. So this waits for the stream to let go, then checks that
+            # the input actually stuck.
+            for _ in range(4):
+                time.sleep(0.5)
+                if self._mc_epoch != epoch:
+                    return          # a new cast started; it owns the input now
+            for (host, zone), previous in restore.items():
+                for _ in range(3):
+                    if self._mc_epoch != epoch or self._targets:
+                        return
+                    try:
+                        if yxc_current_input(host, zone) == previous:
+                            break
+                        yxc_set_input(host, previous, zone)
+                    except Exception:
+                        pass
+                    time.sleep(1.5)
+        threading.Thread(target=worker, daemon=True,
+                         name="musiccast-restore").start()
+
+    def _group_musiccast(self, devices: list) -> list:
+        """Link several MusicCast units so one stream feeds them all in sync.
+
+        Same reasoning as _group_sonos: sending each unit its own copy leaves
+        them audibly out of step, and the receiver can do the syncing itself.
+        With a single MusicCast unit selected -- the ordinary case -- this
+        does nothing at all.
+        """
+        hosts, mains = [], []
+        for device in devices:
+            mc = device.musiccast
+            if mc and mc["zone"] == "main" and device.kind != "musiccast":
+                hosts.append(mc["host"])
+                mains.append(device)
+        if len(hosts) < 2:
+            return devices
+        try:
+            server = musiccast_group(hosts)
+        except Exception as exc:
+            self.set_status(f"MusicCast grouping failed: {exc}")
+            return devices
+        self._mc_grouped = list(hosts)
+        keep = [d for d in mains if d.musiccast["host"] == server] or mains[:1]
+        return [d for d in devices if d not in mains] + keep
+
     def _scan_upnp(self) -> dict:
         found: dict[str, Device] = {}
-        for name, url, maker in upnp_discover(timeout=DISCOVER_SECONDS):
+        for name, url, maker, sinks in upnp_discover(
+                timeout=DISCOVER_SECONDS):
             # A Sonos answers UPnP too, but wants its own transport
             # handling and its own grouping; it is discovered natively
             # by _scan_sonos. Listing it twice would just offer the
@@ -1079,7 +1486,8 @@ class MainFrame(wx.Frame):
                 continue
             found.setdefault(
                 name, Device("upnp", name,
-                             {"control_url": url.replace("&amp;", "&")}))
+                             {"control_url": url.replace("&amp;", "&")},
+                             sinks=sinks))
         return found
 
     def _scan_sonos(self) -> dict:
@@ -1164,8 +1572,23 @@ class MainFrame(wx.Frame):
         found: dict[str, Device] = {}
         for key in ("chromecast", "airplay", "upnp", "roku", "kodi"):
             for name, device in results.get(key, {}).items():
-                found.setdefault(name, device)
+                seen = found.get(name)
+                if seen is None:
+                    found[name] = device
+                elif (device.sinks and device.supports_video
+                        and not seen.supports_video):
+                    # One box answering two protocols under one name: keep the
+                    # answer that can do more. A television advertises AirPlay
+                    # and DLNA both, and AirPlay here is RAOP -- audio only --
+                    # so first-come would silently cost it its picture. Order
+                    # still decides every tie, so an amplifier (no video on
+                    # either) keeps the AirPlay path, which is the better one.
+                    # Only a published sink list counts as proof: a renderer
+                    # that answered nothing must not displace a working entry
+                    # on the strength of what its kind usually implies.
+                    found[name] = device
         found.update(results.get("sonos", {}))
+        self._attach_musiccast(found)
 
         self._ui(self._apply_devices, found)
 
@@ -1279,7 +1702,7 @@ class MainFrame(wx.Frame):
             dlg.apply()
             if self.settings["global_hotkeys"]:
                 self.hotkeys.unregister_all()
-                self.hotkeys.register_all()
+                self._report_lost_hotkeys(self.hotkeys.register_all())
             else:
                 self.hotkeys.unregister_all()
             self.set_status("Settings saved.")
@@ -1320,8 +1743,21 @@ class MainFrame(wx.Frame):
         self.settings.add_recent_url(url)
         self.settings.note_device(devices[0].label)
         self._refresh_recent()
-        for dev in self._group_sonos(devices):
-            self._dispatch(dev, url)
+        devices = self._group_musiccast(self._group_sonos(devices))
+        self._targets = list(devices)
+
+        trace("play", f"{[d.label for d in devices]} {url[:60]}")
+
+        def start() -> None:
+            # Waking a receiver and aiming its input is several HTTP round
+            # trips and can include a settle sleep. Off the UI thread, or the
+            # window stops answering -- and a window that stops answering is a
+            # screen reader that has gone quiet at the exact moment the user
+            # is waiting to hear what happened. Dispatch goes back to the UI
+            # thread, where the protocol handlers expect to be called.
+            self._musiccast_prepare(devices)
+            self._ui(lambda: [self._dispatch(dev, url) for dev in devices])
+        threading.Thread(target=start, daemon=True, name="play").start()
 
     def _group_sonos(self, devices: list) -> list:
         """Collapse several Sonos speakers into one grouped coordinator.
@@ -1355,6 +1791,10 @@ class MainFrame(wx.Frame):
             self._play_roku(dev, url, mime, title)
         elif dev.kind == "kodi":
             self._play_kodi(dev, url)
+        elif dev.kind == "musiccast":
+            # Control-only target: _musiccast_prepare has already woken it and
+            # put it on the input its main zone is playing.
+            self._ui(self.set_status, f"{dev.name} following.", speak=False)
         else:
             self._play_airplay(dev, url)
 
@@ -1426,18 +1866,18 @@ class MainFrame(wx.Frame):
                     return
                 probe = probe_media(url)
                 if probe["mime"] == "video/mp2t":
-                    relay = HlsRelay(url)
-                    play_url = relay.start()
+                    relay = self._make_relay(url)
                     self._relay = relay
+                    play_url = relay.start()
                 else:
                     # UPnP renderers can usually fetch plain URLs; but local
                     # files need serving, so relay everything except http(s).
                     if url.lower().startswith(("http://", "https://")):
                         play_url = url
                     else:
-                        relay = HlsRelay(url)  # may fail for non-media
-                        play_url = relay.start()
+                        relay = self._make_relay(url)  # may fail: not media
                         self._relay = relay
+                        play_url = relay.start()
                 # The relay republishes the source as HLS, so what the
                 # renderer is being handed is a playlist, not the probed type.
                 self._upnp_push(
@@ -1460,14 +1900,115 @@ class MainFrame(wx.Frame):
         # MusicCast receivers ignore a pushed URL unless the input is already
         # switched to the network source, and give no error when they do.
         host = upnp_host(control_url)
-        if host and yxc_available(host):
-            yxc_set_input(host)
+        # _musiccast_prepare already did this for a device discovered as
+        # MusicCast; this covers a renderer reached by URL or by a path that
+        # never went through discovery.
+        if host and not any(h == host for h, _ in self._musiccast_targets()) \
+                and yxc_available(host):
+            yxc_set_input(host, "server")
         upnp_play(control_url, play_url, title, mime,
                   "object.item.audioItem.musicTrack"
                   if mime.startswith("audio/") else "object.item.videoItem")
         self._ui(self.set_status, f"Playing on {dev.name}.")
 
     # ---- Chromecast ----
+
+    #: Cast receiver app id (Default Media Receiver).
+    CAST_APP_ID = "CC1AD845"
+
+    def _cast_zeroconf(self):
+        """The one Zeroconf the cast client uses, made on demand.
+
+        A fresh instance per connect binds port 5353 again and is never
+        closed, so a session of channel-hopping leaks one per play.
+        """
+        if self._cast_zc is None:
+            self._cast_zc = zeroconf.Zeroconf()
+        return self._cast_zc
+
+    def _ensure_receiver(self, cast, timeout: float = 8.0) -> None:
+        """Make sure the media receiver app is running, and no more than that.
+
+        Relaunching an app that is already up costs a full teardown and launch
+        -- on a TV, seconds of it -- for no gain, so the launch is forced only
+        when something else holds the screen. What replaces the old flat sleep
+        afterwards is watching for the app to actually report itself: a fast
+        receiver is then waited on for as long as it needs and no longer.
+        """
+        try:
+            if cast.app_id == self.CAST_APP_ID:
+                return
+            cast.start_app(self.CAST_APP_ID, force_launch=True)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if cast.app_id == self.CAST_APP_ID:
+                    # The app id lands a moment before the receiver will take
+                    # media; this is the settle, and it is a tenth of what the
+                    # old unconditional wait cost.
+                    time.sleep(0.25)
+                    return
+                time.sleep(0.05)
+        except Exception:
+            pass        # play_media reports the real failure a moment later
+
+    #: How long to give a load before calling it rejected, and how often to
+    #: look. The poll interval is the floor on how soon "Playing" can be
+    #: spoken, so it is short: a blind user hears this as the app hanging.
+    LOAD_TIMEOUT = 12.0
+    LOAD_POLL = 0.15
+
+    #: Idle reasons that describe the END of a previous playback rather than
+    #: a rejection of the new one. INTERRUPTED in particular is what the
+    #: receiver says when a session is replaced -- which is exactly what
+    #: loading something else does -- so treating it as a failure meant
+    #: reporting the old stream's death as the new stream's.
+    STALE_IDLE_REASONS = ("INTERRUPTED", "CANCELLED")
+
+    def _await_playing(self, mc, previous_session=None) -> bool:
+        """True once the receiver is playing; False if it rejected the load.
+
+        The status object keeps reporting the previous session until the
+        receiver sends one for the new one, so anything still carrying the old
+        session id is ignored outright. Without that, a load issued moments
+        after a stop reads the old session's dying status and is declared
+        failed while it is in fact starting normally.
+        """
+        deadline = time.monotonic() + self.LOAD_TIMEOUT
+        seen = ""
+        while time.monotonic() < deadline:
+            status = mc.status
+            if status is not None:
+                session = getattr(status, "media_session_id", None)
+                stale = (previous_session is not None
+                         and session == previous_session)
+                state = status.player_state
+                if f"{state}{stale}" != seen:
+                    seen = f"{state}{stale}"
+                    trace("cast.state", f"{state} {status.idle_reason or ''}"
+                                        f"{' (stale session)' if stale else ''}")
+                if not stale:
+                    if state == "PLAYING":
+                        return True
+                    if (state == "IDLE" and status.idle_reason
+                            and status.idle_reason
+                            not in self.STALE_IDLE_REASONS):
+                        return False
+            time.sleep(self.LOAD_POLL)
+        return False
+
+    def _make_relay(self, url: str, codecs: Optional[list] = None) -> HlsRelay:
+        """An HLS relay tuned to the chosen quality preset.
+
+        Segment length and how far behind the live edge to sit are the whole
+        delay/robustness trade, so they follow the same setting the user
+        already picked for capture rather than being fixed here.
+        """
+        chosen = preset(self.settings["capture_quality"])
+        return HlsRelay(url,
+                        hls_time=chosen["hls_time"],
+                        prime_segments=chosen["hls_prime"],
+                        trail_keep=chosen["hls_trail"],
+                        codecs=codecs)
 
     def _play_chromecast(self, dev: Device, url: str, mime: str = "",
                          is_live: Optional[bool] = None) -> None:
@@ -1494,9 +2035,21 @@ class MainFrame(wx.Frame):
                     services={HostServiceInfo(host, port)},
                 )
                 cast = pychromecast.Chromecast(
-                    ci, zconf=zeroconf.Zeroconf(), tries=3, timeout=15,
+                    ci, zconf=self._cast_zeroconf(), tries=3, timeout=15,
                 )
                 cast.wait(20)
+                trace("cast.connected", f"{dev.name} app={cast.app_id}")
+                if self._stop_flag:
+                    # Stop was pressed while this was connecting. Publishing
+                    # the connection now would put a live cast back on the
+                    # frame that stop_silent has already cleared: nothing
+                    # would ever tear it down, and the next play would read
+                    # its stale PLAYING status as its own.
+                    try:
+                        cast.disconnect(blocking=False)
+                    except Exception:
+                        pass
+                    return
                 self.cast = cast
 
                 vid = youtube_id(url)
@@ -1508,20 +2061,41 @@ class MainFrame(wx.Frame):
                     self._ui(self.set_status, f"YouTube {vid} on {dev.name}.")
                 else:
                     mc = cast.media_controller
+                    # Get the receiver app coming up NOW, on its own thread.
+                    # A TV takes seconds to launch one, and every one of those
+                    # seconds is otherwise spent after the probe and the relay
+                    # have finished rather than alongside them.
+                    warm = threading.Thread(
+                        target=self._ensure_receiver, args=(cast,),
+                        daemon=True, name="cast-warm")
+                    warm.start()
                     if mime:
                         probe = {"mime": mime, "is_live": bool(is_live)}
                     else:
-                        self._ui(self.set_status, "Probing...")
+                        self._ui(self.set_status, "Probing...", speak=False)
+                        _t = time.monotonic()
                         probe = probe_media(url)
+                        trace("cast.probe",
+                              f"{time.monotonic()-_t:.2f}s {probe['mime']} "
+                              f"live={probe['is_live']}")
                     load_mime = probe["mime"]
                     if probe["mime"] == "video/mp2t" and not url.lower().split("?")[0].endswith(".m3u8"):
                         # Cast receivers reject raw MPEG-TS; remux via the
                         # local relay (runs only while playing).
-                        self._ui(self.set_status, "Relay starting...")
-                        relay = HlsRelay(url)
+                        self._ui(self.set_status, "Relay starting...",
+                                 speak=False)
+                        relay = self._make_relay(url)
                         HlsFileHandler.relay_requests.clear()
-                        play_url = relay.start()
                         self._relay = relay
+                        trace("cast.relay.start",
+                              f"hls_time={relay.hls_time} "
+                              f"prime={relay.prime_segments} "
+                              f"trail={relay.trail_keep}")
+                        _t = time.monotonic()
+                        play_url = relay.start()
+                        trace("cast.relay.ready",
+                              f"{time.monotonic()-_t:.2f}s "
+                              f"transcoded={relay.video_transcoded}")
                         load_mime = "application/vnd.apple.mpegurl"
                     else:
                         play_url = url
@@ -1529,27 +2103,30 @@ class MainFrame(wx.Frame):
                     # the receiver rejects/fails the load.
                     stream_type = "LIVE" if probe["is_live"] else "BUFFERED"
                     # The receiver app must be running or play_media silently
-                    # no-ops (LOADING -> IDLE/FINISHED). Launch it explicitly.
-                    cast.start_app("CC1AD845", force_launch=True)
-                    time.sleep(2.5)
+                    # no-ops (LOADING -> IDLE/FINISHED).
+                    warm.join(timeout=10)
+                    self._ensure_receiver(cast)
+                    trace("cast.receiver.ready", f"app={cast.app_id}")
+                    # Whatever session is showing now belongs to the last
+                    # thing played; the new one has to be told apart from it.
+                    before = getattr(mc.status, "media_session_id", None)
                     mc.play_media(play_url, load_mime,
                                   stream_type=stream_type)
                     mc.block_until_active(15)
-                    settled = False
-                    for _ in range(8):
-                        time.sleep(1.5)
-                        state = mc.status.player_state
-                        if state == "PLAYING":
-                            settled = True
-                            break
-                        if state == "IDLE" and mc.status.idle_reason:
-                            # Load rejected; flip stream type and retry once.
-                            other = "BUFFERED" if stream_type == "LIVE" else "LIVE"
-                            mc.play_media(play_url, load_mime,
-                                          stream_type=other)
-                            mc.block_until_active(15)
-                            stream_type = other
-                            continue
+                    trace("cast.load", f"{load_mime} {stream_type} "
+                                       f"prev_session={before}")
+                    settled = self._await_playing(mc, before)
+                    trace("cast.settled", str(settled))
+                    if not settled:
+                        # Load rejected; flip stream type and retry once.
+                        stream_type = ("BUFFERED" if stream_type == "LIVE"
+                                       else "LIVE")
+                        before = getattr(mc.status, "media_session_id", None)
+                        mc.play_media(play_url, load_mime,
+                                      stream_type=stream_type)
+                        mc.block_until_active(15)
+                        trace("cast.retry", stream_type)
+                        settled = self._await_playing(mc, before)
                     if settled:
                         kind = "live" if stream_type == "LIVE" else "file"
                         self._ui(self.set_status,
@@ -1628,6 +2205,7 @@ class MainFrame(wx.Frame):
                         self._air_play_t0 = time.monotonic()
                     self._air_state = "playing"
                     wake.clear()
+                    trace("air.stream.start", dev.name)
                     self._ui(self.set_status, f"Streaming to {dev.name}...")
                     self.stream_task = asyncio.create_task(
                         atv.stream.stream_file(stream)
@@ -1729,24 +2307,48 @@ class MainFrame(wx.Frame):
 
         # Video (IPTV TS channel or provider VOD): ffmpeg audio pipe.
         self._ui(self.set_status, "Extracting audio...")
+        trace("air.ffmpeg.spawn", url[:70])
         ffmpeg = _find_ffmpeg()
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
         # Survive IPTV source drops/jitter instead of feeding silence.
         cmd += [
+            # See the relay: without this, a reconnect asks a live server to
+            # resume at a byte offset and the overlap is heard as the stream
+            # jumping back. Only meaningful for http(s), which is the only
+            # case that reconnects at all.
+            *(("-seekable", "0") if url.lower().startswith(
+                ("http://", "https://")) else ()),
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "2",
             "-rw_timeout", "5000000",
+            # Look at as little of the stream as it takes to find the audio.
+            # The defaults inspect five seconds before emitting a byte, and
+            # every one of those is silence at the start of a channel.
+            "-analyzeduration", "1000000",
+            "-probesize", "1000000",
         ]
         if self._pending_seek:
             # Input seeking: fast, lands on a keyframe close to the target.
             cmd += ["-ss", str(max(self._pending_seek - 2.0, 0.0))]
         cmd += [
-            "-fflags", "+genpts",          # smooth over source timestamp jumps
+            # +nobuffer and low_delay stop the demuxer holding packets back;
+            # +genpts fills in timestamps the source omits.
+            "-fflags", "+genpts+nobuffer",
+            "-flags", "+low_delay",
             "-i", url,
             "-vn", "-map", "a:0?",          # audio track only
-            "-af", "aresample=44100:async=1",  # steady clock, absorbs jitter
+            # The receiver plays at its own crystal's pace and the channel
+            # arrives at the source's; the two drift apart all day. async is
+            # the budget for correcting that, in samples per second, and it
+            # was 1 -- so the error grew until ffmpeg gave up and jumped,
+            # which is heard as the stream skipping. 1000 lets it be
+            # stretched away continuously instead, inaudibly. first_pts=0
+            # pins the start so the first packet's timestamp, whatever the
+            # channel says it is, does not lurch the stream on its way in.
+            "-af", "aresample=44100:async=1000:first_pts=0",
             "-f", "wav", "-c:a", "pcm_s16le",
+            "-flush_packets", "1",
             "-",                             # pipe to stdout
         ]
         proc = await asyncio.create_subprocess_exec(
@@ -1799,6 +2401,32 @@ class MainFrame(wx.Frame):
         dlg.Destroy()
         self._cast_capture(title, hwnd=hwnd)
 
+    def _install_grabber_cache(self) -> None:
+        """Let the screen-grabber probe remember its answer between launches.
+
+        The probe hangs for its whole timeout on any box where ddagrab does
+        not work, and a box where it does not work never starts working, so
+        paying that once per install beats paying it once per launch. The
+        answer is filed against the machine and session type, because that is
+        what it actually depends on -- the same PC over RDP is a different
+        answer.
+        """
+        settings = self.settings
+
+        def load() -> str:
+            if settings["screen_grabber_key"] != ce.grabber_machine_key():
+                return ""
+            return settings["screen_grabber"]
+
+        def store(value: str) -> None:
+            settings.update(screen_grabber=value,
+                            screen_grabber_key=ce.grabber_machine_key())
+
+        ce.grabber_cache_load = load
+        ce.grabber_cache_store = store
+        # Settle it now, off any connect path. Nothing waits on this.
+        ce.prewarm_screen_grabber()
+
     def _capture_container(self, dev: Device, audio_only: bool) -> str:
         """The wire format `dev` can actually play.
 
@@ -1847,7 +2475,7 @@ class MainFrame(wx.Frame):
             self.set_status("Pick a device first.")
             return
         self.stop_silent()
-        devices = self._group_sonos(devices)
+        devices = self._group_musiccast(self._group_sonos(devices))
         self.current = devices[0]
         self._targets = list(devices)
         self._stop_flag = False
@@ -1857,7 +2485,9 @@ class MainFrame(wx.Frame):
         airplay = [d for d in devices if d.kind == "airplay"]
         by_container: dict = {}
         for dev in devices:
-            if dev.kind == "airplay":
+            # A follower zone is fed by the unit's main zone, already woken
+            # and aimed by _musiccast_prepare. It needs no stream of its own.
+            if dev.kind in ("airplay", "musiccast"):
                 continue
             by_container.setdefault(
                 self._capture_container(dev, audio_only), []).append(dev)
@@ -1869,8 +2499,17 @@ class MainFrame(wx.Frame):
         self.set_status(f"Starting {label.lower()} capture "
                         f"({formats}) for {names}...")
 
+        # Published before anything starts, and appended to as sources come
+        # up: stop() pressed midway must always find a handle to every capture
+        # already running, including one started in the gap.
+        started: list = []
+        self._sources = started
+
         def worker() -> None:
-            started = []
+            # Same reason as play(): this talks to the receiver over HTTP, so
+            # it belongs on the worker and not on the UI thread.
+            self._musiccast_prepare(devices)
+            watched = []
             for container, group in by_container.items():
                 try:
                     src = self._capture_source(container, hwnd)
@@ -1891,12 +2530,25 @@ class MainFrame(wx.Frame):
                 for dev in group:
                     self._ui(self._dispatch, dev, src.url, src.mime, True,
                              f"{APP_TITLE}: {label}")
-            self._sources = started
+                if group:
+                    watched.append(src)
             self._cast_started = time.monotonic()
             for dev in airplay:
                 self._ui(self._play_airplay, dev, "", started[0])
             for dev in devices:
                 self.settings.note_device(dev.label)
+            # The receiver's own connection is what proves the chain works.
+            # Waiting on it here rather than before dispatch means the check
+            # overlaps the receiver connecting instead of delaying it -- and
+            # costs no second encoder to perform.
+            for src in watched:
+                try:
+                    src.wait_for_media()
+                except Exception as exc:
+                    if self._stop_flag or src not in self._sources:
+                        return       # stopped while waiting; not a failure
+                    self._ui(self.set_status, f"Capture failed: {exc}")
+                    return
 
         threading.Thread(target=worker, daemon=True,
                          name="caster-capture").start()
@@ -1945,6 +2597,7 @@ class MainFrame(wx.Frame):
     # ---- teardown ----
 
     def stop_silent(self) -> None:
+        trace("stop", "")
         self._stop_flag = True
         task = self.stream_task
         if task and not task.done():
@@ -1978,13 +2631,26 @@ class MainFrame(wx.Frame):
                     kodi_stop(dev.key["base"], self._kodi_auth())
             except Exception:
                 pass
+        grouped, self._mc_grouped = list(self._mc_grouped), []
+        if grouped:
+            # Nothing waits on this, and stop() is pressed on the UI thread.
+            threading.Thread(
+                target=lambda: musiccast_ungroup(grouped), daemon=True,
+                name="musiccast-ungroup").start()
+        self._musiccast_restore()
         self._targets = []
-        if self.cast:
+        cast, self.cast = self.cast, None
+        if cast:
             try:
-                self.cast.stop_app()
+                cast.stop_app()
             except Exception:
                 pass
-            self.cast = None
+            try:
+                # Without this the socket client thread outlives the play and
+                # keeps the connection open, once per device cast to.
+                cast.disconnect(blocking=False)
+            except Exception:
+                pass
 
     async def _cancel_stream(self, task: asyncio.Task) -> None:
         task.cancel()
@@ -2126,14 +2792,32 @@ class MainFrame(wx.Frame):
             pos += time.monotonic() - self._air_play_t0
         return pos
 
-    def _on_volume(self, event) -> None:
-        self.apply_volume(self.vol_slider.GetValue())
+    def _sync_volume_slider(self, level: int) -> None:
+        """Show the receiver's real volume without sending it back."""
+        self._updating_slider = True
+        try:
+            self.vol_slider.SetValue(max(0, min(100, int(level))))
+            self.settings.set("volume", int(level))
+        finally:
+            self._updating_slider = False
 
-    def apply_volume(self, level: int, remember: bool = True) -> None:
+    def _on_volume(self, event) -> None:
+        if self._updating_slider:
+            return          # we moved it to match the device, not the user
+        self.apply_volume(self.vol_slider.GetValue(), user=True)
+
+    def apply_volume(self, level: int, remember: bool = True,
+                     user: bool = False) -> None:
         """Set the volume on every device being cast to.
 
         Each protocol has its own way of being told, and a room is only
         usefully quieter if all of it gets quieter.
+
+        `user` marks a change the person actually asked for. Only those reach
+        a MusicCast receiver: its scale is its own (161 steps here, not 100),
+        so a remembered slider position replayed at it is not "the volume they
+        had" but a fraction of a completely different range -- and 100 means
+        maximum output on an amplifier wired to real speakers.
         """
         level = max(0, min(100, int(level)))
         if remember:
@@ -2149,6 +2833,18 @@ class MainFrame(wx.Frame):
         def worker() -> None:
             for dev in list(self._targets):
                 try:
+                    # MusicCast first: it is the receiver's own volume, on the
+                    # receiver's own scale (161 steps here, not 100), so it
+                    # lands on a real step and matches the front panel. It is
+                    # also the only way to reach a zone that has no transport
+                    # of its own, and the only volume an AirPlay target has
+                    # that survives the stream ending.
+                    if dev.musiccast:
+                        if not user:
+                            continue    # never impose a level nobody chose
+                        mc = dev.musiccast
+                        if yxc_set_volume(mc["host"], level, mc["zone"]):
+                            continue
                     if dev.kind == "sonos":
                         sonos_set_volume(dev.key["ip"], level)
                     elif dev.kind == "kodi":
@@ -2160,11 +2856,55 @@ class MainFrame(wx.Frame):
                     pass
         threading.Thread(target=worker, daemon=True, name="volume").start()
 
+    def speak_volume(self) -> str:
+        """The volume as the receiver itself shows it, when it can say.
+
+        A percentage is a guess at someone else's scale; "-35.5 dB" is the
+        number on the front panel and on the remote.
+        """
+        for dev in (self._targets or []):
+            if dev.musiccast:
+                shown = yxc_volume_db(dev.musiccast["host"],
+                                      dev.musiccast["zone"])
+                if shown:
+                    return shown
+        return ""
+
     def nudge_volume(self, delta: int) -> None:
         level = max(0, min(100, self.vol_slider.GetValue() + delta))
         self.vol_slider.SetValue(level)
-        self.apply_volume(level)
+        self.apply_volume(level, user=True)
         self.set_status(f"Volume {level} percent.")
+
+        def announce() -> None:
+            # Read back rather than compute: the receiver rounds to its own
+            # step, so the number it shows is not the one that was sent.
+            shown = self.speak_volume()
+            if shown:
+                self._ui(self.set_status, f"Volume {level} percent, {shown}.")
+        if self._musiccast_targets():
+            threading.Thread(target=announce, daemon=True,
+                             name="volume-readback").start()
+
+    def _musiccast_mute(self, muted: bool) -> None:
+        """Mute every MusicCast zone, off the UI thread.
+
+        Mute is on a global hotkey, and every one of these is an HTTP round
+        trip to a receiver that may be asleep or off the network. Done inline
+        that is a window that stops answering the moment the key is pressed.
+        """
+        targets = self._musiccast_targets()
+        if not targets:
+            return
+
+        def worker() -> None:
+            for host, zone in targets:
+                try:
+                    yxc_set_mute(host, muted, zone)
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True,
+                         name="musiccast-mute").start()
 
     def toggle_mute(self) -> None:
         """Silence the receivers without ending the cast.
@@ -2175,13 +2915,22 @@ class MainFrame(wx.Frame):
         if self._muted:
             self._muted = False
             self.vol_slider.SetValue(self._pre_mute_volume)
-            self.apply_volume(self._pre_mute_volume)
+            self._musiccast_mute(False)
+            # A MusicCast receiver has a real mute, already released above, so
+            # its level was never touched and must not be rewritten here.
+            self.apply_volume(self._pre_mute_volume,
+                              user=not self._musiccast_targets())
             self.set_status(f"Unmuted, volume {self._pre_mute_volume} percent.")
         else:
             self._muted = True
             self._pre_mute_volume = self.vol_slider.GetValue()
             self.vol_slider.SetValue(0)
-            self.apply_volume(0, remember=False)
+            # A receiver that has a real mute gets it: winding the volume to
+            # zero and back walks the amplifier through every step in between,
+            # and on a MusicCast unit that is audible.
+            self._musiccast_mute(True)
+            self.apply_volume(0, remember=False,
+                              user=not self._musiccast_targets())
             self.set_status("Muted.")
         # Roku has no volume API, only the remote's own keys.
         for dev in list(self._targets):
@@ -2346,6 +3095,12 @@ class MainFrame(wx.Frame):
                 except Exception:
                     pass
         finally:
+            zc, self._cast_zc = self._cast_zc, None
+            if zc:
+                try:
+                    zc.close()
+                except Exception:
+                    pass
             self.loop_thread.loop.call_soon_threadsafe(self.loop_thread.loop.stop)
             event.Skip()
 

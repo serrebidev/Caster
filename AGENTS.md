@@ -26,7 +26,7 @@ Build output `dist/Caster/`. ffmpeg.exe copied beside exe, 96 MB. Zip ~92 MB, 15
 
 - `caster.py` — GUI, MainFrame, discovery, per-protocol play, HlsRelay, LoopThread
 - `caster_extras.py` — UPnP SOAP, FileServer, AudioTap, ScreenSource, ffmpeg
-- `caster_devices.py` — Sonos, Roku, Kodi. No caster imports. Keep it that way, no cycle
+- `caster_devices.py` - Sonos, Roku, Kodi, MusicCast. No caster imports. Keep it that way, no cycle
 - `caster_ui.py` — NvdaSpeaker, labelled(), HotkeyManager, TrayIcon, SettingsDialog
 - `caster_config.py` — Settings JSON at `%APPDATA%\Caster\settings.json`, QUALITY_PRESETS
 
@@ -92,6 +92,49 @@ each was most of the old cost.
 - pychromecast's own browser misses some Cast devices (the FFM TVs here). Browse
   `_googlecast._tcp` directly and read TXT records.
 
+## Connect latency - where it went, and what must not come back
+
+Was 20-30 s to first picture. Six fixed waits in series, not one slow thing.
+Measured on this box, not guessed.
+
+- `pick_screen_grabber()` probed ddagrab for a hard 10 s EVERY launch, because
+  ddagrab hangs here and the cache was a module global. Now cached to
+  `settings.json` under `screen_grabber` + `screen_grabber_key`
+  (COMPUTERNAME|SESSIONNAME - RDP is a different answer), probe cut to 2.5 s,
+  and `prewarm_screen_grabber()` pays it in the background at startup.
+  caster.py wires the load/store hooks in `_install_grabber_cache()`; without
+  them caster_extras still works and simply re-probes. Do not import the
+  settings into caster_extras to "simplify" this - the hooks are what keep
+  that module standalone.
+- `ScreenSource._verify()` opened the app's OWN url and read 32 KB. ffmpeg is
+  spawned per connection, so that ran a whole encoder, killed it, and left the
+  receiver to wait through a second cold start. Gone. `start(verify=True)` now
+  only settles the gdigrab window spec (one frame, `-frames:v 1`), and
+  `wait_for_media()` reports failure from the receiver's own connection AFTER
+  the url is dispatched. Never reintroduce a self-connect check.
+- Cast `start_app(force_launch=True)` + `time.sleep(2.5)` relaunched a receiver
+  that was usually already up. `_ensure_receiver()` launches only when
+  `cast.app_id` is something else, then polls for it. It also runs on a warm
+  thread started before probing, so a TV's launch overlaps the probe and the
+  relay prime instead of following them.
+- The settle loop slept 1.5 s BEFORE its first look, up to 8 times. Even an
+  instant cast could not be announced for 1.5 s, which a blind user hears as
+  the app hanging. `_await_playing()` polls at 0.15 s. Keep it short.
+- `_probe_codecs` had NO timeout: `p.stderr.read(65536)` on a server that goes
+  quiet blocked forever. Now `subprocess.run(timeout=8)` with
+  `-analyzeduration 2000000 -probesize 2000000` (the defaults spend 5 s on a TS
+  before saying anything). `HlsRelay(codecs=...)` takes the answer when the
+  caller already has it, so the source is not opened a third time.
+- Relay primed 4 segments at `hls_time 2` = a guaranteed 8 s wait on a live
+  source, then sat 12 s behind live at `TRAIL_KEEP = 6`. Both now come from
+  QUALITY_PRESETS (`hls_time`, `hls_prime`, `hls_trail`) via `_make_relay()`.
+  The `hls_prime` floor of 3 is not a preference: it is what clears the cast
+  receiver's 3x TARGETDURATION rule. `hls_trail` is the jitter cushion AND the
+  delay, second for second - deep for stuttering IPTV, shallow for clean
+  sources.
+
+Roughly 15 s off both paths. What is left is the receiver's own startup.
+
 ## Capture
 
 `CONTAINERS`: mp4 -> Chromecast and Roku, mpegts -> DLNA/TV/Kodi, wav -> audio boxes.
@@ -106,37 +149,192 @@ Mixed selection (Cast + DLNA) = one ScreenSource per container, two encoders.
 `_no_window_kwargs()` on every subprocess or a console flashes on screen.
 `_find_ffmpeg()` order: beside frozen exe, PATH, winget glob.
 
-## Known bugs — open as of v1.1.2
+## Known bugs
 
-Confirmed by running the code:
+Fixed before the 0.5.0 release, listed so they are not reintroduced:
 
-1. `HlsRelay.stop()` never calls `httpd.shutdown()` / `server_close()`. Port stays open and
-   the thread stays alive for the life of the app, once per relay. `FileServer.stop()` and
-   `ScreenSource.stop()` do it right — copy those.
-2. `HlsRelay.start()` raises "ffmpeg exited early" without calling `self.stop()`. Leaks the
-   server, its thread, and the temp dir `%TEMP%\caster_hls_*`.
-3. `LoopThread.submit()` returns None, declared `-> None`. So `self._runner_fut` is always
+- `HlsRelay.stop()` never closed the server. Port and thread stayed alive for
+  the life of the app, once per relay. Now shuts down and closes like
+  `FileServer` does.
+- `HlsRelay.start()` raised without calling `self.stop()`, leaking the server,
+  its thread and `%TEMP%\caster_hls_*`. The body is now wrapped in
+  `except BaseException: self.stop(); raise`.
+- `HlsRelay._ffmpeg_cmd` passed `-reconnect`/`-rw_timeout` for EVERY input.
+  Those are HTTP-protocol options: handed a local path, ffmpeg refused the
+  whole command with "Option reconnect not found" and opened no input at all,
+  so relaying a local file - which `_play_upnp` does for anything not http(s)
+  - could never have worked. Now applied only to http(s) urls. `-fflags
+  +genpts` also moved BEFORE `-i`; after `-i` it landed on the muxer, where it
+  does nothing.
+- `HlsFileHandler.relay_requests` unbounded. Now `deque(maxlen=200)`.
+- A fresh `zeroconf.Zeroconf()` per Chromecast connect, never closed, and
+  `stop_silent()` dropped `self.cast` without `disconnect()`. Now one
+  `_cast_zeroconf()` for the session, closed in `_on_close`, and `stop_silent`
+  disconnects.
+- `_cast_capture` set `self._sources` AFTER the last `_stop_flag` check, so
+  Stop pressed in that gap left a capture running with no handle to it. The
+  list is published before the worker starts and appended to as sources come
+  up.
+- `_play_chromecast` and `_play_upnp` set `self._relay` only after
+  `relay.start()` returned, so Stop during the prime could not find it.
+  Assigned before starting.
+
+Still open:
+
+1. `LoopThread.submit()` returns None, declared `-> None`. So `self._runner_fut` is always
    None. `stop_silent()`'s `rf.cancel()` is dead and `_on_close()`'s `fut.result(timeout=8)`
-   never waits — app closes without letting AirPlay tear down. Return the future.
-4. `HlsFileHandler.relay_requests` unbounded. Appended on every GET, cleared only when a new
-   Cast relay starts. Long IPTV cast grows it forever.
-
-By inspection, not reproduced:
-
-5. `zeroconf.Zeroconf()` made fresh per Chromecast connect (caster.py ~1497), never closed.
-   `stop_silent()` drops `self.cast` without `disconnect()`. Leaks per play.
-6. `_play_upnp` worker sets `self._relay = relay`. Two UPnP renderers + one TS URL = second
+   never waits - app closes without letting AirPlay tear down. Return the future.
+2. `_play_upnp` worker sets `self._relay = relay`. Two UPnP renderers + one TS URL = second
    overwrites first, first ffmpeg and its server orphaned.
-7. `_cast_capture` worker sets `self._sources = started` AFTER the last `_stop_flag` check.
-   Stop pressed in that gap = capture keeps running with no handle to stop it.
-8. `_air_shutdown` event is created and never set anywhere. Stop during AirPlay falls into
+3. `_air_shutdown` event is created and never set anywhere. Stop during AirPlay falls into
    the "stream ended naturally" branch and announces "Finished." after `stop()` already
    said "Stopped." Wrong word spoken.
-9. `HotkeyManager.register_all()` returns the actions that failed. caster.py ignores the
+4. `HotkeyManager.register_all()` returns the actions that failed. caster.py ignores the
    return, so a hotkey another app already owns is lost silently.
-10. `AudioTap.start()` leaves `self._thread` set after a failed start, so a retry returns
-    immediately and the caller believes capture is live. Note: an unknown device name does
-    NOT fail — `_pick_loopback_device` falls back to the default on purpose.
+5. `AudioTap.start()` leaves `self._thread` set after a failed start, so a retry returns
+   immediately and the caller believes capture is live. Note: an unknown device name does
+   NOT fail - `_pick_loopback_device` falls back to the default on purpose.
+
+## MusicCast (Yamaha)
+
+YXC is a control channel, not a transport. The receiver still takes audio over
+AirPlay or DLNA; YXC on port 80 adds power, input, real volume, zones and
+grouping. So it is ATTACHED to whichever device entry won discovery
+(`_attach_musiccast`), never a device kind that plays anything. Kind
+`musiccast` exists only for extra zones, which are followers: they are woken
+and aimed, and `_cast_capture` skips them so no second encoder is started.
+
+- The unit publishes what it can do. Everything optional is gated on
+  `yxc_can(host, func, zone)` reading `func_list` from getFeatures, never on a
+  model name. On the RX-V4A here, main has link_control and sound_program and
+  zone2 has neither, and that is the unit talking, not a guess.
+- Volume is NOT 0-100. `range_step` says 0-161 step 1, and `actual_volume` is
+  real dB. `yxc_set_volume` maps the slider onto whatever the zone reports;
+  treating it as a percentage lands between steps and throws away resolution.
+- `prepareInputChange` before `setInput` is required whenever the unit lists
+  `prepare_input_change`, and MusicCast's own controller does it. `yxc_set_input`
+  now does both.
+- getFeatures is big and static. Cached per host in `_yxc_features_cache`;
+  measured 0.03 s cold, 0 s after.
+- Link Audio Delay is documented as ignored while Link Control is on Stability
+  Boost, so it is not attempted there. Whether Link Control affects a direct
+  DLNA/AirPlay push at all is NOT documented either way -- it is a MusicCast
+  link setting, so treat any improvement as unproven until measured.
+- `musiccast_group()` mirrors `sonos_group()` and no-ops below two units. There
+  is only one MusicCast unit on this LAN, so the multi-unit path is written
+  from the spec and has never been run.
+
+## SSDP is lossy and one search is not enough
+
+A single M-SEARCH missed the Yamaha in roughly one scan out of two -- it is on
+Wi-Fi, and multicast replies that collide are simply gone. Both
+`upnp_discover` and `_ssdp_search` now repeat the search three times across the
+window (`SSDP_SEARCHES`) and deduplicate by LOCATION. Measured after: 4 scans
+out of 4. Do not "simplify" this back to one send.
+
+Consequence to remember: the socket timeout is now short (0.5 s) and the loop
+`continue`s on timeout instead of breaking, because breaking on the first quiet
+half-second would end the scan before the later searches ever go out.
+
+## Renderers publish what they accept
+
+`upnp_discover` returns 4-tuples now: `(name, control_url, maker, sink_mimes)`,
+where sink_mimes comes from ConnectionManager `GetProtocolInfo`.
+`Device.supports_video` believes that list when it is non-empty and falls back
+to `VIDEO_KINDS` when the renderer said nothing -- plenty answer badly, and
+refusing to send them anything would be worse than guessing.
+
+This matters: "UPnP renderer" spans televisions and stereo amplifiers. The
+RX-V4A's sink list is 49 content types and every one is `audio/*`. Before this,
+a screen cast to it built an H.264 MPEG-TS and pushed `video/mpeg` to a device
+that accepts no video at all -- a whole encoder's work for something it must
+refuse.
+
+## Live sources: never let ffmpeg resume at a byte offset
+
+This is the one that took a whole session to find, so it is written down.
+
+IPTV servers close the connection every ten to twenty seconds. With
+`-reconnect_streamed 1`, ffmpeg reconnects -- and it reconnects by asking for
+`Range: bytes=<offset>`:
+
+    Stream ends prematurely at 918900, should be 18446744073709551615
+    Will reconnect at 918900 in 0 second(s), error=I/O error.
+    Packet corrupt (stream = 0, dts = 3864180449).
+
+A live stream has no such position. The server hands back its current live
+edge, ffmpeg splices it in as though it followed on, and the overlap is media
+the listener has already heard. It is heard as the stream jumping backwards a
+few seconds, over and over. `-seekable 0` before `-i` stops the Range request.
+Set on BOTH the relay and the RAOP pipe, and only for http(s).
+
+Measured on live.iptvcanada.tv over 90s:
+
+- as shipped: 1.88x of real time produced, 8 byte-offset resumes, 7 corrupt
+  packets
+- `-seekable 0`: 0.89x, 0 resumes, 0 corrupt
+
+THE METRIC THAT MATTERS: media-seconds produced per wall-second. A live source
+cannot produce more than 1.0x. Anything above is material arriving twice. Read
+that ratio first; it identifies duplication instantly. Reading it as "the
+source is fast" wasted hours, and so did chasing rw_timeout (raising it to 30s
+made reconnects WORSE: 9 vs 1), the playlist sequence (never went backwards,
+`restarts 0`), and segment filenames.
+
+Things that look clean while this is happening, so prove nothing: the
+supervisor's restart count, EXT-X-MEDIA-SEQUENCE monotonicity, segment names,
+and hashing PCM blocks for repeats (a repeat offset by one sample hashes
+differently -- that test is useless).
+
+## HLS segment length is the source GOP, not hls_time
+
+With `-c copy` ffmpeg can only cut at a keyframe, so `-hls_time 1` on a source
+with a 7.5s GOP produces 7.5s segments. `hls_prime` is counted in SEGMENTS, so
+asking for 6 of them there is a 45-second wait, not six seconds. A Cast
+receiver refuses to start below 3x TARGETDURATION, which three segments
+satisfy whatever their length -- so `hls_prime` is 3, and raising it only makes
+a long-GOP channel look broken. Measured: iptvcanada ~2s keyframes (6s start),
+gohyperspeed ~7.5s (22s start, and nothing will fix that short of re-encoding).
+
+## Cast status is stale until the new session arrives
+
+`mc.status` keeps reporting the PREVIOUS media session until the receiver
+sends one for the new load, and `IDLE`/`INTERRUPTED` is what it says when a
+session is replaced -- which is exactly what loading something else does. So a
+load issued moments after a stop reads the old session's dying status and
+looks rejected while it is in fact starting. `_await_playing` takes the
+media_session_id from before `play_media` and ignores anything still carrying
+it. Do not treat INTERRUPTED or CANCELLED as a rejection.
+
+## Diagnostics
+
+`trace(event, detail)` in caster.py writes a timestamped timeline to whatever
+`CASTER_TRACE` names, and is a no-op otherwise. It is what found the two bugs
+above; a status bar cannot show timing. `scratchpad/run_traced.py` launches the
+app with it on, because a detached `Start-Process` does not reliably inherit
+the environment and `nohup ... &` inside a tool call dies with its shell.
+
+## What is actually on this LAN
+
+Scanned 2026-09-04 with the app's own discovery, so no protocol guessing is needed:
+
+- `192.168.1.65` **Yamaha RX-V4A**, network name "R&B Room", firmware 1.8, YXC
+  api 2.17. Answers RAOP and AirPlay on 7000 with pairing NotNeeded and no
+  password (so pyatv drives it directly), a DLNA renderer on 49154, MusicCast
+  on 80, and Spotify Connect. Zones main and zone2. On WIRELESS (5 GHz ch 161),
+  which is the real buffering variable for a live PCM stream.
+  Its AirPlay and UPnP entries share the name "R&B Room", and the merge is
+  chromecast, airplay, upnp by setdefault -- so the AirPlay entry wins and the
+  UPnP one is dropped. That is the better path and it happens by luck of a name
+  collision, not by design. If the names ever diverge, both appear.
+- `192.168.1.73` Hisense TV. Chromecast built-in on 8008/8009 AND a DLNA
+  renderer at `http://192.168.1.73:38400/upnp/control/mingusavtr`, named
+  "RB Room". NOT a Roku TV: nothing on 8060, no answer to `ST: roku:ecp`, and
+  VIDAA MQTT 36669 closed. 21 video sink types.
+- `192.168.1.101` Samsung 6 Series TV, DLNA renderer on 9197.
+- `192.168.1.67` a second Chromecast-built-in device.
+- `192.168.1.70` AirPlay device with pairing **Mandatory**. Caster has no pyatv
+  pairing flow, so it cannot be cast to and that is not a bug to chase.
 
 ## Editing traps
 

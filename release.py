@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """One-command release for Caster.
 
 Bumps the version (patch by default), commits all pending changes,

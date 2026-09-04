@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """Receiver protocols beyond Chromecast, AirPlay and plain UPnP/DLNA.
 
 Sonos, Roku and Kodi each need their own discovery and their own way of
@@ -14,6 +17,7 @@ almost every AV receiver, so those are not separate integrations.
 from __future__ import annotations
 
 import concurrent.futures
+import concurrent.futures as _futures
 import json
 import re
 import socket
@@ -21,6 +25,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request as _urlreq
+import uuid
 
 # ---------------------------------------------------------------------------
 # Sonos
@@ -443,16 +448,27 @@ def _ssdp_search(search_target: str, timeout: int = 4) -> list:
         "\r\n"
     ).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(timeout)
+    sock.settimeout(0.5)
     locations = []
     try:
-        sock.sendto(msg, ("239.255.255.250", 1900))
+        # Repeated across the window for the same reason as the UPnP search in
+        # caster_extras: SSDP is lossy multicast, and one lost reply is one
+        # device missing from the list.
         deadline = time.monotonic() + timeout
+        next_search, searches = 0.0, 0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_search and searches < 3:
+                try:
+                    sock.sendto(msg, ("239.255.255.250", 1900))
+                except OSError:
+                    pass
+                searches += 1
+                next_search = now + timeout / 4
             try:
                 data, _ = sock.recvfrom(65536)
             except socket.timeout:
-                break
+                continue
             for line in data.decode("utf-8", "replace").splitlines():
                 if line.lower().startswith("location:"):
                     location = line.split(":", 1)[1].strip()
@@ -464,3 +480,270 @@ def _ssdp_search(search_target: str, timeout: int = 4) -> list:
     finally:
         sock.close()
     return locations
+
+
+# ---------------------------------------------------------------------------
+# Yamaha MusicCast (YamahaExtendedControl, "YXC")
+# ---------------------------------------------------------------------------
+#
+# YXC is a plain HTTP/JSON control channel on port 80, unauthenticated, sitting
+# alongside whatever the device uses to actually carry audio. It is not a
+# transport: a MusicCast receiver still takes its audio over AirPlay or DLNA.
+# What YXC adds is everything around the stream -- power, the input selector,
+# real volume in dB, zones and multi-room grouping -- which those transports
+# either cannot express or express worse.
+
+#: Cache of /system/getFeatures per host. It is a big, slow, static document,
+#: and the answer cannot change while the unit is running.
+_yxc_features_cache: dict = {}
+_yxc_cache_lock = threading.Lock()
+
+#: Anything longer than this and the receiver is asleep or gone; the caller is
+#: on a play path and must not be held up by either.
+YXC_TIMEOUT = 4.0
+
+
+def yxc_url(host: str, path: str) -> str:
+    return f"http://{host}/YamahaExtendedControl/v1/{path}"
+
+
+def yxc_request(host: str, path: str, timeout: float = YXC_TIMEOUT) -> dict:
+    """One YXC call. Raises on transport failure or a non-zero response code."""
+    req = _urlreq.Request(yxc_url(host, path),
+                          headers={"User-Agent": "caster/1.0"})
+    with _urlreq.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    code = data.get("response_code")
+    if code not in (0, None):
+        raise RuntimeError(f"MusicCast error {code} from {path}")
+    return data
+
+
+def yxc_try(host: str, path: str, timeout: float = YXC_TIMEOUT) -> dict:
+    """yxc_request, but a failure is an empty answer rather than an exception.
+
+    Every caller of this is decorating a cast that will work regardless --
+    switching an input, nudging a volume -- so a receiver that does not answer
+    should cost nothing but the feature.
+    """
+    try:
+        return yxc_request(host, path, timeout)
+    except Exception:
+        return {}
+
+
+def yxc_available(host: str) -> bool:
+    """True if the device speaks MusicCast (YamahaExtendedControl)."""
+    return bool(yxc_try(host, "main/getStatus", timeout=2.0))
+
+
+def yxc_features(host: str, refresh: bool = False) -> dict:
+    with _yxc_cache_lock:
+        if not refresh and host in _yxc_features_cache:
+            return _yxc_features_cache[host]
+    data = yxc_try(host, "system/getFeatures", timeout=8.0)
+    with _yxc_cache_lock:
+        _yxc_features_cache[host] = data
+    return data
+
+
+def yxc_zones(host: str) -> list:
+    """Zone ids this unit has, main first. Empty if it is not MusicCast."""
+    return [z.get("id", "") for z in yxc_features(host).get("zone", [])
+            if z.get("id")]
+
+
+def yxc_zone_features(host: str, zone: str = "main") -> dict:
+    for z in yxc_features(host).get("zone", []):
+        if z.get("id") == zone:
+            return z
+    return {}
+
+
+def yxc_can(host: str, func: str, zone: str = "main") -> bool:
+    """Whether a zone advertises a function. Everything optional is gated on
+    this rather than on a model name: the unit already publishes the list."""
+    return func in yxc_zone_features(host, zone).get("func_list", [])
+
+
+def yxc_status(host: str, zone: str = "main") -> dict:
+    return yxc_try(host, f"{zone}/getStatus")
+
+
+def yxc_max_volume(host: str, zone: str = "main") -> int:
+    """Volume steps this zone has. 0-161 on an AVENTAGE-era receiver, and
+    emphatically not 0-100 -- treating it as a percentage throws away most of
+    the resolution and lands between real steps."""
+    for r in yxc_zone_features(host, zone).get("range_step", []):
+        if r.get("id") == "volume":
+            return int(r.get("max", 100))
+    return int(yxc_status(host, zone).get("max_volume") or 100)
+
+
+def yxc_set_power(host: str, on: bool = True, zone: str = "main") -> bool:
+    """Wake the zone if it is asleep. True if it is now on.
+
+    A receiver in network standby accepts a pushed stream and plays it to a
+    powered-down amplifier, which is indistinguishable from the cast having
+    failed.
+    """
+    status = yxc_status(host, zone)
+    if not status:
+        return False
+    if status.get("power") == "on":
+        return True
+    ok = bool(yxc_try(host, f"{zone}/setPower?power=on"))
+    if ok:
+        # The amplifier stage needs a moment before it will pass audio; a
+        # stream started inside that window loses its first second.
+        time.sleep(1.5)
+    return ok
+
+
+def yxc_prepare_input(host: str, yxc_input: str, zone: str = "main") -> None:
+    """The documented step before changing input.
+
+    MusicCast's own controller calls this immediately before selecting an
+    input, and the spec makes it a requirement whenever the unit lists
+    prepare_input_change. It lets the receiver spin up whatever the input
+    needs -- the network client, in our case -- instead of being asked to
+    switch and stream in the same breath.
+    """
+    if yxc_can(host, "prepare_input_change", zone):
+        yxc_try(host, f"{zone}/prepareInputChange?input={yxc_input}")
+
+
+def yxc_set_input(host: str, yxc_input: str = "server",
+                  zone: str = "main") -> bool:
+    """Switch a zone's input, preparing it first."""
+    yxc_prepare_input(host, yxc_input, zone)
+    return bool(yxc_try(host, f"{zone}/setInput?input={yxc_input}"))
+
+
+def yxc_current_input(host: str, zone: str = "main") -> str:
+    return str(yxc_status(host, zone).get("input") or "")
+
+
+def yxc_set_volume(host: str, percent: int, zone: str = "main") -> bool:
+    """Set volume from a 0-100 slider onto the zone's own scale."""
+    if not yxc_can(host, "volume", zone):
+        return False
+    top = yxc_max_volume(host, zone)
+    value = max(0, min(top, round(max(0, min(100, int(percent))) * top / 100)))
+    return bool(yxc_try(host, f"{zone}/setVolume?volume={value}"))
+
+
+def yxc_get_volume(host: str, zone: str = "main") -> int:
+    """Current volume as 0-100, or -1 when it cannot be read."""
+    status = yxc_status(host, zone)
+    if not status or "volume" not in status:
+        return -1
+    top = int(status.get("max_volume") or yxc_max_volume(host, zone) or 100)
+    return max(0, min(100, round(int(status["volume"]) * 100 / max(1, top))))
+
+
+def yxc_volume_db(host: str, zone: str = "main") -> str:
+    """The volume the receiver's own display shows, as text, or "".
+
+    Worth speaking instead of a percentage: it is the number on the unit, so
+    it matches what the remote and the front panel say.
+    """
+    actual = yxc_status(host, zone).get("actual_volume") or {}
+    if "value" not in actual:
+        return ""
+    unit = actual.get("unit") or ""
+    return f"{actual['value']}{(' ' + unit) if unit else ''}".strip()
+
+
+def yxc_set_mute(host: str, muted: bool, zone: str = "main") -> bool:
+    if not yxc_can(host, "mute", zone):
+        return False
+    return bool(yxc_try(
+        host, f"{zone}/setMute?enable={'true' if muted else 'false'}"))
+
+
+#: Link Control trades buffer depth against tolerance for a bad network, and
+#: Link Audio Delay trades sync against latency. Both are per zone, both take
+#: their values from getFeatures, and Link Audio Delay is documented as
+#: ignored while Link Control is on Stability Boost.
+LINK_CONTROLS = ("speed", "standard", "stability")
+LINK_AUDIO_DELAYS = ("audio_sync", "balanced", "lip_sync")
+
+
+def yxc_set_link_control(host: str, control: str, zone: str = "main") -> bool:
+    if control not in LINK_CONTROLS or not yxc_can(host, "link_control", zone):
+        return False
+    return bool(yxc_try(host, f"{zone}/setLinkControl?control={control}"))
+
+
+def yxc_set_link_audio_delay(host: str, delay: str,
+                             zone: str = "main") -> bool:
+    if delay not in LINK_AUDIO_DELAYS or not yxc_can(host, "link_audio_delay",
+                                                     zone):
+        return False
+    return bool(yxc_try(host, f"{zone}/setLinkAudioDelay?delay={delay}"))
+
+
+def musiccast_discover_at(hosts: list) -> dict:
+    """{host: {"model", "name", "zones"}} for whichever of `hosts` answer YXC.
+
+    Deliberately takes a host list rather than sweeping: every address worth
+    asking has already answered SSDP or mDNS, and a 254-address sweep to find
+    a receiver the other scans already found would be the slowest thing in
+    discovery.
+    """
+    hosts = [h for h in dict.fromkeys(hosts) if h]
+    if not hosts:
+        return {}
+
+    def one(host: str):
+        info = yxc_try(host, "system/getDeviceInfo", timeout=2.0)
+        if not info.get("model_name"):
+            return host, None
+        net = yxc_try(host, "system/getNetworkStatus", timeout=2.0)
+        return host, {"model": info.get("model_name", ""),
+                      "name": net.get("network_name", ""),
+                      "zones": yxc_zones(host)}
+
+    out = {}
+    with _futures.ThreadPoolExecutor(
+            max_workers=min(12, len(hosts)),
+            thread_name_prefix="musiccast") as pool:
+        for host, info in pool.map(one, hosts):
+            if info:
+                out[host] = info
+    return out
+
+
+def musiccast_group(hosts: list) -> str:
+    """Link several MusicCast units so they play one stream in sync.
+
+    Returns the server's address, which is the only one that should then be
+    given something to play. Streaming to each unit independently leaves them
+    audibly out of step, exactly as it does with Sonos.
+
+    Only main can serve on the units seen so far -- `server_zone_list` says
+    so -- so that is what is asked for.
+    """
+    hosts = [h for h in dict.fromkeys(hosts) if h]
+    if len(hosts) < 2:
+        return hosts[0] if hosts else ""
+    server, clients = hosts[0], hosts[1:]
+    info = yxc_try(server, "dist/getDistributionInfo")
+    group_id = str(info.get("group_id") or "")
+    if not group_id or set(group_id) == {"0"}:
+        group_id = uuid.uuid4().hex
+    for client in clients:
+        yxc_try(client, f"dist/setClientInfo?group_id={group_id}"
+                        f"&zone=main&type=add&client_list={server}")
+    yxc_try(server, f"dist/setServerInfo?group_id={group_id}&zone=main"
+                    f"&type=add&client_list={','.join(clients)}")
+    yxc_try(server, "dist/startDistribution?num=0")
+    return server
+
+
+def musiccast_ungroup(hosts: list) -> None:
+    """Break any link these units are in, so each is standalone again."""
+    for host in dict.fromkeys(h for h in hosts if h):
+        yxc_try(host, "dist/setServerInfo?group_id=&zone=main&type=remove")
+        yxc_try(host, "dist/setClientInfo?group_id=")

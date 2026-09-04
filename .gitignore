@@ -13,3 +13,7 @@ dist/
 
 # Workspace
 .freebuff/
+
+# pytest temp files
+.pytest-tmp/
+.pytest_cache/

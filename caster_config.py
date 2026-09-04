@@ -1,3 +1,6 @@
+# Copyright (c) serrebidev and contributors
+# This file is part of Caster
+# SPDX-License-Identifier: MIT
 """Caster settings: a small JSON file under %APPDATA%\\Caster.
 
 Nothing here is required for the app to run. A missing, unreadable or
@@ -33,6 +36,11 @@ DEFAULTS: dict = {
     "capture_include_mic": False,
     "capture_mic_device": "",
     "av_offset_ms": 0,               # + delays audio behind video
+    # Which screen grabber ffmpeg can actually use here, and the machine
+    # state that answer was true for. Probing costs seconds and the answer
+    # never changes on a given box, so it is asked once and remembered.
+    "screen_grabber": "",            # "ddagrab" | "gdigrab" | "" = unknown
+    "screen_grabber_key": "",        # host + session the cache belongs to
     # Lists
     "recent_urls": [],
     "favourites": [],                # [{"name": ..., "url": ...}, ...]
@@ -45,6 +53,14 @@ DEFAULTS: dict = {
     # Sonos
     "sonos_seed_ips": [],            # for speakers on another subnet or VLAN
     "sonos_resync_hours": 2,         # 0 = never
+    # MusicCast (Yamaha). A receiver answers this alongside whatever carries
+    # the audio, so these apply to it however it is being cast to.
+    "musiccast_power_on": True,       # wake a receiver in network standby
+    "musiccast_restore_input": True,  # put it back on its previous input
+    "musiccast_link_control": "",     # "" = leave alone | speed | standard
+                                      # | stability
+    "musiccast_link_audio_delay": "",  # "" = leave alone | audio_sync
+                                       # | balanced | lip_sync
     # Kodi
     "kodi_username": "",
     "kodi_password": "",
@@ -58,6 +74,21 @@ def config_dir() -> str:
 
 def settings_path() -> str:
     return os.path.join(config_dir(), SETTINGS_NAME)
+
+
+def _same_type(value, default) -> bool:
+    """Whether a stored value may stand in for this default.
+
+    isinstance() alone is too permissive here, because in Python a bool IS an
+    int: a JSON `true` in a numeric field passed the guard and became 1, so a
+    hand-edited `"volume": true` was near-silence rather than a rejected
+    value. Booleans and numbers are kept strictly apart.
+    """
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, type(default))
 
 
 class Settings:
@@ -89,15 +120,21 @@ class Settings:
             # Merge rather than replace, so a settings file written by an
             # older version still gets every key added since.
             for key, value in stored.items():
-                if key in DEFAULTS and isinstance(value, type(DEFAULTS[key])):
+                if key in DEFAULTS and _same_type(value, DEFAULTS[key]):
                     self._data[key] = value
 
     def save(self) -> None:
         with self._lock:
             snapshot = dict(self._data)
+        # Beside the file being written, not in the default directory. Using
+        # config_dir() unconditionally meant the path= argument only half
+        # worked: %APPDATA%\Caster was created even for a caller who asked for
+        # somewhere else, and os.replace across two volumes raises OSError --
+        # swallowed below, so those settings would silently never persist.
+        folder = os.path.dirname(self.path) or config_dir()
         try:
-            os.makedirs(config_dir(), exist_ok=True)
-            fd, temp = tempfile.mkstemp(dir=config_dir(), suffix=".tmp")
+            os.makedirs(folder, exist_ok=True)
+            fd, temp = tempfile.mkstemp(dir=folder, suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(snapshot, handle, indent=2, ensure_ascii=False)
@@ -191,15 +228,33 @@ class Settings:
 
 #: Capture presets. Latency is not a single knob -- frame rate, bitrate and
 #: resolution all trade against it -- so they move together behind one choice.
+#: Capture and relay tuning per quality choice.
+#:
+#: The three hls_* keys steer the MPEG-TS relay, and the trade they make is
+#: delay against tolerance for a stuttering source. `hls_trail` is how far
+#: behind the live edge the receiver is deliberately held: a deep cushion
+#: swallows IPTV jitter, a shallow one gets the picture up sooner. Cast
+#: receivers refuse to start below 3x the segment length, so `hls_prime`
+#: never drops under 3 -- that is the floor, not a preference.
+#:
+#: And it must not go ABOVE it either. With -c copy ffmpeg can only cut a
+#: segment at a keyframe, so a segment is as long as the source GOP however
+#: short hls_time is: gohyperspeed emits one every 7.5s, so priming six of
+#: them is a 45-second wait, not a six-second one. Three segments satisfy the
+#: receiver whatever their length; asking for more only makes a long-GOP
+#: channel look broken.
 QUALITY_PRESETS = {
     "latency": {"fps": 30, "bitrate": "3M", "max_width": 1280,
                 "max_height": 720, "keyframe_seconds": 0.4,
+                "hls_time": 2, "hls_prime": 3, "hls_trail": 6,
                 "label": "Lowest delay (720p)"},
     "balanced": {"fps": 30, "bitrate": "6M", "max_width": 1920,
                  "max_height": 1080, "keyframe_seconds": 0.5,
+                 "hls_time": 2, "hls_prime": 3, "hls_trail": 8,
                  "label": "Balanced (1080p)"},
     "quality": {"fps": 60, "bitrate": "12M", "max_width": 1920,
                 "max_height": 1080, "keyframe_seconds": 1.0,
+                "hls_time": 2, "hls_prime": 3, "hls_trail": 12,
                 "label": "Best picture (1080p60)"},
 }
 
