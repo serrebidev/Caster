@@ -798,8 +798,15 @@ class LoopThread(threading.Thread):
         self.ready.set()
         self.loop.run_forever()
 
-    def submit(self, coro) -> None:
-        asyncio.run_coroutine_threadsafe(coro, self.loop)
+    def submit(self, coro) -> concurrent.futures.Future:
+        """Run a coroutine on the loop and hand back its future.
+
+        Returning it matters: the caller cancels through it on stop and waits
+        on it while closing. Dropping it made both no-ops -- the AirPlay
+        runner was never cancelled and never waited for, so the app exited
+        without letting the receiver tear the session down.
+        """
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 
 #: How each receiver kind is shown in the device list.
@@ -888,7 +895,12 @@ class MainFrame(wx.Frame):
         self._runner_fut: Optional[concurrent.futures.Future] = None
         self._stop_flag = True
         self._ffmpeg_proc = None
-        self._relay = None
+        #: Relays currently running. There is more than one whenever a TS
+        #: url goes to more than one receiver, and every one owns an ffmpeg
+        #: and an HTTP server that has to be stopped.
+        self._relays: list = []
+        self._relay_lock = threading.Lock()
+        self._relay = None            # the most recent, for transport control
         self._file_server = None
         #: Live captures. Usually one; a selection spanning receivers that
         #: need different wire formats gets one per format.
@@ -1867,7 +1879,7 @@ class MainFrame(wx.Frame):
                 probe = probe_media(url)
                 if probe["mime"] == "video/mp2t":
                     relay = self._make_relay(url)
-                    self._relay = relay
+                    self._keep_relay(relay)
                     play_url = relay.start()
                 else:
                     # UPnP renderers can usually fetch plain URLs; but local
@@ -1876,7 +1888,7 @@ class MainFrame(wx.Frame):
                         play_url = url
                     else:
                         relay = self._make_relay(url)  # may fail: not media
-                        self._relay = relay
+                        self._keep_relay(relay)
                         play_url = relay.start()
                 # The relay republishes the source as HLS, so what the
                 # renderer is being handed is a playlist, not the probed type.
@@ -2086,7 +2098,7 @@ class MainFrame(wx.Frame):
                                  speak=False)
                         relay = self._make_relay(url)
                         HlsFileHandler.relay_requests.clear()
-                        self._relay = relay
+                        self._keep_relay(relay)
                         trace("cast.relay.start",
                               f"hls_time={relay.hls_time} "
                               f"prime={relay.prime_segments} "
@@ -2230,6 +2242,8 @@ class MainFrame(wx.Frame):
                         if wake.is_set():
                             wake.clear()
                             continue   # resume or seek: reopen the source
+                        if self._stop_flag or shutdown.is_set():
+                            break       # stop() already said "Stopped."
                         # Stream ended naturally.
                         self._ui(lambda: self.set_status("Finished."))
                         break
@@ -2668,11 +2682,27 @@ class MainFrame(wx.Frame):
             except Exception:
                 pass
 
+    def _keep_relay(self, relay) -> None:
+        """Hold a relay for teardown, stopping any it displaces.
+
+        There is one attribute and there can be several receivers: casting one
+        TS url to two UPnP renderers built two relays, and the second quietly
+        replaced the first -- leaving an ffmpeg and an HTTP server running
+        with nothing able to stop them.
+        """
+        with self._relay_lock:
+            self._relays.append(relay)
+            self._relay = relay
+
     def _stop_relay(self) -> None:
-        relay = self._relay
-        self._relay = None
-        if relay:
-            relay.stop()
+        with self._relay_lock:
+            relays, self._relays = list(self._relays), []
+            self._relay = None
+        for relay in relays:
+            try:
+                relay.stop()
+            except Exception:
+                pass
         fs = self._file_server
         self._file_server = None
         if fs:

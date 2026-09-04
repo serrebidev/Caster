@@ -71,7 +71,9 @@ Set `CASTER_TRACE` to a file path before launching and Caster writes a timeline 
 
 ## A note on IPTV sources
 
-Live IPTV servers vary enormously. Some hand over a clean stream; some close the connection every ten seconds and re-send what they already sent. Caster now declares those sources unseekable so a reconnect cannot ask to resume at a byte offset a live stream does not have — which is what used to make playback jump backwards. A channel whose keyframes are eight seconds apart will still take longer to start than one with two-second keyframes, because a Chromecast will not begin until it holds three segments, and a segment cannot be shorter than the gap between keyframes.
+Live IPTV servers vary enormously. Many close the connection every ten to twenty seconds. Left alone, ffmpeg reconnects by asking to resume at a byte offset — a position a live stream does not have — so the server answers with its current live edge and the overlap is audio you have already heard. Caster declares those sources unseekable, which stops the request being made at all.
+
+That one change fixed the startup delay as well as the jumping: the constant reconnects were disrupting the stream badly enough to slow segment production to a crawl. Two channels measured here now start in 0.7 and 2.8 seconds, where one of them used to take over twenty.
 
 ## Contributing
 

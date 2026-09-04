@@ -462,15 +462,26 @@ class AudioTap:
         self._stop.clear()
         self._ready.clear()
         self._error = None
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="caster-audiotap")
-        self._thread.start()
+        thread = threading.Thread(target=self._run, daemon=True,
+                                  name="caster-audiotap")
+        self._thread = thread
+        thread.start()
         # ffmpeg's command line needs the device's real rate and channel count,
         # and those are only known once the loopback stream is open.
-        if not self._ready.wait(10):
-            raise RuntimeError("system audio capture did not start")
-        if self._error:
-            raise RuntimeError(f"system audio capture failed: {self._error}")
+        try:
+            if not self._ready.wait(10):
+                raise RuntimeError("system audio capture did not start")
+            if self._error:
+                raise RuntimeError(
+                    f"system audio capture failed: {self._error}")
+        except BaseException:
+            # A failed start must leave nothing behind that looks like a
+            # running tap: otherwise the next start() sees self._thread and
+            # returns at once, and the caller believes capture is live when
+            # the device never opened at all.
+            self._stop.set()
+            self._thread = None
+            raise
 
     def subscribe(self) -> "queue.Queue":
         q: queue.Queue = queue.Queue(maxsize=self.QUEUE_CHUNKS)

@@ -179,21 +179,30 @@ Fixed before the 0.5.0 release, listed so they are not reintroduced:
   `relay.start()` returned, so Stop during the prime could not find it.
   Assigned before starting.
 
-Still open:
+Also fixed, and worth not reintroducing:
 
-1. `LoopThread.submit()` returns None, declared `-> None`. So `self._runner_fut` is always
-   None. `stop_silent()`'s `rf.cancel()` is dead and `_on_close()`'s `fut.result(timeout=8)`
-   never waits - app closes without letting AirPlay tear down. Return the future.
-2. `_play_upnp` worker sets `self._relay = relay`. Two UPnP renderers + one TS URL = second
-   overwrites first, first ffmpeg and its server orphaned.
-3. `_air_shutdown` event is created and never set anywhere. Stop during AirPlay falls into
-   the "stream ended naturally" branch and announces "Finished." after `stop()` already
-   said "Stopped." Wrong word spoken.
-4. `HotkeyManager.register_all()` returns the actions that failed. caster.py ignores the
-   return, so a hotkey another app already owns is lost silently.
-5. `AudioTap.start()` leaves `self._thread` set after a failed start, so a retry returns
-   immediately and the caller believes capture is live. Note: an unknown device name does
-   NOT fail - `_pick_loopback_device` falls back to the default on purpose.
+- `LoopThread.submit()` returned None, so `self._runner_fut` was always None and both the
+  cancel on stop and the eight-second wait on close were dead code -- the app exited
+  without letting AirPlay tear the session down. It returns the future.
+- One `self._relay` for any number of receivers: a TS url sent to two UPnP renderers built
+  two relays and the second replaced the first, orphaning an ffmpeg and an HTTP server.
+  `_keep_relay()` tracks them all and `_stop_relay()` stops them all.
+- Stop during AirPlay fell into the "stream ended naturally" branch and announced
+  "Finished." after stop() had already said "Stopped." -- the wrong word, spoken last.
+- `AudioTap.start()` left `self._thread` set after a failed start, so a retry returned at
+  once and the caller believed capture was live. Note: an unknown device name does NOT
+  fail - `_pick_loopback_device` falls back to the default on purpose.
+- `HotkeyManager.register_all()`'s return was ignored, so a hotkey another app owned was
+  lost silently; worse, wx logged the failure to a MODAL DIALOG behind the main window,
+  which blocked the UI thread and took the screen reader down with it. `wx.LogNull` around
+  registration, and the lost keys are reported in the status line.
+- `Settings.save()` wrote its temp file into `config_dir()` rather than beside the target,
+  so `path=` only half worked and a cross-volume replace would have failed silently.
+- `load()` accepted a JSON `true` for an int setting, because in Python a bool IS an int:
+  `"volume": true` loaded as 1, i.e. near-silence. `_same_type()` keeps them apart.
+- `probe_media` treated any file starting with 0x47 as MPEG-TS, but that byte is ASCII "G"
+  -- a text file, subtitle or GIF went down the live-remux path. Both branches confirm the
+  packet stride now, and too few bytes to check it means "no", not "probably".
 
 ## MusicCast (Yamaha)
 
@@ -293,8 +302,17 @@ with a 7.5s GOP produces 7.5s segments. `hls_prime` is counted in SEGMENTS, so
 asking for 6 of them there is a 45-second wait, not six seconds. A Cast
 receiver refuses to start below 3x TARGETDURATION, which three segments
 satisfy whatever their length -- so `hls_prime` is 3, and raising it only makes
-a long-GOP channel look broken. Measured: iptvcanada ~2s keyframes (6s start),
-gohyperspeed ~7.5s (22s start, and nothing will fix that short of re-encoding).
+a long-GOP channel look broken.
+
+The 22-second start once measured on a long-GOP channel was NOT the GOP: it
+was the byte-offset reconnects tearing the stream up so badly that segments
+crawled out. With `-seekable 0` the same channel primes in 0.7s and iptvcanada
+in 2.8s. Do not reintroduce a "long GOP means slow start" rule of thumb; it
+was a symptom of the reconnect bug, not a property of the source.
+
+Fragmented MP4 was evaluated as a way around the 3x rule and is NOT needed now
+that priming is fast. Note if it is ever revisited: `-c copy` from TS into MP4
+fails with "Malformed AAC bitstream detected" and needs `-bsf:a aac_adtstoasc`.
 
 ## Cast status is stale until the new session arrives
 
