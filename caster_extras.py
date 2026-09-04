@@ -1,6 +1,6 @@
-"""Roomcaster extras: UPnP/DLNA renderer control and screen/app-window
-capture sources. Kept free of roomcaster imports to avoid a cycle;
-roomcaster imports THIS module."""
+"""Caster extras: UPnP/DLNA renderer control and screen/app-window
+capture sources. Kept free of caster imports to avoid a cycle;
+caster imports THIS module."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _no_window_kwargs() -> dict:
     return {}
 
 
-# Mirrored minimal HLS server (same wire format as roomcaster.HlsRelay):
+# Mirrored minimal HLS server (same wire format as caster.HlsRelay):
 # CORS headers, correct MIME types, HTTP/1.1 keep-alive.
 
 class ScreenHlsHandler(http.server.SimpleHTTPRequestHandler):
@@ -165,7 +165,7 @@ def _soap(control_url: str, action: str, inner: str) -> None:
         r.read()
 
 
-def upnp_play(control_url: str, media_url: str, title: str = "Roomcaster",
+def upnp_play(control_url: str, media_url: str, title: str = "Caster",
               mime: str = "", upnp_class: str = "object.item.videoItem") -> None:
     """Send an AVTransport SetAVTransportURI + Play SOAP pair."""
     escaped = (media_url.replace("&", "&amp;")
@@ -344,7 +344,7 @@ class FileServer:
         self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True,
-                         name="roomcaster-file").start()
+                         name="caster-file").start()
         return f"http://{_lan_ip()}:{self.port}/{urllib.parse.quote(self._name)}"
 
     def stop(self) -> None:
@@ -383,7 +383,7 @@ class ScreenSource:
     def start(self) -> None:
         # 1. System-audio loopback -> temp WAV file.
         self._wav_path = os.path.join(
-            tempfile.mkdtemp(prefix="roomcaster_scr_"), "loop.wav")
+            tempfile.mkdtemp(prefix="caster_scr_"), "loop.wav")
         self._wav_stop = threading.Event()
         threading.Thread(target=self._capture_audio, daemon=True).start()
         time.sleep(1.0)  # let the WAV get some data
@@ -419,7 +419,7 @@ class ScreenSource:
         # Video: gdigrab. ddagrab (Desktop Duplication) hangs on some
         # driver/GPU combos — gdigrab is slower (~15fps) but universally
         # works. A window is captured natively by title.
-        from roomcaster import pick_h264_encoder  # deferred: no cycle
+        from caster import pick_h264_encoder  # deferred: no cycle
         if self.hwnd:
             title = _window_title(self.hwnd)
             vid_in = ["-f", "gdigrab", "-framerate", "15",

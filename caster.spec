@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec: portable onedir build of Roomcaster.
-# Build:  py -m PyInstaller roomcaster.spec --noconfirm
+# PyInstaller spec: portable onedir build of Caster.
+# Build:  py -m PyInstaller caster.spec --noconfirm
 
 import sys
 
 block_cipher = None
 
 a = Analysis(
-    ["roomcaster.py"],
+    ["caster.py"],
     pathex=[],
     binaries=[],
     datas=[],
@@ -20,7 +20,7 @@ a = Analysis(
         "miniaudio",
         "aiohttp",
         "pyaudiowpatch",
-        "roomcaster_extras",
+        "caster_extras",
         # pyatv protocols are loaded dynamically via entry points
         "pyatv.protocols.raop",
         "pyatv.protocols.airplay",
@@ -54,7 +54,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Roomcaster",
+    name="Caster",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -74,5 +74,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="Roomcaster",
+    name="Caster",
 )

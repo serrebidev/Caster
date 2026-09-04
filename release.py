@@ -1,8 +1,8 @@
-"""One-command release for Roomcaster.
+"""One-command release for Caster.
 
 Bumps the version (patch by default), commits all pending changes,
 tags vX.Y.Z, builds the portable exe with PyInstaller, bundles
-ffmpeg.exe, zips to dist/Roomcaster-portable.zip, and commits the
+ffmpeg.exe, zips to dist/Caster-portable.zip, and commits the
 version bump.
 
 Usage:
@@ -21,7 +21,7 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SOURCE_FILE = os.path.join(ROOT, "roomcaster.py")
+SOURCE_FILE = os.path.join(ROOT, "caster.py")
 VERSION_RE = re.compile(r'APP_VERSION = "(\d+)\.(\d+)\.(\d+)"')
 
 
@@ -40,7 +40,7 @@ def read_version() -> tuple[int, int, int]:
     src = open(SOURCE_FILE, encoding="utf-8").read()
     m = VERSION_RE.search(src)
     if not m:
-        raise SystemExit("APP_VERSION not found in roomcaster.py")
+        raise SystemExit("APP_VERSION not found in caster.py")
     return tuple(int(x) for x in m.groups())  # type: ignore[return-value]
 
 
@@ -95,7 +95,7 @@ def main() -> None:
         run(["git", "tag", "-f", vtag])
 
     # Build.
-    run([sys.executable, "-m", "PyInstaller", "roomcaster.spec",
+    run([sys.executable, "-m", "PyInstaller", "caster.spec",
          "--noconfirm", "--distpath", "dist"])
 
     # Bundle ffmpeg next to the exe.
@@ -103,21 +103,21 @@ def main() -> None:
                         capture_output=True).stdout.splitlines()
     if not ff:
         raise SystemExit("ffmpeg.exe not found on PATH")
-    run(["cp", ff[0], os.path.join("dist", "Roomcaster", "ffmpeg.exe")])
+    run(["cp", ff[0], os.path.join("dist", "Caster", "ffmpeg.exe")])
 
     # Zip the portable folder.
-    zp = os.path.join(ROOT, "dist", "Roomcaster-portable.zip")
+    zp = os.path.join(ROOT, "dist", "Caster-portable.zip")
     if os.path.exists(zp):
         os.remove(zp)
     count = 0
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        base = os.path.join(ROOT, "dist", "Roomcaster")
+        base = os.path.join(ROOT, "dist", "Caster")
         for root, _, files in os.walk(base):
             for fn in files:
                 p = os.path.join(root, fn)
                 z.write(p, os.path.relpath(p, base))
                 count += 1
-    print(f"{vtag}: {count} files -> dist/Roomcaster-portable.zip "
+    print(f"{vtag}: {count} files -> dist/Caster-portable.zip "
           f"({os.path.getsize(zp) / 1e6:.1f} MB)")
 
 

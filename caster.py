@@ -1,11 +1,11 @@
-"""Roomcaster — send any URL, screen, or system audio to a Chromecast,
+"""Caster — send any URL, screen, or system audio to a Chromecast,
 UPnP/DLNA renderer, or AirPlay device.
 
 NVDA-friendly wx GUI. One asyncio loop runs on a daemon thread and owns
 all pyatv (AirPlay) work; PyChromecast is synchronous and is called from
 worker threads.
 
-Usage: py roomcaster.py
+Usage: py caster.py
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ try:
 except ImportError:
     yt_dlp = None  # type: ignore[assignment]
 
-from roomcaster_extras import (
+from caster_extras import (
     list_windows,
     ScreenSource,
     upnp_discover,
@@ -58,7 +58,7 @@ from roomcaster_extras import (
     upnp_host,
 )
 
-APP_TITLE = "Roomcaster"
+APP_TITLE = "Caster"
 APP_VERSION = "1.0.1"
 
 YT_ID_RE = re.compile(
@@ -116,7 +116,7 @@ def probe_media(url: str) -> dict:
         except OSError:
             pass
         return result
-    req = urllib.request.Request(url, headers={"User-Agent": "roomcaster/1.0",
+    req = urllib.request.Request(url, headers={"User-Agent": "caster/1.0",
                                                "Range": "bytes=0-192"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -301,7 +301,7 @@ class HlsRelay:
 
     def start(self, prime_segments: int = 4) -> str:
         import tempfile
-        self.root = tempfile.mkdtemp(prefix="roomcaster_hls_")
+        self.root = tempfile.mkdtemp(prefix="caster_hls_")
         handler = functools.partial(HlsFileHandler, directory=self.root)
         # ThreadingHTTPServer + HTTP/1.1 keep-alive: the receiver reuses one
         # connection for playlist polls and segment fetches instead of a new
@@ -310,7 +310,7 @@ class HlsRelay:
         self.httpd.relay = self
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True,
-                         name="roomcaster-hls").start()
+                         name="caster-hls").start()
 
         m3u8 = os.path.join(self.root, "live.m3u8")
         cmd = self._ffmpeg_cmd(m3u8)
@@ -548,7 +548,7 @@ class LoopThread(threading.Thread):
     """Daemon thread owning the asyncio loop for pyatv."""
 
     def __init__(self) -> None:
-        super().__init__(daemon=True, name="roomcaster-asyncio")
+        super().__init__(daemon=True, name="caster-asyncio")
         self.loop = asyncio.new_event_loop()
         self.ready = threading.Event()
 
@@ -866,7 +866,7 @@ class MainFrame(wx.Frame):
                 meta = (f"<DIDL-Lite xmlns:urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/>"
                         f"<item id=\"\" parentID=\"0\" restricted=\"1\">"
                         f"<dc:title xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
-                        f"Roomcaster</dc:title>"
+                        f"Caster</dc:title>"
                         f"<upnp:class xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
                         f"object.item.videoItem</upnp:class>"
                         f"<res>{play_url}</res></item></DIDL-Lite>")
