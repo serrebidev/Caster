@@ -59,6 +59,7 @@ from roomcaster_extras import (
 )
 
 APP_TITLE = "Roomcaster"
+APP_VERSION = "1.0.0"
 
 YT_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})"
@@ -676,7 +677,8 @@ class MainFrame(wx.Frame):
         mi_about = h.Append(wx.ID_ABOUT, "&About")
         self.Bind(wx.EVT_MENU,
                   lambda e: wx.MessageBox(
-                      "Roomcaster: cast URLs, screens and apps to "
+                      f"{APP_TITLE} {APP_VERSION}\n\n"
+                      "Cast URLs, files, screens and apps to "
                       "Chromecast, UPnP/DLNA and AirPlay devices.",
                       APP_TITLE, wx.ICON_INFORMATION),
                   mi_about)
