@@ -59,7 +59,7 @@ from roomcaster_extras import (
 )
 
 APP_TITLE = "Roomcaster"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 YT_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})"
