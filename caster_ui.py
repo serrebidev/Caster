@@ -81,9 +81,31 @@ class NvdaSpeaker:
 # Accessible labelling
 # ---------------------------------------------------------------------------
 
-def labelled(parent, sizer, text: str, control, proportion: int = 0,
+class _NamedAccessible(wx.Accessible):
+    """Pins a control's accessible name, leaving role, state and value to
+    the native control underneath.
+
+    Windows infers a control's name from the nearest static text created
+    before it, which a wxSlider built with wxSL_LABELS quietly breaks: it
+    inserts its own minimum, maximum and value statics in between, so the
+    volume slider announced as "0". Stating the name outright is immune to
+    whatever a control decides to build for itself.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+
+    def GetName(self, childId):
+        # childId 0 is the control itself; its parts keep their own names.
+        if childId:
+            return (wx.ACC_NOT_IMPLEMENTED, "")
+        return (wx.ACC_OK, self._name)
+
+
+def labelled(parent, sizer, text: str, build, proportion: int = 0,
              border: int = 8):
-    """Add `control` to `sizer` behind a real label.
+    """Build a control behind a real label and add both to `sizer`.
 
     A wx control with no label announces as bare "slider" or "edit", which
     for two sliders in a row means the volume and the position are
@@ -91,19 +113,31 @@ def labelled(parent, sizer, text: str, control, proportion: int = 0,
     context help and tooltips, not the accessible name a screen reader
     reads. A visible wxStaticText immediately before the control does, and
     it also gives sighted users the same information.
+
+    `build` is a callable taking the parent and returning the control,
+    rather than a ready-made control, because "immediately before" means
+    the creation order and not the sizer. Windows names a control after the
+    nearest static text created before it, and wx gives a static's Alt
+    mnemonic to whatever follows it. Building the control first put the
+    static on the wrong side of both, so every control wore the *previous*
+    one's name: the URL box announced "Devices:" and answered to Alt+D.
+    Reordering the windows afterwards is not enough either -- a wxSpinCtrl
+    is a buddy edit plus an up-down, and only the up-down can be moved, so
+    the part that takes focus keeps the wrong label. Creating the static
+    first is the only fix that reaches every control.
     """
     label = wx.StaticText(parent, label=text)
     sizer.Add(label, 0, wx.LEFT | wx.RIGHT | wx.TOP, border)
-    control.SetName(text.replace("&", "").rstrip(":"))
+    control = build(parent)
+    name = text.replace("&", "").rstrip(":")
+    control.SetName(name)
+    # Held on the control as well: the window owns the accessible, and a
+    # Python-side reference keeps it from being collected under it.
+    control._accessible = _NamedAccessible(name)
+    control.SetAccessible(control._accessible)
     sizer.Add(control, proportion,
               wx.LEFT | wx.RIGHT | wx.EXPAND | (wx.TOP if not text else 0),
               border)
-    return label
-
-
-def name_control(control, text: str):
-    """Give a control an accessible name without adding a visible label."""
-    control.SetName(text)
     return control
 
 
@@ -241,7 +275,7 @@ class SettingsDialog(wx.Dialog):
     laid out in one column so tab order matches reading order."""
 
     def __init__(self, parent, settings, output_devices, input_devices) -> None:
-        super().__init__(parent, title="Caster settings",
+        super().__init__(parent, title="Settings",
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.settings = settings
         self._outputs = output_devices or [("Default output", "")]
@@ -251,65 +285,79 @@ class SettingsDialog(wx.Dialog):
         box = wx.BoxSizer(wx.VERTICAL)
 
         quality_keys = list(QUALITY_PRESETS)
-        self.quality = wx.Choice(
-            panel, choices=[QUALITY_PRESETS[k]["label"] for k in quality_keys])
         self._quality_keys = quality_keys
+        self.quality = labelled(
+            panel, box, "Screen capture &quality:",
+            lambda p: wx.Choice(
+                p, choices=[QUALITY_PRESETS[k]["label"] for k in quality_keys]))
         current = settings["capture_quality"]
         self.quality.SetSelection(
             quality_keys.index(current) if current in quality_keys else 1)
-        labelled(panel, box, "Screen capture &quality:", self.quality)
 
-        self.output = wx.Choice(panel, choices=[d[0] for d in self._outputs])
+        self.output = labelled(
+            panel, box, "Capture sound &from:",
+            lambda p: wx.Choice(p, choices=[d[0] for d in self._outputs]))
         self.output.SetSelection(self._index(self._outputs,
                                              settings["capture_audio_device"]))
-        labelled(panel, box, "Capture sound &from:", self.output)
 
-        self.mic = wx.Choice(panel, choices=[d[0] for d in self._inputs])
+        self.mic = labelled(
+            panel, box, "Mix in &microphone:",
+            lambda p: wx.Choice(p, choices=[d[0] for d in self._inputs]))
         self.mic.SetSelection(self._index(self._inputs,
                                           settings["capture_mic_device"]))
-        labelled(panel, box, "Mix in &microphone:", self.mic)
 
-        self.offset = wx.SpinCtrl(panel, min=-2000, max=2000,
-                                  initial=int(settings["av_offset_ms"]))
-        labelled(panel, box,
-                 "&Audio delay in milliseconds (negative delays picture):",
-                 self.offset)
+        self.offset = labelled(
+            panel, box, "&Audio delay in ms (negative delays picture):",
+            lambda p: wx.SpinCtrl(p, min=-2000, max=2000,
+                                  initial=int(settings["av_offset_ms"])))
 
-        self.sleep = wx.SpinCtrl(panel, min=0, max=600,
-                                 initial=int(settings["sleep_timer_minutes"]))
-        labelled(panel, box, "&Stop casting after this many minutes (0 = never):",
-                 self.sleep)
+        self.sleep = labelled(
+            panel, box, "Sleep &timer in minutes (0 = off):",
+            lambda p: wx.SpinCtrl(
+                p, min=0, max=600,
+                initial=int(settings["sleep_timer_minutes"])))
 
-        self.seeds = wx.TextCtrl(
-            panel, value=", ".join(settings["sonos_seed_ips"]))
-        labelled(panel, box,
-                 "Sonos addresses on another subnet, comma separated:",
-                 self.seeds)
+        self.seeds = labelled(
+            panel, box, "&Sonos IPs on other subnets, comma separated:",
+            lambda p: wx.TextCtrl(
+                p, value=", ".join(settings["sonos_seed_ips"])))
 
-        self.kodi_user = wx.TextCtrl(panel, value=settings["kodi_username"])
-        labelled(panel, box, "&Kodi username:", self.kodi_user)
-        self.kodi_pass = wx.TextCtrl(panel, value=settings["kodi_password"],
-                                     style=wx.TE_PASSWORD)
-        labelled(panel, box, "Kodi &password:", self.kodi_pass)
+        self.kodi_user = labelled(
+            panel, box, "&Kodi username:",
+            lambda p: wx.TextCtrl(p, value=settings["kodi_username"]))
+        self.kodi_pass = labelled(
+            panel, box, "Kodi &password:",
+            lambda p: wx.TextCtrl(p, value=settings["kodi_password"],
+                                  style=wx.TE_PASSWORD))
 
         self.checks = {}
         for key, label in (
-                ("discover_on_launch", "Scan for &devices when Caster starts"),
-                ("reselect_last_device", "Select the &last used device again"),
-                ("global_hotkeys", "Enable system-&wide hotkeys"),
+                ("discover_on_launch", "Scan for &devices at startup"),
+                ("reselect_last_device", "Reselect the &last device"),
+                ("global_hotkeys", "System-&wide hotkeys"),
                 ("minimise_to_tray", "Close to the &notification area"),
-                ("auto_reconnect", "Reconnect automatically if a device drops"),
-                ("speak_status", "Speak status changes through N&VDA")):
+                ("auto_reconnect", "&Reconnect if a device drops"),
+                ("speak_status", "Speak status through N&VDA")):
             check = wx.CheckBox(panel, label=label)
             check.SetValue(bool(settings[key]))
             box.Add(check, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
             self.checks[key] = check
 
-        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
-        box.Add(buttons, 0, wx.ALL | wx.EXPAND, 8)
         panel.SetSizer(box)
-        box.Fit(self)
+
+        # The buttons belong to the dialog, not the panel, so they go in the
+        # dialog's own sizer. Putting dialog-owned buttons inside the panel's
+        # sizer leaves them outside the panel's tab traversal, which is a
+        # dialog you cannot accept from the keyboard.
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(panel, 1, wx.EXPAND)
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        outer.Add(buttons, 0, wx.ALL | wx.EXPAND, 8)
+        self.SetSizer(outer)
+
         self.SetMinSize((460, 520))
+        outer.Fit(self)
+        self.CentreOnParent()
         self.quality.SetFocus()
 
     @staticmethod

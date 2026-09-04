@@ -83,7 +83,6 @@ from caster_ui import (
     SettingsDialog,
     TrayIcon,
     labelled,
-    name_control,
 )
 
 APP_TITLE = "Caster"
@@ -728,15 +727,15 @@ class MainFrame(wx.Frame):
         # space ticks, and a screen reader announces the tick state --
         # so casting to one device stays a single keystroke and casting to
         # a whole room is space on each.
-        self.device_list = wx.CheckListBox(panel, choices=[])
-        labelled(panel, vbox,
-                 "Device &list (space ticks extra ones for multi-room):",
-                 self.device_list, proportion=1)
+        self.device_list = labelled(
+            panel, vbox, "&Devices:",
+            lambda p: wx.CheckListBox(p, choices=[]), proportion=1)
 
         # A combo box, so previously cast URLs are reachable with the arrow
         # keys instead of being retyped.
-        self.url_box = wx.ComboBox(panel, style=wx.TE_PROCESS_ENTER)
-        labelled(panel, vbox, "URL to &cast:", self.url_box)
+        self.url_box = labelled(
+            panel, vbox, "URL to &cast:",
+            lambda p: wx.ComboBox(p, style=wx.TE_PROCESS_ENTER))
 
         self.btn_cast = wx.Button(panel, label="&Play")
         self.btn_cast.SetDefault()
@@ -751,15 +750,15 @@ class MainFrame(wx.Frame):
             row.Add(b, 1, wx.RIGHT, 8)
         vbox.Add(row, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
 
-        self.pos_slider = name_control(
-            wx.Slider(panel, value=0, minValue=0, maxValue=100,
-                      style=wx.SL_HORIZONTAL | wx.SL_LABELS), "Position")
-        labelled(panel, vbox, "P&osition in seconds:", self.pos_slider)
+        self.pos_slider = labelled(
+            panel, vbox, "P&osition in seconds:",
+            lambda p: wx.Slider(p, value=0, minValue=0, maxValue=100,
+                                style=wx.SL_HORIZONTAL | wx.SL_LABELS))
 
-        self.vol_slider = name_control(
-            wx.Slider(panel, value=100, minValue=0, maxValue=100,
-                      style=wx.SL_HORIZONTAL | wx.SL_LABELS), "Volume")
-        labelled(panel, vbox, "&Volume percent:", self.vol_slider)
+        self.vol_slider = labelled(
+            panel, vbox, "&Volume percent:",
+            lambda p: wx.Slider(p, value=100, minValue=0, maxValue=100,
+                                style=wx.SL_HORIZONTAL | wx.SL_LABELS))
 
         self.status_bar = wx.StatusBar(self)
         self.SetStatusBar(self.status_bar)
@@ -787,30 +786,29 @@ class MainFrame(wx.Frame):
         self.btn_discover_id = self.btn_discover.GetId()
         m.AppendSeparator()
         mi_screen = m.Append(wx.ID_ANY, "Cast &screen\tCtrl+S",
-                             "Cast this PC's screen and system audio")
+                             "Screen plus system audio")
         self.mi_screen_id = mi_screen.GetId()
         mi_window = m.Append(wx.ID_ANY, "Cast &window\tCtrl+W",
-                             "Cast a running app window with its audio")
+                             "One app window plus its audio")
         self.mi_window_id = mi_window.GetId()
         mi_audio = m.Append(
             wx.ID_ANY, "Cast system &audio\tCtrl+Shift+A",
-            "Cast this PC's sound only, at the lowest possible delay")
+            "System sound only, lowest delay")
         self.mi_audio_id = mi_audio.GetId()
         m.AppendSeparator()
         mi_file = m.Append(wx.ID_ANY, "&Open file...\tCtrl+O",
-                           "Cast a local media file")
+                           "Cast a local file")
         self.mi_file_id = mi_file.GetId()
         m.AppendSeparator()
         mi_copy = m.Append(wx.ID_ANY, "&Copy stream address\tCtrl+Shift+C",
-                           "Copy the live stream's address so any player "
-                           "can open it")
+                           "Copy the stream address")
         self.mi_copy_id = mi_copy.GetId()
         mi_mute = m.Append(wx.ID_ANY, "&Mute\tCtrl+M",
-                           "Silence the receiver without stopping the cast")
+                           "Silence the receiver, keep casting")
         self.mi_mute_id = mi_mute.GetId()
         m.AppendSeparator()
         mi_settings = m.Append(wx.ID_PREFERENCES, "&Settings...\tCtrl+,",
-                               "Capture quality, audio source and more")
+                               "Quality, audio source, hotkeys")
         self.mi_settings_id = mi_settings.GetId()
         mi_quit = m.Append(wx.ID_EXIT, "E&xit\tAlt+F4")
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), mi_quit)
@@ -820,7 +818,7 @@ class MainFrame(wx.Frame):
         self._menu_favourites = wx.Menu()
         mi_add_fav = self._menu_favourites.Append(
             wx.ID_ANY, "&Add current URL...\tCtrl+B",
-            "Save the URL in the box under a name you choose")
+            "Save the current URL")
         self.mi_add_fav_id = mi_add_fav.GetId()
         mi_del_fav = self._menu_favourites.Append(
             wx.ID_ANY, "&Remove...", "Delete a saved favourite")
@@ -835,13 +833,10 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU,
                   lambda e: wx.MessageBox(
                       f"{APP_TITLE} {APP_VERSION}\n\n"
-                      "Cast URLs, files, screens and apps to "
+                      "Casts URLs, files, the screen or an app window to "
                       "Chromecast, Sonos, Roku, Kodi, UPnP/DLNA and "
-                      "AirPlay devices.\n\n"
-                      "Ctrl+S casts the screen, Ctrl+W an app window, and "
-                      "Ctrl+Shift+A this PC's sound alone at the lowest "
-                      "delay. Tick several devices for multi-room.\n\n"
-                      "See Help, Keyboard shortcuts for the full list.",
+                      "AirPlay.\n\n"
+                      "Shortcuts: Help, Keyboard shortcuts.",
                       APP_TITLE, wx.ICON_INFORMATION),
                   mi_about)
         mb.Append(m, "&Device")
@@ -929,7 +924,7 @@ class MainFrame(wx.Frame):
             "Ctrl+B save the URL as a favourite\n"
             "Ctrl+Shift+C copy the stream address\n"
             "Ctrl+M mute\n"
-            "Space in the device list ticks a device for multi-room\n\n"
+            "Space ticks a device for multi-room\n\n"
             "Anywhere in Windows:\n" + HotkeyManager.describe(),
             "Keyboard shortcuts", wx.ICON_INFORMATION)
 
