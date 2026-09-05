@@ -392,9 +392,26 @@ class HlsRelay:
     # start at all.
     TRAIL_KEEP = 6
 
+    #: Sustained under-feed detection. Some IPTV CDNs cap a connection's
+    #: throughput by age: it opens at full rate and decays (measured at 0.44x
+    #: sustained on gohyperspeed, 2026-09-05). A slow encoder does not drop --
+    #: it just produces slower than real time, the relay's trail drains, and
+    #: the receiver stalls with nothing on this side noticing. The cure is a
+    #: fresh connection, which opens hot again: kill the starved encoder and
+    #: let the supervisor's restart path bring one up in place (same dir,
+    #: continuing numbering, monotonic playlist). Conservative by design: two
+    #: consecutive ~20s windows below 55% of real time, only for sources the
+    #: caller certifies live, never sooner than a minute after (re)start or
+    #: 90s after the previous rotation.
+    ROTATE_RATIO = 0.55      # media-seconds per wall-second that reads as fed
+    ROTATE_EVAL = 20.0       # seconds between cadence evaluations
+    ROTATE_STREAK = 2        # consecutive under-fed windows before rotating
+    ROTATE_MIN_AGE = 45.0    # do not judge an encoder younger than this
+    ROTATE_MIN_GAP = 90.0    # floor between forced rotations
+
     def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
-                 trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None
-                 ) -> None:
+                 trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None,
+                 live: Optional[bool] = None) -> None:
         self.url = url
         #: Segment length. Shorter means the receiver can start sooner, since
         #: everything below is counted in segments, not seconds.
@@ -420,6 +437,15 @@ class HlsRelay:
         #: restart, what leaves here never decreases.
         self._served_seq = None
         self._restarted = 0       # upstream-drop restarts (diagnostics)
+        #: True only when the caller certifies the source is live. Under-feed
+        #: rotation restarts a connection from the live edge, which for a VOD
+        #: or local file would restart the media from the beginning.
+        self.live = live
+        self._rotated = 0        # forced under-feed rotations (diagnostics)
+        self._last_rotate = 0.0
+        self._fail_streak = 0
+        self._eval_t0 = None     # (monotonic, newest-seg) window start
+        self._proc_born = 0.0
 
     def start(self, prime_segments: int = 0) -> str:
         import tempfile
@@ -470,14 +496,8 @@ class HlsRelay:
                          name="caster-relay-supervisor").start()
         return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
 
-    def _next_segment_number(self) -> int:
-        """The number a restarted encoder must resume from.
-
-        Without this a restart begins again at seg00000, and the receiver --
-        which has already played that name and may still be holding it -- is
-        handed a file it believes it knows. What comes out of the speakers is
-        audio from the start of the stream: playback jumps backwards.
-        """
+    def _newest_seg_number(self) -> int:
+        """Highest segNNNNN.ts on disk, or -1 before the first one."""
         highest = -1
         try:
             for name in os.listdir(self.root):
@@ -486,7 +506,17 @@ class HlsRelay:
                     highest = max(highest, int(match.group(1)))
         except OSError:
             pass
-        return highest + 1
+        return highest
+
+    def _next_segment_number(self) -> int:
+        """The number a restarted encoder must resume from.
+
+        Without this a restart begins again at seg00000, and the receiver --
+        which has already played that name and may still be holding it -- is
+        handed a file it believes it knows. What comes out of the speakers is
+        audio from the start of the stream: playback jumps backwards.
+        """
+        return self._newest_seg_number() + 1
 
     def _spawn_ffmpeg(self) -> None:
         """(Re)start the ffmpeg encoder process for this relay."""
@@ -497,6 +527,11 @@ class HlsRelay:
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, **_no_window_kwargs())
+        # A (re)started encoder gets the benefit of the doubt: rotation is
+        # judged only after it has had a chance to prove its cadence.
+        self._proc_born = time.monotonic()
+        self._fail_streak = 0
+        self._eval_t0 = None
 
     def _supervise(self) -> None:
         """Restart ffmpeg if it dies while the relay is up.
@@ -512,18 +547,105 @@ class HlsRelay:
             time.sleep(2)
             if self.httpd is None:
                 break   # stopped while sleeping
+            now = time.monotonic()
             proc = self.proc
-            if proc is None or proc.poll() is None:
+            if proc is not None and proc.poll() is not None:
+                # ffmpeg exited on its own: upstream dropped and reconnect
+                # flags gave up. Restart it unless we are shutting down.
+                if self.httpd is None:
+                    break
+                self._restarted += 1
+                try:
+                    self._spawn_ffmpeg()
+                except Exception:
+                    pass
                 continue
-            # ffmpeg exited on its own: upstream dropped and reconnect flags
-            # gave up. Restart it unless we are shutting down.
-            if self.httpd is None:
-                break
-            self._restarted += 1
-            try:
-                self._spawn_ffmpeg()
-            except Exception:
-                pass
+            if proc is not None:
+                try:
+                    self._check_underfeed(now)
+                except Exception:
+                    pass
+
+    def _check_underfeed(self, now: float) -> None:
+        """Rotate the source connection when a live encoder under-produces.
+
+        ffmpeg does not drop on a throttled source: it keeps the connection
+        and simply delivers packets slower than real time, so the relay's
+        trail drains and the receiver stalls -- on a Chromecast a starved
+        live HLS stream just sits there reporting PLAYING, which the app's
+        reconnect watchdog never sees. Some IPTV CDNs cap throughput by
+        connection age (hot at open, decaying after), so the cure is a fresh
+        connection: kill this encoder and the supervisor's restart path
+        brings one up in the same directory with continuing numbering.
+        """
+        if not self.live:
+            return
+        if not self.url.lower().startswith(("http://", "https://")):
+            return
+        if now - self._proc_born < self.ROTATE_MIN_AGE:
+            return
+        if now - self._last_rotate < self.ROTATE_MIN_GAP:
+            return
+        newest = self._newest_seg_number()
+        if newest < 0:
+            return
+        if self._eval_t0 is None:
+            # Open a cadence window: count segments from here for EVAL secs.
+            self._eval_t0 = (now, newest)
+            return
+        t0, n0 = self._eval_t0
+        span = now - t0
+        if span < self.ROTATE_EVAL:
+            return
+        # Close the window and open the next one.
+        self._eval_t0 = (now, newest)
+        seg_dur = self._read_seg_dur()
+        if not seg_dur or seg_dur <= 0:
+            return
+        # Media produced per wall-second. A live encoder keeping up scores
+        # ~1.0; the gohyperspeed cap measured 0.44.
+        ratio = (newest - n0) * seg_dur / span
+        if ratio >= self.ROTATE_RATIO:
+            self._fail_streak = 0
+            return
+        self._fail_streak += 1
+        if self._fail_streak < self.ROTATE_STREAK:
+            return
+        # Sustained under-feed: rotate to a connection that opens hot.
+        self._last_rotate = now
+        self._fail_streak = 0
+        self._eval_t0 = None
+        self._rotated += 1
+        trace("relay.rotate",
+              f"{ratio:.2f}x media for {self.ROTATE_STREAK} consecutive "
+              f"windows; restarting the encoder")
+        try:
+            self.proc.kill()
+        except Exception:
+            pass   # already gone; nothing to kill
+
+    def _read_seg_dur(self) -> Optional[float]:
+        """Media seconds per segment, from the encoder's own EXTINF line.
+
+        Used as the cadence yardstick: at full rate a segment lands every
+        EXTINF seconds of wall time, so this sidesteps hls_time's overcut.
+        """
+        if self.root is None:
+            return None
+        try:
+            with open(os.path.join(self.root, "live.m3u8"), "r",
+                      encoding="utf-8", errors="replace") as f:
+                dur = None
+                for line in f:
+                    if line.startswith("#EXTINF:"):
+                        try:
+                            dur = float(line.split(":", 1)[1]
+                                        .split(",", 1)[0])
+                        except (ValueError, IndexError):
+                            dur = None
+                return dur
+        except OSError:
+            return None
 
     def _ffmpeg_cmd(self, m3u8: str, start_number: int = 0) -> list:
         """ffmpeg command producing HLS for this relay's source."""
@@ -537,20 +659,20 @@ class HlsRelay:
                 # A live stream has no byte positions to come back to. Left
                 # to itself ffmpeg reconnects with "Range: bytes=<offset>"
                 # after every drop -- and this server drops every ten to
-                # twenty seconds -- so it asks to resume at an offset the
-                # server cannot honour, gets handed the current live edge
-                # instead, and splices that in as though it followed on.
-                # The overlap is media the listener has already heard: the
-                # stream jumps backwards, with a seam of corrupt packets.
-                # Declaring the source unseekable stops the Range request.
-                # Measured on this channel over 90s: 1.88x of real time
-                # produced (i.e. most of it arriving twice), 8 byte-offset
-                # resumes and 7 corrupt packets -- against 0.89x, 0 and 0
-                # with this set.
+                # twenty seconds. -seekable 0 used to stop the Range request
+                # and measured 0.89x here (2026-09-03); the server changed
+                # (2026-09-05): it now IGNORES the unseekable declaration,
+                # serves its own buffer from an earlier point, and ffmpeg
+                # splices that in as though it followed on. Measured 5.2x
+                # media per wall-second -- most of the channel arriving
+                # twice, heard and seen as constant skip-backs.
+                #
+                # So: no reconnect flags at all. A drop makes ffmpeg EXIT,
+                # and _supervise restarts it at the live edge in the same
+                # directory -- the playlist stays monotonic, the receiver
+                # rides through with a short freeze instead of a rewind.
+                # The restart loop is the resilience now, not ffmpeg.
                 "-seekable", "0",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "2",
                 "-rw_timeout", "5000000",   # 5s read timeout on the source
             ]
         # Inspect as little of the source as it takes to identify it. The
@@ -1904,7 +2026,8 @@ class MainFrame(wx.Frame):
                     return
                 probe = probe_media(url)
                 if probe["mime"] == "video/mp2t":
-                    relay = self._make_relay(url)
+                    relay = self._make_relay(url,
+                                             live=bool(probe["is_live"]))
                     self._keep_relay(relay)
                     play_url = relay.start()
                 else:
@@ -2034,7 +2157,8 @@ class MainFrame(wx.Frame):
             time.sleep(self.LOAD_POLL)
         return False
 
-    def _make_relay(self, url: str, codecs: Optional[list] = None) -> HlsRelay:
+    def _make_relay(self, url: str, codecs: Optional[list] = None,
+                    live: Optional[bool] = None) -> HlsRelay:
         """An HLS relay tuned to the chosen quality preset.
 
         Segment length and how far behind the live edge to sit are the whole
@@ -2048,7 +2172,7 @@ class MainFrame(wx.Frame):
                         hls_time=chosen["hls_time"],
                         prime_segments=chosen["hls_prime"],
                         trail_keep=chosen["hls_trail"],
-                        codecs=codecs)
+                        codecs=codecs, live=live)
 
     def _play_chromecast(self, dev: Device, url: str, mime: str = "",
                          is_live: Optional[bool] = None) -> None:
@@ -2126,7 +2250,8 @@ class MainFrame(wx.Frame):
                         # local relay (runs only while playing).
                         self._ui(self.set_status, "Relay starting...",
                                  speak=False)
-                        relay = self._make_relay(url)
+                        relay = self._make_relay(
+                            url, live=bool(probe["is_live"]))
                         HlsFileHandler.relay_requests.clear()
                         self._keep_relay(relay)
                         trace("cast.relay.start",
@@ -2281,6 +2406,16 @@ class MainFrame(wx.Frame):
                             continue
                         if self._stop_flag or shutdown.is_set():
                             break       # stop() already said "Stopped."
+                        if (self._air_is_live
+                                and self._air_kind in ("video", "live")):
+                            # Live ffmpeg pipe: the source dropped (they do,
+                            # every ten to twenty seconds) and ffmpeg exited
+                            # -- there are no reconnect flags any more
+                            # because the byte-offset resume spliced
+                            # already-heard media in as skip-backs. Reopen
+                            # at the live edge on the same RAOP session.
+                            trace("air.stream.restart", "live pipe ended")
+                            continue
                         # Stream ended naturally.
                         self._ui(lambda: self.set_status("Finished."))
                         break
@@ -2363,15 +2498,15 @@ class MainFrame(wx.Frame):
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
         # Survive IPTV source drops/jitter instead of feeding silence.
         cmd += [
-            # See the relay: without this, a reconnect asks a live server to
-            # resume at a byte offset and the overlap is heard as the stream
-            # jumping back. Only meaningful for http(s), which is the only
-            # case that reconnects at all.
+            # A live stream has no byte positions to come back to, and this
+            # source now IGNORES -seekable 0: on a drop it serves its buffer
+            # from an earlier point and ffmpeg splices that in -- the overlap
+            # is heard as the stream jumping back (measured 5.2x media per
+            # wall-second, 2026-09-05). So no reconnect flags at all: a drop
+            # ends the pipe and the RAOP runner's restart loop reopens at
+            # the live edge. Only meaningful for http(s).
             *(("-seekable", "0") if url.lower().startswith(
                 ("http://", "https://")) else ()),
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
             "-rw_timeout", "5000000",
             # Look at as little of the stream as it takes to find the audio.
             # The defaults inspect five seconds before emitting a byte, and

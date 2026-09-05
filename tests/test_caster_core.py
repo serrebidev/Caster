@@ -690,3 +690,119 @@ def test_capture_container_is_always_wav_when_audio_only(frame, dev):
     would cost an encoder and the delay that comes with it.
     """
     assert MainFrame._capture_container(frame, dev, audio_only=True) == "wav"
+
+
+# --------------------------------------------------------------------------
+# 3. HlsRelay under-feed rotation -- a fresh connection on a throttled source
+# --------------------------------------------------------------------------
+
+class _FakeProc:
+    """A stand-in encoder: alive until killed, and it records the kill."""
+
+    def __init__(self) -> None:
+        self.killed = 0
+
+    def poll(self):
+        return None
+
+    def kill(self) -> None:
+        self.killed += 1
+
+
+def _segments(root, count: int, dur: float = 2.5) -> None:
+    """Materialise `count` segments and a matching playlist in `root`."""
+    for n in range(count):
+        with open(os.path.join(root, f"seg{n:05d}.ts"), "wb"):
+            pass
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+             f"#EXT-X-MEDIA-SEQUENCE:0"]
+    for n in range(count):
+        lines += [f"#EXTINF:{dur},", f"seg{n:05d}.ts"]
+    with open(os.path.join(root, "live.m3u8"), "w",
+              encoding="utf-8", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _live_relay(relay):
+    """A relay the caller certifies live, with an encoder that started at 100."""
+    relay.live = True
+    relay._proc_born = 100.0
+    relay.proc = _FakeProc()
+    return relay
+
+
+def test_underfeed_rotation_kills_a_starved_encoder(relay):
+    """Two consecutive under-fed windows rotate to a fresh connection.
+
+    The gohyperspeed cap measured 0.44 media-seconds per wall-second: a
+    20s window that should yield eight 2.5s segments yields three or four.
+    The relay must kill the encoder so the supervisor restarts it, because
+    ffmpeg itself never notices -- the connection stays up, just slow.
+    """
+    r = _live_relay(relay)
+    _segments(r.root, 40)          # newest seg00039
+    r._check_underfeed(160.0)      # opens the cadence window
+    _segments(r.root, 43)          # +3 in 20s: 0.375x -- under-fed
+    r._check_underfeed(180.0)
+    assert r._fail_streak == 1
+    assert r.proc.killed == 0      # one bad window is not enough
+    _segments(r.root, 46)          # +3 more: still 0.375x
+    r._check_underfeed(200.0)
+    assert r._fail_streak == 0
+    assert r.proc.killed == 1      # rotated
+    assert r._rotated == 1
+    assert r._last_rotate == 200.0
+    # The gap floor prevents thrashing right after a rotation.
+    r._check_underfeed(215.0)
+    assert r.proc.killed == 1
+
+
+def test_underfeed_rotation_leaves_a_healthy_encoder_alone(relay):
+    """A full-rate encoder is never rotated, no matter how long it runs."""
+    r = _live_relay(relay)
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)      # opens the window
+    _segments(r.root, 48)          # +8 in 20s: 1.0x
+    r._check_underfeed(180.0)
+    _segments(r.root, 56)          # +8 more: still 1.0x
+    r._check_underfeed(200.0)
+    assert r.proc.killed == 0
+    assert r._rotated == 0
+
+
+def test_underfeed_rotation_requires_certified_live_http(relay):
+    """Rotation restarts from the live edge, so VOD/local must never rotate.
+
+    A bare HlsRelay (the default) has live=None and is never touched, and
+    neither is a live-coded relay whose source is a local path.
+    """
+    _segments(relay.root, 40)
+    relay.proc = _FakeProc()
+    relay._proc_born = 100.0       # live stays None
+    relay._check_underfeed(160.0)
+    relay._check_underfeed(200.0)  # span long enough, no segments gained
+    assert relay.proc.killed == 0
+
+    local = HlsRelay(str(relay.root) + "/movie.mkv", live=True)
+    local.root = str(relay.root)
+    local.proc = _FakeProc()
+    local._proc_born = 100.0
+    _segments(local.root, 40)
+    local._check_underfeed(160.0)
+    local._check_underfeed(200.0)
+    assert local.proc.killed == 0
+
+
+def test_underfeed_rotation_waits_for_a_window_and_encoder_age(relay):
+    """The cadence window needs ROTATE_EVAL seconds and the encoder needs
+    ROTATE_MIN_AGE before it is judged at all."""
+    r = _live_relay(relay)
+    _segments(r.root, 40)
+    r._check_underfeed(120.0)      # age 20s < 45s: not judged
+    assert r._eval_t0 is None
+    _segments(r.root, 40)
+    r._proc_born = 100.0
+    r._check_underfeed(160.0)      # opens the window
+    r._check_underfeed(165.0)      # only 5s in: no evaluation yet
+    assert r._eval_t0 is not None
+    assert r.proc.killed == 0
