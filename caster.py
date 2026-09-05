@@ -519,9 +519,25 @@ class HlsRelay:
         return self._newest_seg_number() + 1
 
     def _spawn_ffmpeg(self) -> None:
-        """(Re)start the ffmpeg encoder process for this relay."""
+        """(Re)start the ffmpeg encoder process for this relay.
+
+        Kills any still-running previous encoder FIRST, so there is always
+        exactly one ffmpeg per relay. Without this, _supervise's two-step
+        read-self.proc-then-kill-proc races _spawn_ffmpeg's self.proc swap:
+        the kill lands on the new process and the old one keeps running as a
+        zombie -- the dual-ffmpeg state seen live on 2026-09-05.
+        """
         if self.root is None:
             return          # stop() already tore down the temp directory
+        # One encoder per relay, always.
+        prev = self.proc
+        self.proc = None
+        if prev is not None and prev.poll() is None:
+            prev.kill()
+            try:
+                prev.wait(timeout=5)
+            except Exception:
+                prev.kill()
         m3u8 = os.path.join(self.root, "live.m3u8")
         cmd = self._ffmpeg_cmd(m3u8, self._next_segment_number())
         self.proc = subprocess.Popen(
