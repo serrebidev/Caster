@@ -913,7 +913,7 @@ def test_wav_header_sizes_are_clamped_to_32_bits():
     """
     header = wav_header(48000, 2, caster_extras.ENDLESS_WAV_BYTES)
     assert len(header) == 44
-    assert struct.unpack("<I", header[40:44])[0] == 0x7FFFFFFF
+    assert struct.unpack("<I", header[40:44])[0] == caster_extras.ENDLESS_WAV_BYTES
 
     huge = wav_header(48000, 2, 0xFFFFFFFF)
     assert struct.unpack("<I", huge[4:8])[0] == 0xFFFFFFFF
@@ -926,6 +926,7 @@ def test_endless_wav_size_is_the_signed_ceiling():
     Receivers that parse the RIFF sizes into a SIGNED int -- Sonos among them
     -- see anything above 0x7FFFFFFF as a negative length and refuse the
     stream. The unsigned ceiling looks like the obvious choice here and is the
-    wrong one.
+    wrong one.  The constant is 44 bytes short of the signed ceiling so that
+    the RIFF field (data + header) stays non-negative too.
     """
-    assert caster_extras.ENDLESS_WAV_BYTES == 0x7FFFFFFF
+    assert caster_extras.ENDLESS_WAV_BYTES == 0x7FFFFFFF - 44

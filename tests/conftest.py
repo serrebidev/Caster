@@ -73,6 +73,8 @@ def frame():
     obj._muted = False
     obj.cast = None
     obj.atv = None
+    obj._casts = {}
+    obj._atvs = {}
     obj._relay = None
     obj._cast_zc = None
     return obj

@@ -667,7 +667,10 @@ def wav_header(rate: int, channels: int, data_bytes: int) -> bytes:
 #: Sonos among them -- see anything above it as negative. At 48 kHz stereo it
 #: caps one session at about three hours, after which the receiver ends the
 #: track and the reconnect watchdog starts a fresh one.
-ENDLESS_WAV_BYTES = 0x7FFFFFFF
+#: payload of the header itself, so that ENDLESS_WAV_BYTES + 44 still fits
+#: in a signed 32-bit integer and both the RIFF field and the Content-Length
+#: header stay non-negative to every parser.
+ENDLESS_WAV_BYTES = 0x7FFFFFFF - 44
 
 
 class LiveWavReader(io.BufferedIOBase):

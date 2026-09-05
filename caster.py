@@ -142,14 +142,21 @@ def youtube_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def url_path(url: str) -> str:
+    """The URL with its query and fragment removed."""
+    return url.split("?")[0].split("#")[0]
+
+
 def guess_mime(url: str) -> str:
-    path = url.split("?")[0].split("#")[0]
-    mt, _ = mimetypes.guess_type(path)
+    mt, _ = mimetypes.guess_type(url_path(url))
     if mt:
         return mt
-    lowered = url.lower()
-    if ".mp3" in lowered or "aac" in lowered:
-        return "audio/mpeg"
+    if "aac" in url.lower():
+        return "audio/aac"
+    # Nothing in the URL says what this is. Radio streams are the common
+    # extension-less case, so audio is the useful guess -- but it is only a
+    # guess, which is why probe_media leaves is_audio unknown rather than
+    # treating it as a fact. See the fallback branch there.
     return "audio/mpeg"
 
 
@@ -237,7 +244,7 @@ def probe_media(url: str) -> dict:
         is_audio, mime = True, "audio/flac"
     elif head.startswith(b"RIFF") and head[8:12] == b"WAVE":
         is_audio, mime = True, "audio/wav"
-    elif head.startswith(b"ftyp") or head[4:8] == b"ftyp":
+    elif head[4:8] == b"ftyp":
         is_audio, mime = False, "video/mp4"
     elif ct in _CT_AUDIO:
         is_audio, mime = True, ct
@@ -483,6 +490,8 @@ class HlsRelay:
 
     def _spawn_ffmpeg(self) -> None:
         """(Re)start the ffmpeg encoder process for this relay."""
+        if self.root is None:
+            return          # stop() already tore down the temp directory
         m3u8 = os.path.join(self.root, "live.m3u8")
         cmd = self._ffmpeg_cmd(m3u8, self._next_segment_number())
         self.proc = subprocess.Popen(
@@ -768,7 +777,9 @@ class HlsFileHandler(http.server.SimpleHTTPRequestHandler):
         HlsFileHandler.relay_requests.append(
             (time.strftime("%H:%M:%S"), self.path, self.client_address[0]))
         # Playlist requests get the trailing-edge view (see HlsRelay).
-        if self.path.rstrip("/").endswith("live.m3u8") and self.server is not None:
+        # Strip query string: a receiver appending ?_=N must still match.
+        path_only = self.path.split("?")[0]
+        if path_only.rstrip("/").endswith("live.m3u8") and self.server is not None:
             relay = getattr(self.server, "relay", None)
             if relay is not None:
                 data = relay.trailing_playlist()
@@ -780,6 +791,11 @@ class HlsFileHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(data)
                     return
         return super().do_GET()
+
+    def do_HEAD(self):
+        # HEAD must match what GET returns, otherwise the playlist body
+        # and the Content-Length disagree on the trailing-edge view.
+        HlsFileHandler.do_GET(self)
 
     def log_message(self, format, *args):
         pass  # keep console quiet
@@ -891,6 +907,9 @@ class MainFrame(wx.Frame):
         self._cast_zc = None
         self.yt: Optional[YouTubeController] = None
         self.atv = None  # pyatv AppleTV
+        #: Per-device tracking for multi-room: stop() needs every connection.
+        self._casts: dict[str, pychromecast.Chromecast] = {}
+        self._atvs: dict[str, object] = {}
         self.stream_task: Optional[asyncio.Task] = None
         self._runner_fut: Optional[concurrent.futures.Future] = None
         self._stop_flag = True
@@ -1256,7 +1275,12 @@ class MainFrame(wx.Frame):
                 "model": props.get("md") or "Chromecast",
             })
             with lock:
-                found[fn] = device
+                # Two Cast devices sharing a friendly name collapse into one.
+                # Disambiguate by appending the IP so both appear in the list.
+                key = fn
+                if key in found:
+                    key = f"{fn} ({host})"
+                found[key] = device
 
         class _Listener:
             def add_service(self, zc_, type_, name):
@@ -1755,6 +1779,7 @@ class MainFrame(wx.Frame):
         self.settings.add_recent_url(url)
         self.settings.note_device(devices[0].label)
         self._refresh_recent()
+        self._cast_started = time.monotonic()
         devices = self._group_musiccast(self._group_sonos(devices))
         self._targets = list(devices)
 
@@ -1872,6 +1897,7 @@ class MainFrame(wx.Frame):
         read the first few bytes and then throw it away.
         """
         def worker() -> None:
+            relay = None
             try:
                 if mime:
                     self._upnp_push(dev, url, mime, title)
@@ -1900,7 +1926,7 @@ class MainFrame(wx.Frame):
             except Exception as exc:
                 message = f"UPnP error: {exc}"
                 self._ui(self.set_status, message)
-                self._stop_relay()
+                self._stop_relay(relay)
         threading.Thread(target=worker, daemon=True).start()
         self.set_status(f"Connecting to {dev.name}...")
 
@@ -2016,6 +2042,8 @@ class MainFrame(wx.Frame):
         already picked for capture rather than being fixed here.
         """
         chosen = preset(self.settings["capture_quality"])
+        if codecs is None:
+            codecs = _probe_codecs(url)
         return HlsRelay(url,
                         hls_time=chosen["hls_time"],
                         prime_segments=chosen["hls_prime"],
@@ -2031,6 +2059,7 @@ class MainFrame(wx.Frame):
         encoder just to read its first bytes and then throw it away.
         """
         def worker() -> None:
+            relay = None
             try:
                 host = dev.key["host"]
                 port = dev.key.get("port", 8009)
@@ -2063,6 +2092,7 @@ class MainFrame(wx.Frame):
                         pass
                     return
                 self.cast = cast
+                self._casts[dev.label] = cast
 
                 vid = youtube_id(url)
                 if vid:
@@ -2146,14 +2176,14 @@ class MainFrame(wx.Frame):
                     else:
                         self._ui(self.set_status,
                                  f"Load failed ({mc.status.idle_reason}).")
-                        self._stop_relay()
+                        self._stop_relay(relay)
                 vol = cast.status.volume_level
                 self._ui(lambda: (self.vol_slider.SetValue(int(vol * 100)) if vol else None,
                                   self.btn_playpause.SetLabel("Pa&use")))
             except Exception as exc:
                 self._ui(self.set_status, f"Cast error: {exc}")
                 # Playback never started; don't leave the relay running.
-                self._stop_relay()
+                self._stop_relay(relay)
 
         threading.Thread(target=worker, daemon=True, name="cast-play").start()
         self.set_status(f"Connecting to {dev.name}...")
@@ -2204,6 +2234,7 @@ class MainFrame(wx.Frame):
                 atv = await pyatv.connect(dev.key, self.loop_thread.loop,
                                           protocol=Protocol.RAOP)
                 self.atv = atv
+                self._atvs[dev.name] = atv
                 if shutdown.is_set():
                     raise asyncio.CancelledError()
 
@@ -2242,6 +2273,12 @@ class MainFrame(wx.Frame):
                         if wake.is_set():
                             wake.clear()
                             continue   # resume or seek: reopen the source
+                        if self._air_state == "paused":
+                            # Pause killed the source; wait for resume/seek
+                            # to set wake, then reopen on the same session.
+                            await wake.wait()
+                            wake.clear()
+                            continue
                         if self._stop_flag or shutdown.is_set():
                             break       # stop() already said "Stopped."
                         # Stream ended naturally.
@@ -2599,6 +2636,7 @@ class MainFrame(wx.Frame):
             return
         self._file_server = server
         self._stop_flag = False
+        self._cast_started = time.monotonic()
         name = os.path.basename(path)
         self.set_status(f"Serving {name}...")
         if dev.kind == "chromecast":
@@ -2653,8 +2691,10 @@ class MainFrame(wx.Frame):
                 name="musiccast-ungroup").start()
         self._musiccast_restore()
         self._targets = []
-        cast, self.cast = self.cast, None
-        if cast:
+        # Disconnect every Chromecast, not just the most recent one.
+        # Multi-room casts create several, and self.cast only holds one.
+        casts, self._casts = dict(self._casts), {}
+        for cast in casts.values():
             try:
                 cast.stop_app()
             except Exception:
@@ -2665,6 +2705,18 @@ class MainFrame(wx.Frame):
                 cast.disconnect(blocking=False)
             except Exception:
                 pass
+        # Also handle self.cast for code that still writes to it directly.
+        cast, self.cast = self.cast, None
+        if cast and cast not in list(casts.values()):
+            try:
+                cast.stop_app()
+            except Exception:
+                pass
+            try:
+                cast.disconnect(blocking=False)
+            except Exception:
+                pass
+        self._atvs.clear()
 
     async def _cancel_stream(self, task: asyncio.Task) -> None:
         task.cancel()
@@ -2694,19 +2746,34 @@ class MainFrame(wx.Frame):
             self._relays.append(relay)
             self._relay = relay
 
-    def _stop_relay(self) -> None:
+    def _stop_relay(self, only=None) -> None:
+        """Stop relays.  With *only*, remove and stop a single relay; without
+        it, tear everything down (called by stop_silent)."""
         with self._relay_lock:
-            relays, self._relays = list(self._relays), []
-            self._relay = None
-        for relay in relays:
+            if only is not None:
+                if only in self._relays:
+                    self._relays.remove(only)
+                    if self._relay is only:
+                        self._relay = self._relays[-1] if self._relays else None
+                relay = only
+            else:
+                relays, self._relays = list(self._relays), []
+                self._relay = None
+                fs = self._file_server
+                self._file_server = None
+                for relay in relays:
+                    try:
+                        relay.stop()
+                    except Exception:
+                        pass
+                if fs:
+                    fs.stop()
+                return
+        if relay:
             try:
                 relay.stop()
             except Exception:
                 pass
-        fs = self._file_server
-        self._file_server = None
-        if fs:
-            fs.stop()
 
     def stop(self) -> None:
         self.stop_silent()
@@ -2762,6 +2829,11 @@ class MainFrame(wx.Frame):
                 self._air_pos += time.monotonic() - self._air_play_t0
                 self._air_play_t0 = None
             self._kill_ffmpeg()
+            # Cancel the stream task so that direct-audio URLs and live
+            # capture sources (which have no ffmpeg to kill) also stop.
+            task = self.stream_task
+            if task and not task.done():
+                self.loop_thread.submit(self._cancel_stream(task))
             self.btn_playpause.SetLabel("&Resume")
             self.set_status("Paused.")
         elif self._air_state == "paused" and self._air_wake:
