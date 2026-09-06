@@ -211,6 +211,53 @@ def test_trailing_playlist_offset_never_runs_off_a_shorter_playlist(relay):
     assert _seq_of(out) >= 204
 
 
+def test_trailing_playlist_marks_a_restart_seam_as_discontinuous(relay):
+    """A segment from a NEW encoder connection needs a DISCONTINUITY tag.
+
+    A restarted connection continues the channel but not its timestamp
+    clock. Without the tag the receiver splices the two timelines as one:
+    the last few seconds play twice (the ~5s skip-back reported live on
+    2026-09-05) and the decoder then fails, ending the stream.
+    """
+    _serve(relay, _playlist(100, 100, 12))
+    relay._discont_segs.add(112)                # restart lands on 112
+    out = _serve(relay, _playlist(104, 104, 12))
+    lines = out.splitlines()
+    # Exactly one tag, immediately before the first segment of the new
+    # encoder's output -- never anywhere else.
+    assert lines.count("#EXT-X-DISCONTINUITY") == 1
+    idx = lines.index("#EXT-X-DISCONTINUITY")
+    assert lines[idx + 1] == "#EXTINF:2.000000," or lines[idx + 1].startswith("#EXTINF:")
+    assert lines[idx + 2] == "seg00112.ts"
+
+
+def test_trailing_playlist_has_no_discontinuity_without_a_restart(relay):
+    """A relay that never restarted serves a tag-free playlist.
+
+    Some receivers drop A/V for a beat at every tag; sprinkling them into
+    an unbroken timeline would trade one artefact for another.
+    """
+    out = _serve(relay, _playlist(50, 50, 12))
+    assert "#EXT-X-DISCONTINUITY" not in out
+
+
+def test_trailing_playlist_keeps_the_tag_through_trimming(relay):
+    """The seam must survive being scrolled out of the trailing window.
+
+    _trail_drop only grows; when the seam scrolls out of the kept window
+    the tag belongs to nothing and must not be emitted, but while the seam
+    is still inside the window it must stay, however far the trim moves.
+    """
+    _serve(relay, _playlist(100, 100, 12))
+    relay._discont_segs.add(106)                # seam mid-window
+    out = _serve(relay, _playlist(102, 102, 12))
+    assert out.count("#EXT-X-DISCONTINUITY") == 1
+    assert "seg00106.ts" in out
+    # Once the seam is gone from the playlist entirely, no tag.
+    out2 = _serve(relay, _playlist(110, 110, 12))
+    assert "#EXT-X-DISCONTINUITY" not in out2
+
+
 def test_trailing_playlist_output_is_a_valid_playlist(relay):
     """Whatever the trimming does, the bytes served must still parse.
 

@@ -446,6 +446,12 @@ class HlsRelay:
         self._fail_streak = 0
         self._eval_t0 = None     # (monotonic, newest-seg) window start
         self._proc_born = 0.0
+        #: Segment numbers where a restarted encoder began. Each is served
+        #: with an #EXT-X-DISCONTINUITY tag: a fresh upstream connection
+        #: continues the channel but not its timestamp clock, and a receiver
+        #: told to treat the two timelines as one splices them into a replay
+        #: of the last few seconds followed by a decode failure.
+        self._discont_segs: set = set()
 
     def start(self, prime_segments: int = 0) -> str:
         import tempfile
@@ -539,7 +545,13 @@ class HlsRelay:
             except Exception:
                 prev.kill()
         m3u8 = os.path.join(self.root, "live.m3u8")
-        cmd = self._ffmpeg_cmd(m3u8, self._next_segment_number())
+        start = self._next_segment_number()
+        if start > 0:
+            # Not the first encoder this relay has run: the source timeline
+            # is about to be spliced. Mark the seam so trailing_playlist can
+            # tell the receiver it is a boundary, not a continuation.
+            self._discont_segs.add(start)
+        cmd = self._ffmpeg_cmd(m3u8, start)
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, **_no_window_kwargs())
@@ -785,7 +797,6 @@ class HlsRelay:
             return j
 
         header_end = block_start(segs[0])   # comments after MEDIA-SEQUENCE
-        keep_from = block_start(segs[drop])
         # The ratchet. A restarted encoder numbers from wherever it likes, and
         # handing the receiver a sequence lower than one it has already seen
         # tells it to play those segments again -- heard as the stream jumping
@@ -795,10 +806,20 @@ class HlsRelay:
         if self._served_seq is not None and seq < self._served_seq:
             seq = self._served_seq
         self._served_seq = seq
+
+        # Restart seams. A segment written by a NEW encoder connection does
+        # not continue the previous one's timestamp clock, so it is preceded
+        # by a DISCONTINUITY tag -- the receiver then re-initialises its
+        # decoder at the seam instead of splicing the two timelines, which
+        # played the last few seconds twice and then failed.
         out = lines[:seq_idx]
         out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}")
         out.extend(lines[seq_idx + 1:header_end])  # version/targetduration
-        out.extend(lines[keep_from:])
+        for uri_idx in segs[drop:]:
+            num = re.fullmatch(r"seg(\d+)\.ts", lines[uri_idx].strip())
+            if num and int(num.group(1)) in self._discont_segs:
+                out.append("#EXT-X-DISCONTINUITY")
+            out.extend(lines[block_start(uri_idx):uri_idx + 1])
         return ("\n".join(out) + "\n").encode("utf-8")
 
     @staticmethod
