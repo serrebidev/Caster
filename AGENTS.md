@@ -324,6 +324,20 @@ looks rejected while it is in fact starting. `_await_playing` takes the
 media_session_id from before `play_media` and ignores anything still carrying
 it. Do not treat INTERRUPTED or CANCELLED as a rejection.
 
+## HLS restart continuity (2026-09-05)
+
+With ffmpeg `append_list`, `-start_number` must be the existing playlist's
+MEDIA-SEQUENCE, not the next segment filename: ffmpeg adds the retained
+entry count itself. Passing the next filename renumbers retained segments
+and can disconnect a Cast receiver. Verified with five consecutive real
+ffmpeg runs and overlapping segment identity checks.
+
+Use ffmpeg's actual DISCONTINUITY markers rather than guessing the restart
+filename from disk (an unfinished segment may exist). Deduplicate markers
+and retain EXT-X-DISCONTINUITY-SEQUENCE as seams leave the served window;
+otherwise still-buffered segments change timeline IDs. Serialize playlist
+rewrites because HTTP requests can overlap.
+
 ## Diagnostics
 
 `trace(event, detail)` in caster.py writes a timestamped timeline to whatever

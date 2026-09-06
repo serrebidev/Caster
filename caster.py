@@ -201,6 +201,8 @@ def probe_media(url: str) -> dict:
         # Local file: decide from extension + magic bytes directly.
         path = url
         mt, _ = mimetypes.guess_type(path)
+        if os.path.splitext(path)[1].lower() == ".wav":
+            mt = "audio/wav"
         mime = mt or "application/octet-stream"
         result["mime"] = mime
         result["is_audio"] = mime.startswith("audio/")
@@ -452,6 +454,7 @@ class HlsRelay:
         #: told to treat the two timelines as one splices them into a replay
         #: of the last few seconds followed by a decode failure.
         self._discont_segs: set = set()
+        self._playlist_lock = threading.Lock()
 
     def start(self, prime_segments: int = 0) -> str:
         import tempfile
@@ -546,11 +549,8 @@ class HlsRelay:
                 prev.kill()
         m3u8 = os.path.join(self.root, "live.m3u8")
         start = self._next_segment_number()
-        if start > 0:
-            # Not the first encoder this relay has run: the source timeline
-            # is about to be spliced. Mark the seam so trailing_playlist can
-            # tell the receiver it is a boundary, not a continuation.
-            self._discont_segs.add(start)
+        # append_list marks the actual first new segment. Do not guess its
+        # name from files on disk: an unfinished segment can be there too.
         cmd = self._ffmpeg_cmd(m3u8, start)
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -677,6 +677,19 @@ class HlsRelay:
 
     def _ffmpeg_cmd(self, m3u8: str, start_number: int = 0) -> list:
         """ffmpeg command producing HLS for this relay's source."""
+        append = start_number > 0
+        if append:
+            # append_list adds the old entry count to start_number. Passing
+            # the next filename shifts the sequence of EVERY retained URI.
+            # Continue from the existing playlist's base instead.
+            try:
+                with open(m3u8, encoding="utf-8") as playlist:
+                    for line in playlist:
+                        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                            start_number = int(line.split(":", 1)[1])
+                            break
+            except (OSError, ValueError):
+                pass
         cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
         if self.url.lower().startswith(("http://", "https://")):
             # Survive IPTV sources dropping/jittering instead of stalling.
@@ -745,7 +758,7 @@ class HlsRelay:
             # instead of truncating it, which would strip the segments the
             # receiver is still working through.
             "-hls_flags",
-            "delete_segments+append_list" if start_number else "delete_segments",
+            "delete_segments+append_list" if append else "delete_segments",
             "-start_number", str(start_number),
             "-hls_segment_filename", os.path.join(self.root, "seg%05d.ts"),
             m3u8,
@@ -753,6 +766,11 @@ class HlsRelay:
         return cmd
 
     def trailing_playlist(self):
+        # Concurrent HTTP polls must see a consistent timeline.
+        with self._playlist_lock:
+            return self._trailing_playlist()
+
+    def _trailing_playlist(self):
         """Playlist bytes trimmed to the trailing TRAIL_KEEP segments, so the
         receiver rides a few seconds behind the live edge. Returns None only
         before enough segments exist (the raw file is served then)."""
@@ -797,6 +815,11 @@ class HlsRelay:
             return j
 
         header_end = block_start(segs[0])   # comments after MEDIA-SEQUENCE
+        # append_list already marks restart seams. Record before trimming.
+        for uri_idx in segs:
+            num = re.fullmatch(r"seg(\d+)\.ts", lines[uri_idx].strip())
+            if num and "#EXT-X-DISCONTINUITY" in lines[block_start(uri_idx):uri_idx]:
+                self._discont_segs.add(int(num.group(1)))
         # The ratchet. A restarted encoder numbers from wherever it likes, and
         # handing the receiver a sequence lower than one it has already seen
         # tells it to play those segments again -- heard as the stream jumping
@@ -813,13 +836,21 @@ class HlsRelay:
         # decoder at the seam instead of splicing the two timelines, which
         # played the last few seconds twice and then failed.
         out = lines[:seq_idx]
+        out = [line for line in out
+               if not line.startswith("#EXT-X-DISCONTINUITY-SEQUENCE:")]
         out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}")
+        first = re.fullmatch(r"seg(\d+)\.ts", lines[segs[drop]].strip())
+        if first and self._discont_segs:
+            # Preserve timeline IDs when a restart seam leaves the window.
+            count = sum(n < int(first.group(1)) for n in self._discont_segs)
+            out.append(f"#EXT-X-DISCONTINUITY-SEQUENCE:{count}")
         out.extend(lines[seq_idx + 1:header_end])  # version/targetduration
         for uri_idx in segs[drop:]:
             num = re.fullmatch(r"seg(\d+)\.ts", lines[uri_idx].strip())
             if num and int(num.group(1)) in self._discont_segs:
                 out.append("#EXT-X-DISCONTINUITY")
-            out.extend(lines[block_start(uri_idx):uri_idx + 1])
+            out.extend(line for line in lines[block_start(uri_idx):uri_idx + 1]
+                       if line != "#EXT-X-DISCONTINUITY")
         return ("\n".join(out) + "\n").encode("utf-8")
 
     @staticmethod

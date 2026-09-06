@@ -251,11 +251,12 @@ def test_trailing_playlist_keeps_the_tag_through_trimming(relay):
     _serve(relay, _playlist(100, 100, 12))
     relay._discont_segs.add(106)                # seam mid-window
     out = _serve(relay, _playlist(102, 102, 12))
-    assert out.count("#EXT-X-DISCONTINUITY") == 1
+    assert out.splitlines().count("#EXT-X-DISCONTINUITY") == 1
     assert "seg00106.ts" in out
     # Once the seam is gone from the playlist entirely, no tag.
     out2 = _serve(relay, _playlist(110, 110, 12))
-    assert "#EXT-X-DISCONTINUITY" not in out2
+    assert "#EXT-X-DISCONTINUITY" not in out2.splitlines()
+    assert "#EXT-X-DISCONTINUITY-SEQUENCE:1" in out2
 
 
 def test_trailing_playlist_output_is_a_valid_playlist(relay):
@@ -273,6 +274,36 @@ def test_trailing_playlist_output_is_a_valid_playlist(relay):
     assert len(uris) == relay.trail_keep
     assert out.count("#EXTINF") == len(uris)     # every URI kept its duration
     assert out.endswith("\n")
+
+
+def test_native_restart_marker_is_not_duplicated(relay):
+    relay._discont_segs.add(106)
+    raw = _playlist(100, 100, 12).replace(
+        "#EXTINF:2.000000,\nseg00106.ts",
+        "#EXT-X-DISCONTINUITY\n#EXTINF:2.000000,\nseg00106.ts")
+    out = _serve(relay, raw)
+    assert out.splitlines().count("#EXT-X-DISCONTINUITY") == 1
+
+
+def test_restart_preserves_existing_playlist_sequence(relay, no_ffmpeg):
+    relay.codecs = ["h264", "aac"]
+    path = os.path.join(relay.root, "live.m3u8")
+    _serve(relay, _playlist(100, 100, 12))
+    cmd = relay._ffmpeg_cmd(path, start_number=113)
+    assert cmd[cmd.index("-start_number") + 1] == "100"
+    assert "append_list" in cmd[cmd.index("-hls_flags") + 1]
+
+
+def test_native_restart_timeline_survives_sliding_window(relay):
+    raw = _playlist(100, 100, 12).replace(
+        "#EXTINF:2.000000,\nseg00106.ts",
+        "#EXT-X-DISCONTINUITY\n#EXTINF:2.000000,\nseg00106.ts")
+    before = _serve(relay, raw)
+    after = _serve(relay, _playlist(104, 104, 12))
+    assert "#EXT-X-DISCONTINUITY-SEQUENCE:0" in before
+    assert "#EXT-X-DISCONTINUITY-SEQUENCE:1" in after
+    assert "seg00108.ts" in before and "seg00108.ts" in after
+    assert "#EXT-X-DISCONTINUITY" not in after.splitlines()
 
 
 def test_trailing_playlist_returns_none_after_stop(relay):
