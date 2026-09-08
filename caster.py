@@ -106,7 +106,7 @@ from caster_ui import (
 import caster_update
 
 APP_TITLE = "Caster"
-APP_VERSION = "0.5.9"
+APP_VERSION = "0.5.10"
 
 #: Diagnostic timeline, off unless CASTER_TRACE names a file. Buffering is a
 #: timing problem and timing problems are invisible from a status bar, so this
