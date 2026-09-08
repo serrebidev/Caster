@@ -67,11 +67,24 @@ every reply arriving meanwhile is lost. Collect locations, close socket, fetch i
 Resolve mDNS services as announced, not after the browse window. Serial resolve at 3-4 s
 each was most of the old cost.
 
+Measured 2026-09-07 on this LAN: the full six-protocol discovery takes 5.31 s
+(Cast 5.00, AirPlay 5.01, Kodi 5.00, Roku 5.07, Sonos 5.10, UPnP 5.31).
+That is the five-second listen window plus 0.31 s for parallel UPnP capability
+reads. Do not shorten the window or remove repeated SSDP sends to make this
+number smaller; the result would be faster but unreliable.
+
 ## Protocol traps
 
 - Sonos answers SSDP as ZonePlayer, not MediaRenderer. Needs own discovery via soco.
 - Sonos AirPlay 2 = trap. Wants MFi hardware auth, Python cannot do it, speaker refuses
   the audio port. Filter with `looks_like_sonos()`.
+- Caster uses RAOP and has no pairing flow. Discovery must show only a
+  `Protocol.RAOP` service whose pairing requirement is `NotNeeded`; an
+  AirPlay-only service or one requiring pairing is guaranteed to fail.
+- Multi-room AirPlay owns one runner, RAOP connection and (if needed) ffmpeg
+  process per device label. Never use a shared cleanup handle: when one room
+  ends it must not close another room or kill its audio pipe; Stop cancels all
+  runners and close waits for all of them.
 - Sonos transport commands only to the group coordinator. Members reject them.
 - SoCo default REQUEST_TIMEOUT 20 s. Set to 4.0. One asleep speaker stalls everything.
 - Don't use SoCo `play_uri` — tags the stream as TuneIn radio, Sonos then hides its tone
@@ -143,6 +156,12 @@ Sonos and AirPlay always get wav — RAOP carries no video, Sonos is speakers.
 wav + `pcm_is_directly_usable()` = no ffmpeg in the path at all. Lowest latency route.
 AudioTap = one WASAPI loopback, many subscribers, bounded queue, drop oldest chunk. Never
 let a queue build a backlog — backlog is heard as lag.
+
+`cast_file()` must route each receiver explicitly. Chromecast and UPnP probe
+the FileServer URL; Sonos and Roku need the served MIME and title; Kodi gets
+its own play call; only an AirPlay device uses `_play_airplay`. Do not let all
+other kinds fall through to AirPlay. A standalone MusicCast zone is a
+control-only follower, so explain that a transport device must be selected.
 
 Mixed selection (Cast + DLNA) = one ScreenSource per container, two encoders.
 
@@ -277,7 +296,7 @@ the listener has already heard. It is heard as the stream jumping backwards a
 few seconds, over and over. `-seekable 0` before `-i` stops the Range request.
 Set on BOTH the relay and the RAOP pipe, and only for http(s).
 
-Measured on live.iptvcanada.tv over 90s:
+Measured on a live IPTV source over 90s:
 
 - as shipped: 1.88x of real time produced, 8 byte-offset resumes, 7 corrupt
   packets
@@ -306,7 +325,7 @@ a long-GOP channel look broken.
 
 The 22-second start once measured on a long-GOP channel was NOT the GOP: it
 was the byte-offset reconnects tearing the stream up so badly that segments
-crawled out. With `-seekable 0` the same channel primes in 0.7s and iptvcanada
+crawled out. With `-seekable 0` the same channel primes in 0.7s and another source
 in 2.8s. Do not reintroduce a "long GOP means slow start" rule of thumb; it
 was a symptom of the reconnect bug, not a property of the source.
 
@@ -324,6 +343,12 @@ looks rejected while it is in fact starting. `_await_playing` takes the
 media_session_id from before `play_media` and ignores anything still carrying
 it. Do not treat INTERRUPTED or CANCELLED as a rejection.
 
+The Cast recovery watchdog runs from a wx timer. `media_controller.status` can
+be absent or raise during a transient socket loss; treat that tick as
+inconclusive and let the next one retry. Never let a status read escape the
+timer callback, or recovery stops after the very disconnect it is meant to
+handle.
+
 ## HLS restart continuity (2026-09-05)
 
 With ffmpeg `append_list`, `-start_number` must be the existing playlist's
@@ -338,7 +363,36 @@ and retain EXT-X-DISCONTINUITY-SEQUENCE as seams leave the served window;
 otherwise still-buffered segments change timeline IDs. Serialize playlist
 rewrites because HTTP requests can overlap.
 
+Chromecast may issue a `HEAD` playlist probe on the same HTTP/1.1 connection
+it subsequently uses for `GET`. HEAD must return the same headers (including
+Content-Length) but absolutely no body; leaking playlist bytes into that
+connection corrupts the next response parser and can look like a random TV
+stall.
+
 ## Diagnostics
+
+Never put real stream URLs or their credentials in source code, tests, or
+agent notes. Use example.invalid fixtures and runtime arguments for live
+checks. Diagnostic traces must not record stream URLs.
+
+For numeric IPTV channel URLs, a verified sibling `.m3u8` can avoid the raw
+TS server replaying its buffer after reconnection. `_native_hls_url` checks
+the actual live playlist body, not its suffix or Content-Type. Chromecast
+prefers this feed and falls back to the TS relay if loading it fails. Tested
+on RB Room (Cast), now at 192.168.1.76, on 2026-09-05: one provider's native
+HLS played for three minutes without a session restart after the user heard
+a skip-back on the TS relay. A steadily advancing Cast playback clock does
+NOT prove the content did not repeat. Another provider's tested `.m3u8` endpoints
+returned binary media, not playlists; do not assume the same HLS path works
+there just because changing the extension returns HTTP 200.
+
+Live Chromecast URL recovery must not depend on `_sources`: that list is
+populated for capture, not ordinary URL playback. `_cast_live_loads` retains
+successful live loads per receiver so the watchdog can reload the existing
+relay after IDLE, without starting another source connection. Clear those
+loads on Stop, and check their identity after receiver launch before reloading.
+The 2026-09-05 channel probe observed five encoder restarts in about 98 seconds;
+relay survival alone does not establish uninterrupted receiver playback.
 
 `trace(event, detail)` in caster.py writes a timestamped timeline to whatever
 `CASTER_TRACE` names, and is a no-op otherwise. It is what found the two bugs

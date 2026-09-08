@@ -12,14 +12,230 @@ their terminal state within a couple of poll intervals.
 """
 from __future__ import annotations
 
+import functools
+import http.client
+import http.server
+import io
 import os
+import threading
 import time
 import types
 
 import pytest
 
 import caster
-from caster import Device, HlsRelay, MainFrame, probe_media
+from caster import Device, HlsFileHandler, HlsRelay, MainFrame, probe_media
+
+
+LIVE_HLS = b'#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n'
+
+
+def test_native_hls_checks_body_and_preserves_query(monkeypatch):
+    requested = []
+    def open_playlist(req, timeout):
+        requested.append((req.full_url, timeout))
+        return io.BytesIO(LIVE_HLS)
+    monkeypatch.setattr(caster.urllib.request, 'urlopen', open_playlist)
+    source = 'https://example.invalid/live/user/password/123.ts?token=value'
+    expected = source.replace('.ts?', '.m3u8?')
+    assert caster._native_hls_url(source) == expected
+    assert requested == [(expected, 5)]
+
+
+@pytest.mark.parametrize('body', [b'<html>Not found</html>', b'#EXTM3U\n',
+                                LIVE_HLS + b'#EXT-X-ENDLIST\n', b'x' * 65537],
+                         ids=['html', 'empty', 'vod', 'oversized'])
+def test_native_hls_rejects_non_live_or_invalid_responses(monkeypatch, body):
+    monkeypatch.setattr(caster.urllib.request, 'urlopen',
+                        lambda *a, **kw: io.BytesIO(body))
+    assert caster._native_hls_url('http://example.invalid/u/p/123.ts') is None
+
+
+def test_native_hls_network_failure_keeps_ts_fallback(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise TimeoutError('source unavailable')
+    monkeypatch.setattr(caster.urllib.request, 'urlopen', unavailable)
+    assert caster._native_hls_url('http://example.invalid/u/p/123.ts') is None
+
+
+@pytest.mark.parametrize('url', ['C:/recording.ts', 'http://example.invalid/123.ts',
+                               'http://example.invalid/u/p/123.mp4',
+                               'http://example.invalid/u/p/segment.ts'])
+def test_native_hls_does_not_probe_unrelated_urls(monkeypatch, url):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('unexpected network request')
+    monkeypatch.setattr(caster.urllib.request, 'urlopen', unexpected)
+    assert caster._native_hls_url(url) is None
+
+
+@pytest.mark.parametrize('reject_native', [False, True])
+def test_cast_prefers_native_hls_with_receiver_fallback(frame, monkeypatch, reject_native):
+    loaded = []
+    kept = []
+    source = 'http://example.invalid/u/p/123.ts'
+    native = source[:-3] + '.m3u8'
+    mc = types.SimpleNamespace(
+        status=types.SimpleNamespace(media_session_id=1),
+        play_media=lambda url, mime, **kw: loaded.append(url),
+        block_until_active=lambda timeout: None)
+    cast = types.SimpleNamespace(media_controller=mc, app_id=frame.CAST_APP_ID,
+                                 status=types.SimpleNamespace(volume_level=None),
+                                 wait=lambda timeout: None)
+    monkeypatch.setattr(caster.pychromecast, 'Chromecast', lambda *a, **kw: cast)
+    monkeypatch.setattr(caster, '_native_hls_url', lambda url: native)
+    monkeypatch.setattr(caster, 'probe_media',
+                        lambda url: {'mime': 'video/mp2t', 'is_live': True})
+    monkeypatch.setattr(caster.threading, 'Thread', lambda target, args=(), **kw:
+                        types.SimpleNamespace(start=lambda: target(*args),
+                                              join=lambda **kw: None))
+    frame._cast_zeroconf = lambda: None
+    frame._ensure_receiver = lambda cast: None
+    results = iter([False, True] if reject_native else [True])
+    frame._await_playing = lambda *args: next(results)
+    frame._ui = lambda *a, **kw: None
+    frame.set_status = lambda *a, **kw: None
+    relay = types.SimpleNamespace(start=lambda: 'http://relay/live.m3u8')
+    frame._make_relay = lambda *a, **kw: relay
+    frame._keep_relay = kept.append
+    frame._stop_relay = lambda *a: None
+    dev = Device('chromecast', 'TV', {'host': '192.0.2.1', 'uuid': '0' * 32})
+    frame._play_chromecast(dev, source)
+    assert loaded == ([native, 'http://relay/live.m3u8'] if reject_native else [native])
+    assert kept == ([relay] if reject_native else [])
+    assert frame._cast_live_loads[dev.label][1] == loaded[-1]
+
+
+@pytest.mark.parametrize('state,expected', [('IDLE', 1), ('PLAYING', 0), ('BUFFERING', 0)])
+def test_live_url_recovers_without_capture_sources(frame, monkeypatch, state, expected):
+    calls = []
+    mc = types.SimpleNamespace(
+        status=types.SimpleNamespace(player_state=state, media_session_id=7),
+        play_media=lambda *args, **kw: calls.append((args, kw)),
+        block_until_active=lambda timeout: None)
+    cast = types.SimpleNamespace(media_controller=mc)
+    frame._cast_live_loads['TV'] = (cast, 'http://relay/live.m3u8', 'application/vnd.apple.mpegurl', 'LIVE')
+    frame._ensure_receiver = lambda cast: None
+    frame._await_playing = lambda mc, before: True
+    frame._ui = lambda *args, **kw: None
+    monkeypatch.setattr(caster.threading, 'Thread',
+                        lambda target, **kw: types.SimpleNamespace(start=target))
+    frame._check_reconnect()
+    assert len(calls) == expected
+    if calls:
+        assert calls[0][0][0] == 'http://relay/live.m3u8'
+    assert not frame._cast_recovering
+
+
+def test_live_url_recovery_does_not_reload_after_stop(frame, monkeypatch):
+    calls = []
+    mc = types.SimpleNamespace(status=types.SimpleNamespace(player_state='IDLE'),
+                               play_media=lambda *args, **kw: calls.append(args))
+    cast = types.SimpleNamespace(media_controller=mc)
+    frame._cast_live_loads['TV'] = (cast, 'http://relay/live.m3u8', 'application/vnd.apple.mpegurl', 'LIVE')
+    frame._ensure_receiver = lambda cast: frame._cast_live_loads.clear()
+    monkeypatch.setattr(caster.threading, 'Thread',
+                        lambda target, **kw: types.SimpleNamespace(start=target))
+    frame._recover_live_casts()
+    assert not calls
+    assert not frame._cast_recovering
+
+
+def test_live_url_recovery_tolerates_a_missing_receiver_status(frame):
+    """A transient Cast disconnect must not crash the watchdog timer."""
+    mc = types.SimpleNamespace(status=None)
+    cast = types.SimpleNamespace(media_controller=mc)
+    frame._cast_live_loads['TV'] = (
+        cast, 'http://relay/live.m3u8', 'application/vnd.apple.mpegurl', 'LIVE')
+    frame._recover_live_casts()
+    assert not frame._cast_recovering
+
+
+@pytest.mark.parametrize("kind,key,expected", [
+    ("sonos", {"ip": "192.0.2.10"}, "sonos"),
+    ("roku", {"base": "http://192.0.2.11:8060"}, "roku"),
+    ("kodi", {"base": "http://192.0.2.12:8080"}, "kodi"),
+])
+def test_cast_file_uses_the_selected_receiver_protocol(
+        frame, monkeypatch, kind, key, expected):
+    """A local file must not fall through to AirPlay for every non-TV."""
+    dev = Device(kind, "Receiver", key)
+    calls = []
+    server = types.SimpleNamespace(
+        start=lambda: "http://192.0.2.1:9000/movie.mp4", mime="video/mp4")
+    monkeypatch.setattr(caster, "FileServer", lambda path: server)
+    frame.selected_device = lambda: dev
+    frame.stop_silent = lambda: None
+    frame.set_status = lambda *args, **kwargs: None
+    frame._play_sonos = lambda *args: calls.append("sonos")
+    frame._play_roku = lambda *args: calls.append("roku")
+    frame._play_kodi = lambda *args: calls.append("kodi")
+    frame._play_airplay = lambda *args: calls.append("airplay")
+    frame.cast_file("C:/media/movie.mp4")
+    assert calls == [expected]
+
+
+def test_cast_file_explains_that_a_musiccast_zone_is_not_a_transport(
+        frame, monkeypatch):
+    dev = Device("musiccast", "Zone 2", {"host": "192.0.2.65"})
+    messages = []
+    server = types.SimpleNamespace(start=lambda: "http://192.0.2.1:9000/a.wav",
+                                   mime="audio/wav")
+    monkeypatch.setattr(caster, "FileServer", lambda path: server)
+    frame.selected_device = lambda: dev
+    frame.stop_silent = lambda: None
+    frame.set_status = lambda message, *args, **kwargs: messages.append(message)
+    frame.cast_file("C:/media/a.wav")
+    assert messages[-1] == "Select a playback device; a MusicCast zone follows it."
+
+
+def test_airplay_discovery_only_lists_unpaired_raop_receivers(frame, monkeypatch):
+    """An AirPlay-only or pairing-required device cannot play RAOP audio."""
+    def service(protocol, pairing):
+        return types.SimpleNamespace(protocol=protocol, pairing=pairing)
+    usable = types.SimpleNamespace(
+        name="R&B Room",
+        services=[service(caster.Protocol.RAOP,
+                          caster.PairingRequirement.NotNeeded)],
+        device_info="")
+    pairing_required = types.SimpleNamespace(
+        name="Living Room",
+        services=[service(caster.Protocol.RAOP,
+                          caster.PairingRequirement.Mandatory)],
+        device_info="")
+    airplay_only = types.SimpleNamespace(
+        name="Samsung",
+        services=[service(caster.Protocol.AirPlay,
+                          caster.PairingRequirement.Mandatory)],
+        device_info="")
+    result = types.SimpleNamespace(
+        result=lambda timeout: [usable, pairing_required, airplay_only])
+    monkeypatch.setattr(caster.pyatv, "scan", lambda *args, **kwargs: object())
+    monkeypatch.setattr(caster.asyncio, "run_coroutine_threadsafe",
+                        lambda *args, **kwargs: result)
+    frame.loop_thread = types.SimpleNamespace(loop=object())
+    found = frame._scan_airplay()
+    assert list(found) == ["R&B Room"]
+    assert found["R&B Room"].key is usable
+
+
+def test_airplay_runner_only_kills_its_own_ffmpeg_process(frame):
+    """One AirPlay room ending must not silence another room's stream."""
+    class Proc:
+        returncode = None
+
+        def __init__(self):
+            self.kills = 0
+
+        def kill(self):
+            self.kills += 1
+
+    first, second = Proc(), Proc()
+    frame._air_ffmpeg_procs = {"First (AirPlay)": first,
+                               "Second (AirPlay)": second}
+    MainFrame._kill_ffmpeg(frame, "First (AirPlay)")
+    assert first.kills == 1
+    assert second.kills == 0
+    assert frame._air_ffmpeg_procs == {"Second (AirPlay)": second}
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +530,34 @@ def test_trailing_playlist_returns_none_after_stop(relay):
     """
     relay.root = None
     assert relay.trailing_playlist() is None
+
+
+def test_hls_head_has_playlist_headers_but_no_body(relay):
+    """A Chromecast HEAD probe must not poison its kept-alive connection."""
+    expected = _serve(relay, _playlist(7, 7, 4)).encode("utf-8")
+    handler = functools.partial(HlsFileHandler, directory=relay.root)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.relay = relay
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        connection.request("HEAD", "/live.m3u8")
+        head = connection.getresponse()
+        assert head.status == 200
+        assert int(head.getheader("Content-Length")) == len(expected)
+        assert head.read() == b""
+        # This reuses the connection. Any body incorrectly written for HEAD
+        # becomes invalid response bytes before this GET status line.
+        connection.request("GET", "/live.m3u8")
+        get = connection.getresponse()
+        assert get.status == 200
+        assert get.read() == expected
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 # --------------------------------------------------------------------------
@@ -793,7 +1037,7 @@ def _segments(root, count: int, dur: float = 2.5) -> None:
         with open(os.path.join(root, f"seg{n:05d}.ts"), "wb"):
             pass
     lines = ["#EXTM3U", "#EXT-X-VERSION:3",
-             f"#EXT-X-MEDIA-SEQUENCE:0"]
+             "#EXT-X-MEDIA-SEQUENCE:0"]
     for n in range(count):
         lines += [f"#EXTINF:{dur},", f"seg{n:05d}.ts"]
     with open(os.path.join(root, "live.m3u8"), "w",
@@ -812,7 +1056,7 @@ def _live_relay(relay):
 def test_underfeed_rotation_kills_a_starved_encoder(relay):
     """Two consecutive under-fed windows rotate to a fresh connection.
 
-    The gohyperspeed cap measured 0.44 media-seconds per wall-second: a
+    One provider's cap measured 0.44 media-seconds per wall-second: a
     20s window that should yield eight 2.5s segments yields three or four.
     The relay must kill the encoder so the supervisor restarts it, because
     ffmpeg itself never notices -- the connection stays up, just slow.

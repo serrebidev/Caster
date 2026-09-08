@@ -74,7 +74,11 @@ def frame():
     obj.cast = None
     obj.atv = None
     obj._casts = {}
+    obj._cast_live_loads = {}
+    obj._cast_recovering = set()
     obj._atvs = {}
+    obj._air_runner_futs = []
+    obj._air_ffmpeg_procs = {}
     obj._relay = None
     obj._cast_zc = None
     return obj

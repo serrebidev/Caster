@@ -30,6 +30,7 @@ import time
 import traceback
 import urllib.request
 import urllib.error
+import urllib.parse
 import uuid as uuidlib
 from typing import Any, Optional
 
@@ -38,7 +39,7 @@ import wx
 import pychromecast
 import pyatv
 import zeroconf
-from pyatv.const import Protocol
+from pyatv.const import PairingRequirement, Protocol
 from pychromecast.const import CAST_TYPE_CHROMECAST
 from pychromecast.controllers.youtube import YouTubeController
 from pychromecast.models import CastInfo, HostServiceInfo
@@ -186,6 +187,39 @@ def _looks_like_mpegts(head: bytes) -> bool:
     if len(head) >= 189 and head[188:189] == b"\x47":
         return True                     # 188-byte packets
     return len(head) >= 193 and head[192:193] == b"\x47"   # M2TS
+
+
+def _native_hls_url(url: str) -> Optional[str]:
+    """Validate a live IPTV portal's sibling HLS feed before remuxing TS.
+
+    Some portals replay buffered TS whenever a connection is reopened. Their
+    HLS endpoint supplies stable sequence numbers instead. Only try the
+    numeric channel URL convention, and keep the TS fallback for everything
+    that does not return an actual live media playlist.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    if not re.fullmatch(r"/(?:live/)?[^/]+/[^/]+/\d+\.ts", parts.path,
+                        flags=re.IGNORECASE):
+        return None
+    candidate = urllib.parse.urlunsplit(parts._replace(path=parts.path[:-3] + ".m3u8"))
+    try:
+        req = urllib.request.Request(candidate, headers={"User-Agent": "caster/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = response.read(65537)
+        if len(body) > 65536:
+            return None
+        lines = body.decode("utf-8-sig").splitlines()
+        if (lines and lines[0] == "#EXTM3U"
+                and any(line.startswith("#EXT-X-TARGETDURATION:") for line in lines)
+                and any(line.startswith("#EXTINF:") for line in lines)
+                and any(line and not line.startswith("#") for line in lines)
+                and "#EXT-X-ENDLIST" not in lines):
+            return candidate
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return None
 
 
 def probe_media(url: str) -> dict:
@@ -396,7 +430,7 @@ class HlsRelay:
 
     #: Sustained under-feed detection. Some IPTV CDNs cap a connection's
     #: throughput by age: it opens at full rate and decays (measured at 0.44x
-    #: sustained on gohyperspeed, 2026-09-05). A slow encoder does not drop --
+    #: sustained on one live provider, 2026-09-05). A slow encoder does not drop --
     #: it just produces slower than real time, the relay's trail drains, and
     #: the receiver stalls with nothing on this side noticing. The cure is a
     #: fresh connection, which opens hot again: kill the starved encoder and
@@ -631,7 +665,7 @@ class HlsRelay:
         if not seg_dur or seg_dur <= 0:
             return
         # Media produced per wall-second. A live encoder keeping up scores
-        # ~1.0; the gohyperspeed cap measured 0.44.
+        # ~1.0; one provider's cap measured 0.44.
         ratio = (newest - n0) * seg_dur / span
         if ratio >= self.ROTATE_RATIO:
             self._fail_streak = 0
@@ -963,29 +997,48 @@ class HlsFileHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
+    def _serve_playlist(self, send_body: bool) -> bool:
+        """Serve the relay's current playlist for GET or HEAD.
+
+        Chromecast's media stack can probe a playlist with HEAD before it
+        starts its normal GET/poll loop.  A HEAD response has to carry the
+        same headers as GET but *no body*: writing playlist bytes there puts
+        unexpected bytes into the persistent HTTP/1.1 connection, so the
+        next parser can mistake them for the beginning of another response.
+        """
+        path_only = self.path.split("?")[0]
+        if not path_only.rstrip("/").endswith("live.m3u8") or self.server is None:
+            return False
+        relay = getattr(self.server, "relay", None)
+        if relay is None:
+            return False
+        data = relay.trailing_playlist()
+        if data is None:
+            return False
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(data)
+        return True
+
     def do_GET(self):
         HlsFileHandler.relay_requests.append(
             (time.strftime("%H:%M:%S"), self.path, self.client_address[0]))
         # Playlist requests get the trailing-edge view (see HlsRelay).
         # Strip query string: a receiver appending ?_=N must still match.
-        path_only = self.path.split("?")[0]
-        if path_only.rstrip("/").endswith("live.m3u8") and self.server is not None:
-            relay = getattr(self.server, "relay", None)
-            if relay is not None:
-                data = relay.trailing_playlist()
-                if data is not None:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
+        if self._serve_playlist(send_body=True):
+            return
         return super().do_GET()
 
     def do_HEAD(self):
-        # HEAD must match what GET returns, otherwise the playlist body
-        # and the Content-Length disagree on the trailing-edge view.
-        HlsFileHandler.do_GET(self)
+        # HEAD has the same representation headers as GET, but RFC 9110
+        # forbids a response body.  In particular, do not delegate to
+        # do_GET(): this handler deliberately uses persistent connections.
+        if self._serve_playlist(send_body=False):
+            return
+        return super().do_HEAD()
 
     def log_message(self, format, *args):
         pass  # keep console quiet
@@ -1099,11 +1152,18 @@ class MainFrame(wx.Frame):
         self.atv = None  # pyatv AppleTV
         #: Per-device tracking for multi-room: stop() needs every connection.
         self._casts: dict[str, pychromecast.Chromecast] = {}
+        self._cast_live_loads = {}
+        self._cast_recovering = set()
         self._atvs: dict[str, object] = {}
         self.stream_task: Optional[asyncio.Task] = None
         self._runner_fut: Optional[concurrent.futures.Future] = None
+        #: One runner per selected AirPlay receiver.  ``_runner_fut`` remains
+        #: the primary transport-control runner, but Stop must cancel every
+        #: RAOP session in a multi-room selection.
+        self._air_runner_futs: list[concurrent.futures.Future] = []
         self._stop_flag = True
         self._ffmpeg_proc = None
+        self._air_ffmpeg_procs: dict[str, object] = {}
         #: Relays currently running. There is more than one whenever a TS
         #: url goes to more than one receiver, and every one owns an ffmpeg
         #: and an HTTP server that has to be stopped.
@@ -1512,6 +1572,15 @@ class MainFrame(wx.Frame):
         )
         for cfg in futs.result(DISCOVER_SECONDS + 15):
             if not cfg.name:
+                continue
+            # This app sends audio through RAOP and has no pairing flow.  An
+            # AirPlay-only advertisement, or a RAOP service requiring pairing,
+            # cannot receive anything Caster can send.  Showing it anyway
+            # produces an inevitable, unexplained connection failure.
+            raop = next((service for service in cfg.services
+                         if service.protocol == Protocol.RAOP), None)
+            if (raop is None
+                    or raop.pairing != PairingRequirement.NotNeeded):
                 continue
             # Sonos advertises AirPlay 2, and streaming to it that way
             # fails: it demands MFi hardware authentication no Python
@@ -1973,7 +2042,7 @@ class MainFrame(wx.Frame):
         devices = self._group_musiccast(self._group_sonos(devices))
         self._targets = list(devices)
 
-        trace("play", f"{[d.label for d in devices]} {url[:60]}")
+        trace("play", str([d.label for d in devices]))
 
         def start() -> None:
             # Waking a receiver and aiming its input is several HTTP round
@@ -2313,7 +2382,14 @@ class MainFrame(wx.Frame):
                               f"{time.monotonic()-_t:.2f}s {probe['mime']} "
                               f"live={probe['is_live']}")
                     load_mime = probe["mime"]
-                    if probe["mime"] == "video/mp2t" and not url.lower().split("?")[0].endswith(".m3u8"):
+                    native_url = (_native_hls_url(url)
+                                  if probe["mime"] == "video/mp2t" and probe["is_live"]
+                                  else None)
+                    if native_url:
+                        play_url = native_url
+                        load_mime = "application/vnd.apple.mpegurl"
+                        trace("cast.native_hls", "validated live playlist")
+                    elif probe["mime"] == "video/mp2t" and not url.lower().split("?")[0].endswith(".m3u8"):
                         # Cast receivers reject raw MPEG-TS; remux via the
                         # local relay (runs only while playing).
                         self._ui(self.set_status, "Relay starting...",
@@ -2352,6 +2428,17 @@ class MainFrame(wx.Frame):
                                        f"prev_session={before}")
                     settled = self._await_playing(mc, before)
                     trace("cast.settled", str(settled))
+                    if not settled and native_url and not self._stop_flag:
+                        # A valid provider playlist can still be incompatible
+                        # with this receiver. Retain the original TS route.
+                        trace("cast.native_hls.fallback", "receiver did not start")
+                        relay = self._make_relay(url, live=True)
+                        self._keep_relay(relay)
+                        play_url = relay.start()
+                        before = getattr(mc.status, "media_session_id", None)
+                        mc.play_media(play_url, load_mime, stream_type=stream_type)
+                        mc.block_until_active(15)
+                        settled = self._await_playing(mc, before)
                     if not settled:
                         # Load rejected; flip stream type and retry once.
                         stream_type = ("BUFFERED" if stream_type == "LIVE"
@@ -2363,6 +2450,10 @@ class MainFrame(wx.Frame):
                         trace("cast.retry", stream_type)
                         settled = self._await_playing(mc, before)
                     if settled:
+                        if (probe["is_live"] and not self._stop_flag
+                                and self._casts.get(dev.label) is cast):
+                            self._cast_live_loads[dev.label] = (
+                                cast, play_url, load_mime, stream_type)
                         kind = "live" if stream_type == "LIVE" else "file"
                         self._ui(self.set_status,
                                  f"Playing {kind} on {dev.name}.")
@@ -2404,6 +2495,8 @@ class MainFrame(wx.Frame):
 
         async def runner() -> None:
             cancelled = False
+            atv = None
+            stream_task = None
             wake = asyncio.Event()
             shutdown = asyncio.Event()
             self._air_wake = wake
@@ -2427,7 +2520,7 @@ class MainFrame(wx.Frame):
                 atv = await pyatv.connect(dev.key, self.loop_thread.loop,
                                           protocol=Protocol.RAOP)
                 self.atv = atv
-                self._atvs[dev.name] = atv
+                self._atvs[dev.label] = atv
                 if shutdown.is_set():
                     raise asyncio.CancelledError()
 
@@ -2436,31 +2529,38 @@ class MainFrame(wx.Frame):
                 # sets `wake` and the loop reopens the source (with seek).
                 while not shutdown.is_set():
                     stream = (source.open_wav_reader() if source is not None
-                              else await self._raop_source(url, vid))
+                              else await self._raop_source(url, vid, dev.label))
                     if self._air_play_t0 is None:
                         self._air_play_t0 = time.monotonic()
                     self._air_state = "playing"
                     wake.clear()
                     trace("air.stream.start", dev.name)
                     self._ui(self.set_status, f"Streaming to {dev.name}...")
-                    self.stream_task = asyncio.create_task(
+                    stream_task = asyncio.create_task(
                         atv.stream.stream_file(stream)
                     )
+                    # Transport controls address the current primary session;
+                    # each runner keeps its own task so another AirPlay room
+                    # cannot cancel or await the wrong stream.
+                    if self.atv is atv:
+                        self.stream_task = stream_task
                     stop_wait = asyncio.create_task(shutdown.wait())
                     wake_wait = asyncio.create_task(wake.wait())
                     try:
                         done, pending = await asyncio.wait(
-                            [self.stream_task, stop_wait, wake_wait],
+                            [stream_task, stop_wait, wake_wait],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         # Stop the stream task unless it already finished.
-                        if not self.stream_task.done():
-                            self.stream_task.cancel()
+                        if not stream_task.done():
+                            stream_task.cancel()
                         try:
-                            await self.stream_task
+                            await stream_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                        self.stream_task = None
+                        if self.stream_task is stream_task:
+                            self.stream_task = None
+                        stream_task = None
                         if shutdown.is_set():
                             break
                         if wake.is_set():
@@ -2490,39 +2590,46 @@ class MainFrame(wx.Frame):
                     finally:
                         stop_wait.cancel()
                         wake_wait.cancel()
-                        self._kill_ffmpeg()
+                        self._kill_ffmpeg(dev.label)
             except asyncio.CancelledError:
                 cancelled = True
             except Exception as exc:
                 message = f"AirPlay error: {exc}"
                 self._ui(self.set_status, message)
             finally:
-                st = self.stream_task
-                self.stream_task = None
+                st, stream_task = stream_task, None
                 if st and not st.done():
                     st.cancel()
                     try:
                         await st
                     except (asyncio.CancelledError, Exception):
                         pass
-                self._kill_ffmpeg()
-                atv_local = self.atv
-                self.atv = None
-                if atv_local:
+                if self.stream_task is st:
+                    self.stream_task = None
+                self._kill_ffmpeg(dev.label)
+                if atv:
                     try:
-                        await asyncio.gather(*atv_local.close())
+                        await asyncio.gather(*atv.close())
                     except Exception:
                         pass
-                self._air_state = "stopped"
-                self._air_wake = None
-                self._air_shutdown = None
+                if self._atvs.get(dev.label) is atv:
+                    self._atvs.pop(dev.label, None)
+                if self.atv is atv:
+                    self.atv = None
+                    self._air_state = "stopped"
+                    self._air_wake = None
+                    self._air_shutdown = None
                 if cancelled:
                     self._ui(lambda: self.set_status("Stopped."))
 
+        self._air_runner_futs = [fut for fut in self._air_runner_futs
+                                 if not fut.done()]
         self._runner_fut = self.loop_thread.submit(runner())
+        self._air_runner_futs.append(self._runner_fut)
         self.set_status(f"Starting to {dev.name}...")
 
-    async def _raop_source(self, url: str, vid: Optional[str]):
+    async def _raop_source(self, url: str, vid: Optional[str],
+                           owner: Optional[str] = None):
         """Open an audio source for RAOP at the current seek position.
 
         Audio URLs stream directly (RAOP decodes them). Everything else
@@ -2561,7 +2668,7 @@ class MainFrame(wx.Frame):
 
         # Video (IPTV TS channel or provider VOD): ffmpeg audio pipe.
         self._ui(self.set_status, "Extracting audio...")
-        trace("air.ffmpeg.spawn", url[:70])
+        trace("air.ffmpeg.spawn")
         ffmpeg = _find_ffmpeg()
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
         # Survive IPTV source drops/jitter instead of feeding silence.
@@ -2612,7 +2719,10 @@ class MainFrame(wx.Frame):
             stdin=asyncio.subprocess.DEVNULL,
             **_no_window_kwargs(),
         )
-        self._ffmpeg_proc = proc
+        if owner is None:
+            self._ffmpeg_proc = proc
+        else:
+            self._air_ffmpeg_procs[owner] = proc
         if self._pending_seek:
             self._air_pos = self._pending_seek
             self._pending_seek = None
@@ -2846,8 +2956,18 @@ class MainFrame(wx.Frame):
             self._play_chromecast(dev, url)
         elif dev.kind == "upnp":
             self._play_upnp(dev, url)
-        else:
+        elif dev.kind == "sonos":
+            self._play_sonos(dev, url, server.mime, name)
+        elif dev.kind == "roku":
+            self._play_roku(dev, url, server.mime, name)
+        elif dev.kind == "kodi":
+            self._play_kodi(dev, url)
+        elif dev.kind == "airplay":
             self._play_airplay(dev, url)
+        else:
+            # MusicCast zones are control-only followers, not transports.
+            self.set_status(
+                "Select a playback device; a MusicCast zone follows it.")
 
     # ---- teardown ----
 
@@ -2857,11 +2977,11 @@ class MainFrame(wx.Frame):
         task = self.stream_task
         if task and not task.done():
             self.loop_thread.submit(self._cancel_stream(task))
-        rf = self._runner_fut
-        if rf and not rf.done():
-            # Runner may still be connecting; cancel it there too.
-            rf.cancel()
-        self._runner_fut = None
+        for rf in self._air_runner_futs:
+            if not rf.done():
+                # A runner may still be connecting.  Cancel every selected
+                # receiver, not only the last one whose future was recorded.
+                rf.cancel()
         self._kill_ffmpeg()
         self._stop_relay()
         for src in self._sources:
@@ -2897,6 +3017,7 @@ class MainFrame(wx.Frame):
         # Disconnect every Chromecast, not just the most recent one.
         # Multi-room casts create several, and self.cast only holds one.
         casts, self._casts = dict(self._casts), {}
+        self._cast_live_loads = {}
         for cast in casts.values():
             try:
                 cast.stop_app()
@@ -2928,9 +3049,12 @@ class MainFrame(wx.Frame):
         except (asyncio.CancelledError, Exception):
             pass
 
-    def _kill_ffmpeg(self) -> None:
-        proc = self._ffmpeg_proc
-        self._ffmpeg_proc = None
+    def _kill_ffmpeg(self, owner: Optional[str] = None) -> None:
+        if owner is None:
+            proc = self._ffmpeg_proc
+            self._ffmpeg_proc = None
+        else:
+            proc = self._air_ffmpeg_procs.pop(owner, None)
         if proc and proc.returncode is None:
             try:
                 proc.kill()
@@ -3326,19 +3450,65 @@ class MainFrame(wx.Frame):
         that goes away simply closes the connection and there is nothing
         left to ask.
         """
-        if self._stop_flag or not self._sources or not self._targets:
+        if self._stop_flag:
+            return
+        self._recover_live_casts()
+        if not self._sources or not self._targets:
             return
         source = self._sources[0]
         if self.cast:
             try:
                 if (self.cast.media_controller.status.player_state == "IDLE"
-                        and self.current):
+                        and self.current
+                        and self.current.label not in self._cast_live_loads):
                     self.set_status("Receiver dropped; reconnecting...")
                     self._dispatch(self.current, source.url, source.mime, True)
                     return
             except Exception:
                 pass
         self._check_sonos_resync(source)
+
+    def _recover_live_casts(self) -> None:
+        """Reload an ended live URL using its existing relay and connection."""
+        for label, load in list(self._cast_live_loads.items()):
+            cast, url, mime, stream_type = load
+            if label in self._cast_recovering:
+                continue
+            try:
+                status = cast.media_controller.status
+                if status is None or status.player_state != "IDLE":
+                    continue
+            except Exception as exc:
+                # Status arrives asynchronously.  A socket that is briefly
+                # unavailable must not let this wx timer callback escape --
+                # the next watchdog tick can still recover the same load.
+                trace("cast.recover.status_failed", type(exc).__name__)
+                continue
+            self._cast_recovering.add(label)
+
+            def recover(label=label, load=load):
+                cast, url, mime, stream_type = load
+                try:
+                    self._ensure_receiver(cast)
+                    if (self._stop_flag
+                            or self._cast_live_loads.get(label) is not load):
+                        return
+                    mc = cast.media_controller
+                    before = getattr(mc.status, "media_session_id", None)
+                    trace("cast.recover", label)
+                    mc.play_media(url, mime, stream_type=stream_type)
+                    mc.block_until_active(15)
+                    if (self._await_playing(mc, before)
+                            and not self._stop_flag
+                            and self._cast_live_loads.get(label) is load):
+                        self._ui(self.set_status, f"Reconnected to {label}.")
+                except Exception as exc:
+                    trace("cast.recover.failed", type(exc).__name__)
+                finally:
+                    self._cast_recovering.discard(label)
+
+            threading.Thread(target=recover, daemon=True,
+                             name="cast-recover").start()
 
     def _check_sonos_resync(self, source) -> None:
         """Periodically hand Sonos a fresh connection.
@@ -3391,14 +3561,14 @@ class MainFrame(wx.Frame):
             pass
         try:
             self.stop_silent()
-            fut = self._runner_fut
-            if fut and not fut.done():
-                try:
-                    # Wait for the runner to cancel the stream and close the
-                    # device so nothing is torn down midway.
-                    fut.result(timeout=8)
-                except Exception:
-                    pass
+            for fut in self._air_runner_futs:
+                if fut and not fut.done():
+                    try:
+                        # Wait for every runner to cancel its stream and
+                        # close its own receiver before the loop stops.
+                        fut.result(timeout=8)
+                    except Exception:
+                        pass
         finally:
             zc, self._cast_zc = self._cast_zc, None
             if zc:

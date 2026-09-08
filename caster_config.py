@@ -239,7 +239,7 @@ class Settings:
 #:
 #: And it must not go ABOVE it either. With -c copy ffmpeg can only cut a
 #: segment at a keyframe, so a segment is as long as the source GOP however
-#: short hls_time is: gohyperspeed emits one every 7.5s, so priming six of
+#: short hls_time is: one source emits one every 7.5s, so priming six of
 #: them is a 45-second wait, not a six-second one. Three segments satisfy the
 #: receiver whatever their length; asking for more only makes a long-GOP
 #: channel look broken.
