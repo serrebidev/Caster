@@ -334,6 +334,49 @@ supervisor's restart count, EXT-X-MEDIA-SEQUENCE monotonicity, segment names,
 and hashing PCM blocks for repeats (a repeat offset by one sample hashes
 differently -- that test is useless).
 
+## Measure the receiver, not just the relay
+
+A healthy relay proves nothing. A receiver was stuck BUFFERING with its
+position frozen at 41.8s while the relay it was reading advanced past
+sequence 172, and three releases were verified against relay output while
+the stall lived entirely on the consumer side. Connect to the Cast device
+and read `media_controller.status`: `player_state` and a `current_time` that
+does not advance say in seconds what upstream measurements cannot.
+
+## Retained media is a duration, and hls_list_size counts entries
+
+`delete_segments` drops everything older than `-hls_list_size` entries, so
+the retained window is that count times the SEGMENT LENGTH -- which is not
+ours to assume. At a source's own 5-9s GOP, 24 entries held 120-216s behind
+a 45s cushion. Forcing keyframes cut segments to `hls_time` (2s) and the same
+24 entries held 48s behind that same 45s cushion. The receiver starts at the
+oldest segment it is shown, so one slip put the file it needed next behind
+the delete, and a 404 there is not a rebuffer but a permanent freeze.
+`_list_size()` sizes it by duration: at least twice the cushion plus margin.
+Any change to segment length has to be checked against the window holding it.
+
+## MPEG-TS detection must tolerate a mid-packet start
+
+A live server does not owe anyone a packet boundary. Requiring 0x47 at byte 0
+misread one provider's live channels about a third of the time, and a live
+channel read as VOD loses the piped reader, the replay dedupe and the
+under-feed rotation together -- an encoder restarting 26 times in 70 seconds.
+`_looks_like_mpegts` keeps the cheap aligned check (all a short local file can
+offer) and adds a scan for any offset whose stride repeats four times; four
+hits is out of reach for text or an MP3 frame, where two would be a
+coincidence roughly one time in 340.
+
+## A probe that learned nothing must not assert VOD
+
+One portal load-balances across CDN nodes and some answer with HTTP 503 in
+clusters, or HTTP 200 and a zero-byte body. `probe_media` retries with
+backoff until it has enough bytes to prove a packet stride, keeping the
+longest reply seen. When every attempt fails it must NOT fall through to
+`guess_mime`, which reads an extensionless portal URL as audio/mpeg out of
+thin air: that verdict is what switched the live protections off. No evidence
+now means live, because the cost of that being wrong is reconnect handling a
+finite asset does not need, while the cost the other way is a restart storm.
+
 ## Check which path a channel actually takes before measuring anything
 
 `_native_hls_url` hands Chromecast the portal's own sibling `.m3u8` and the

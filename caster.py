@@ -184,24 +184,49 @@ _CT_AUDIO = {"audio/mpeg", "audio/aac", "audio/aacp", "audio/mp4", "audio/x-m4a"
              "audio/ogg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav"}
 
 
+#: Bytes read to identify a stream. Enough to find the packet stride several
+#: times over even when the response begins mid-packet.
+PROBE_BYTES = 2048
+
+
 def _looks_like_mpegts(head: bytes) -> bool:
-    """Whether these first bytes are really MPEG-TS.
+    """Whether these bytes are really MPEG-TS.
 
     The sync byte is 0x47, which is also ASCII "G", so on its own it says
     almost nothing: a text file, a subtitle or a GIF starting with that
-    letter all pass it. What identifies the format is the byte repeating
-    at the packet stride -- every 188 bytes, or every 192 for M2TS.
+    letter all pass it. What identifies the format is the byte repeating at
+    the packet stride -- every 188 bytes, or every 192 for M2TS.
 
-    Too few bytes to check the stride is an unproven claim, not a
-    generous one: a buffer this small is either a file far too short to
-    be a stream, or a server that sent almost nothing. Either way the
-    extension is a better guide than one coincidental byte.
+    The stride is what to look for, but NOT at byte 0. A live server does not
+    owe anyone a packet boundary: the stream is joined mid-flight, so byte 0
+    is wherever the connection happened to land. Demanding the sync byte
+    there misread one provider's live channels about a third of the time --
+    as audio/mpeg, off a chance 0xff 0xfb pair in the payload -- and a live
+    channel misread as VOD loses the piped reader, the replay dedupe and the
+    under-feed rotation all at once. That was an encoder restarting 26 times
+    in 70 seconds against a server which then refused it outright.
+
+    So find an offset whose stride repeats. Four consecutive hits is not a
+    coincidence any text or image will produce, and too few bytes to prove a
+    stride stays an unproven claim rather than a generous one.
     """
-    if not head.startswith(b"\x47"):
-        return False
-    if len(head) >= 189 and head[188:189] == b"\x47":
-        return True                     # 188-byte packets
-    return len(head) >= 193 and head[192:193] == b"\x47"   # M2TS
+    # An aligned buffer proves itself at byte 0 with one stride, which is
+    # all a short local file can offer and what this has always accepted.
+    if head.startswith(b"G"):
+        if len(head) >= 189 and head[188] == 0x47:
+            return True                 # 188-byte packets
+        if len(head) >= 193 and head[192] == 0x47:
+            return True                 # M2TS
+    # A mid-packet start has to be searched for, so it is held to more
+    # proof: scanning every offset makes a two-hit coincidence far too
+    # cheap (about 1 in 340 on random bytes), while four is out of reach.
+    for stride in (188, 192):
+        for start in range(1, stride):
+            if start + 3 * stride >= len(head):
+                break
+            if all(head[start + n * stride] == 0x47 for n in range(4)):
+                return True
+    return False
 
 
 #: Longest segment a portal's own HLS playlist may contain before Caster
@@ -290,7 +315,7 @@ def probe_media(url: str) -> dict:
         result["is_live"] = False
         try:
             with open(path, "rb") as f:
-                head = f.read(193)
+                head = f.read(PROBE_BYTES)
             # One sync byte proves nothing: 0x47 is also ASCII "G", so a
             # local file that merely begins with that letter was being
             # sent down the live-remux path. Confirm the packet stride,
@@ -302,14 +327,35 @@ def probe_media(url: str) -> dict:
             pass
         return result
     req = urllib.request.Request(url, headers={"User-Agent": "caster/1.0",
-                                               "Range": "bytes=0-192"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            head = r.read(193)
-            ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    except Exception:
-        ct = ""
-        head = b""
+                                               "Range": f"bytes=0-{PROBE_BYTES - 1}"})
+    # One sample decides whether this is treated as a live channel, and that
+    # is too much weight for a single reply from a load-balanced CDN. One
+    # provider answers the same URL from several nodes, and some of them
+    # return HTTP 200 with a zero-byte body or a 503: measured 2026-09-08,
+    # three of six requests were unusable. An empty body has no magic bytes,
+    # so the lying Content-Type wins, is_live goes False, and the channel
+    # loses the piped reader, the replay dedupe and the under-feed rotation
+    # in one go -- an encoder restarting 26 times in 70 seconds. Ask again
+    # instead of believing an answer that told us nothing.
+    ct = ""
+    head = b""
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                body = r.read(PROBE_BYTES)
+                body_ct = (r.headers.get("Content-Type")
+                           or "").split(";")[0].strip().lower()
+        except Exception:
+            body, body_ct = b"", ""
+        if len(body) > len(head):
+            head, ct = body, body_ct
+        # Enough bytes to prove a packet stride is enough to decide on, and
+        # a URL that really is not MPEG-TS answers in full first time, so
+        # this costs one request for everything that is working.
+        if len(head) >= 3 * 188 + 1:
+            break
+        if attempt < 4:
+            time.sleep(0.3 * 2 ** attempt)   # 503s come in clusters
     if ct in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
         result["mime"] = ct
         result["is_audio"] = False
@@ -342,6 +388,17 @@ def probe_media(url: str) -> dict:
     # MPEG-TS over HTTP is a live channel (segmented streams aside);
     # true VOD responses report Content-Length.
     result["is_live"] = mime == "video/mp2t"
+    if not head and not ct:
+        # Every attempt failed, so nothing above was measured -- `mime` is
+        # guess_mime()'s reading of the URL, and for an extensionless portal
+        # URL that guess is audio/mpeg out of thin air. Calling a stream VOD
+        # on no evidence is the expensive mistake: it drops the piped reader,
+        # the replay dedupe and the under-feed rotation, and the plain path
+        # then restarted an encoder 26 times in 70 seconds. Treating it as
+        # live only turns those protections on. The cost of being wrong the
+        # other way is a finite asset getting reconnect handling it does not
+        # need, which is survivable; this is not.
+        result["is_live"] = True
     return result
 
 
@@ -1270,9 +1327,22 @@ class HlsRelay:
         cmd += [
             "-f", "hls",
             "-hls_time", str(self.hls_time),
-            # Wide window: old segments stay listed/fetchable longer, so a
-            # slow playlist poll never races the delete of a needed file.
-            "-hls_list_size", str(max(24, self.trail_keep * 3)),
+            # Retained media is a DURATION, and counting segments hid that.
+            # delete_segments removes anything older than this many entries,
+            # so the window it keeps is list_size * segment length -- and the
+            # segment length is not ours to assume. At a source's own 5-9s
+            # GOP, 24 entries retained 120-216s behind a 45s cushion. Forcing
+            # keyframes cut segments to hls_time (2s), and the same 24
+            # entries retained 48s behind that same 45s cushion: the receiver
+            # starts at the oldest segment it is shown, one hiccup puts the
+            # file it needs next behind the delete, and a 404 there is a
+            # permanent BUFFERING with the position frozen while the playlist
+            # runs away from it -- observed on a receiver stuck at 41.8s
+            # while the relay advanced to sequence 172.
+            #
+            # Keep at least twice the cushion, plus a margin, so falling
+            # behind costs a rebuffer and not the stream.
+            "-hls_list_size", str(self._list_size()),
             # append_list continues the existing playlist across a restart
             # instead of truncating it, which would strip the segments the
             # receiver is still working through.
@@ -1283,6 +1353,18 @@ class HlsRelay:
             m3u8,
         ]
         return cmd
+
+    def _list_size(self) -> int:
+        """How many segments ffmpeg retains, sized by the media they hold.
+
+        The floor is the cushion the receiver is deliberately held behind,
+        doubled and then padded: it has to survive falling behind, not merely
+        start correctly.
+        """
+        cushion = max(self.trail_seconds, 3 * self.hls_time,
+                      self.trail_keep * self.hls_time)
+        wanted = math.ceil((cushion * 2 + 30) / max(1, self.hls_time))
+        return max(24, self.trail_keep * 3, wanted)
 
     def trailing_playlist(self):
         # Concurrent HTTP polls must see a consistent timeline.

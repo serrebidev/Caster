@@ -31,6 +31,83 @@ from caster import Device, HlsFileHandler, HlsRelay, MainFrame, probe_media
 LIVE_HLS = b'#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n'
 
 
+def _ts_bytes(packets=8, stride=188):
+    return b''.join(b'\x47' + bytes(stride - 1) for _ in range(packets))
+
+
+def test_mpegts_detected_when_the_stream_starts_mid_packet():
+    """A live server joins you mid-flight; byte 0 is not a packet boundary.
+
+    Demanding the sync byte at byte 0 misread one provider's live channels
+    as audio/mpeg, and a live channel read as VOD loses the piped reader,
+    the replay dedupe and the under-feed rotation at once.
+    """
+    assert caster._looks_like_mpegts(_ts_bytes()[77:])
+    assert caster._looks_like_mpegts(_ts_bytes(stride=192)[100:])
+    assert caster._looks_like_mpegts(_ts_bytes()[:193])   # aligned and short
+
+
+@pytest.mark.parametrize('blob', [
+    b'G' + b'ood morning everyone. ' * 100,
+    b'\xff\xfb' + bytes(2046),
+    b'\x47' + bytes(200),
+], ids=['text-starting-G', 'mp3-frame', 'too-short-to-prove-a-stride'])
+def test_mpegts_detection_still_refuses_a_coincidence(blob):
+    assert not caster._looks_like_mpegts(blob)
+
+
+def test_probe_retries_past_a_load_balancer_that_says_nothing(monkeypatch):
+    """One reply is too much weight when some CDN nodes answer with nothing.
+
+    Measured against one provider: HTTP 503s in clusters and HTTP 200 with a
+    zero-byte body, mixed with nodes serving proper MPEG-TS.
+    """
+    replies = [TimeoutError('503'), b'', b'', _ts_bytes(12)]
+    def flaky(req, timeout=None):
+        item = replies.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return _FakeResponse(item, 'video/mp4')
+    monkeypatch.setattr(caster.urllib.request, 'urlopen', flaky)
+    monkeypatch.setattr(caster.time, 'sleep', lambda *_: None)
+    out = caster.probe_media('https://example.invalid/u/p/12345')
+    assert out['mime'] == 'video/mp2t'
+    assert out['is_live'] is True
+
+
+def test_probe_never_calls_a_stream_vod_on_no_evidence(monkeypatch):
+    """When every attempt fails, the URL guess must not assert VOD.
+
+    guess_mime reads an extensionless portal URL as audio/mpeg out of thin
+    air, and that verdict switched off every live protection.
+    """
+    monkeypatch.setattr(caster.urllib.request, 'urlopen',
+                        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError('down')))
+    monkeypatch.setattr(caster.time, 'sleep', lambda *_: None)
+    out = caster.probe_media('https://example.invalid/u/p/12345')
+    assert out['is_live'] is True
+
+
+class _FakeResponse:
+    """Enough of urlopen's result for probe_media: a body and a header."""
+
+    def __init__(self, body, content_type=''):
+        self._body = body
+        self.headers = {'Content-Type': content_type}
+
+    def read(self, n=None):
+        return self._body[:n] if n else self._body
+
+    def geturl(self):
+        return 'https://example.invalid/u/p/12345'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def test_native_hls_checks_body_and_preserves_query(monkeypatch):
     requested = []
     def open_playlist(req, timeout):
@@ -1240,6 +1317,37 @@ class _FakeSource:
 
     def rotate(self) -> None:
         self.rotations += 1
+
+
+def test_retained_window_outlasts_the_cushion_it_serves():
+    """delete_segments must not be able to eat the segment served first.
+
+    The receiver starts at the OLDEST segment in the trailing playlist, so if
+    the retained window is only as deep as the cushion, the file it needs
+    next is already behind the delete the moment it slips. That is not a
+    rebuffer, it is a 404 and a permanent stall: observed with a receiver
+    frozen at 41.8s while the relay's own playlist advanced past sequence
+    170. Counting entries hid it -- 24 of them held 120-216s at a source's
+    own 5-9s GOP and only 48s once forced keyframes cut segments to 2s.
+    """
+    for hls_time, trail_seconds in ((2, 45.0), (2, 25.0), (2, 60.0), (4, 45.0)):
+        r = HlsRelay("http://example.invalid/live.ts", hls_time=hls_time,
+                     prime_segments=3, trail_keep=8,
+                     trail_seconds=trail_seconds)
+        retained = r._list_size() * hls_time
+        assert retained >= 2 * trail_seconds, (
+            f"hls_time={hls_time} trail_seconds={trail_seconds}: retained "
+            f"{retained}s is not twice the {trail_seconds}s cushion")
+
+
+def test_retained_window_is_stated_in_the_ffmpeg_command():
+    """The sizing has to reach ffmpeg, not just the helper."""
+    r = HlsRelay("http://example.invalid/live.ts", hls_time=2,
+                 prime_segments=3, trail_keep=8, trail_seconds=45.0,
+                 codecs=["h264", "aac"])
+    r.root = "."
+    cmd = r._ffmpeg_cmd("live.m3u8")
+    assert int(cmd[cmd.index("-hls_list_size") + 1]) == r._list_size()
 
 
 def test_piped_underfeed_drops_the_socket_and_never_the_encoder(relay):
