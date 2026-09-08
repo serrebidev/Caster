@@ -17,6 +17,7 @@ import http.client
 import http.server
 import io
 import os
+import socket
 import threading
 import time
 import types
@@ -490,6 +491,33 @@ def test_trailing_playlist_output_is_a_valid_playlist(relay):
     assert len(uris) == relay.trail_keep
     assert out.count("#EXTINF") == len(uris)     # every URI kept its duration
     assert out.endswith("\n")
+
+
+def test_variable_gop_playlist_keeps_three_target_durations(relay):
+    # One 10s GOP followed by short 2s GOPs. A fixed eight-segment tail
+    # has 16 seconds, far below the receiver's 30-second requirement.
+    raw = _playlist(0, 0, 24).replace('#EXT-X-TARGETDURATION:2',
+                                       '#EXT-X-TARGETDURATION:10')
+    raw = raw.replace('#EXTINF:2.000000,', '#EXTINF:10.000000,', 1)
+    out = _serve(relay, raw)
+    durations = [float(l.split(':')[1].rstrip(',')) for l in out.splitlines()
+                 if l.startswith('#EXTINF:')]
+    assert sum(durations) >= 30
+    assert len(durations) > relay.trail_keep
+
+
+def test_buffer_can_grow_without_reintroducing_old_segments(relay):
+    before = _serve(relay, _playlist(0, 0, 24))
+    start = _seq_of(before)
+    raw = _playlist(4, 4, 24).replace('#EXT-X-TARGETDURATION:2',
+                                       '#EXT-X-TARGETDURATION:10')
+    after = _serve(relay, raw)
+    assert _seq_of(after) >= start
+    assert 'seg00015.ts' not in after
+    # A full 30-second window becomes available as the raw window advances.
+    later = _serve(relay, _playlist(12, 12, 24).replace(
+        '#EXT-X-TARGETDURATION:2', '#EXT-X-TARGETDURATION:10'))
+    assert later.count('#EXTINF:') >= 15
 
 
 def test_native_restart_marker_is_not_duplicated(relay):
@@ -1202,3 +1230,177 @@ def test_underfeed_rotation_waits_for_a_window_and_encoder_age(relay):
     r._check_underfeed(165.0)      # only 5s in: no evaluation yet
     assert r._eval_t0 is not None
     assert r.proc.killed == 0
+
+
+# --------------------------------------------------------------------------
+# TsSource -- hiding a provider that reconnects constantly and replays
+# --------------------------------------------------------------------------
+
+def _ts(seed: int, packets: int) -> bytes:
+    """Bytes that look enough like MPEG-TS to be searched like it."""
+    out = bytearray()
+    for i in range(packets):
+        out += b"\x47" + ((seed + i) % 251).to_bytes(1, "big") + \
+            bytes((i * 7 + seed + j) % 256 for j in range(186))
+    return bytes(out)
+
+
+class _Replaying(threading.Thread):
+    """A live TS server that closes early and resends what it already sent.
+
+    Modelled on the measured behaviour: connections lasting a few seconds,
+    each starting several seconds behind where the last one stopped.
+    """
+
+    def __init__(self, stream: bytes, serve: int, replay: int):
+        super().__init__(daemon=True)
+        self.stream, self.serve, self.replay = stream, serve, replay
+        self.sent_from = []
+        self.position = 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self._stop = threading.Event()
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/live.ts"
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(4096)
+                    start = max(0, self.position - self.replay)
+                    self.sent_from.append(start)
+                    body = self.stream[start:start + self.serve]
+                    self.position = start + len(body)
+                    conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Type: video/mp2t\r\n\r\n" + body)
+                except OSError:
+                    pass
+
+
+def test_ts_source_drops_the_replayed_bytes_and_leaves_no_hole():
+    """The whole point: one continuous stream out of a replaying source."""
+    stream = _ts(3, 4000)          # ~750 KiB
+    server = _Replaying(stream, serve=200_000, replay=60_000)
+    server.start()
+    received = bytearray()
+
+    class Collector:
+        def write(self, data):
+            received.extend(data)
+
+    source = caster.TsSource(server.url(), Collector())
+    source.PROBE = 4096
+    source.start()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and len(received) < len(stream) - 200_000:
+        time.sleep(0.05)
+    source.stop()
+    source.join(timeout=5)
+    server.stop()
+
+    assert len(server.sent_from) > 2, "the source never reconnected"
+    assert source.deduped > 0, "no replay was recognised"
+    # Continuity is the test: what came out must be an unbroken run of the
+    # original stream. A duplicate or a hole both break this.
+    assert bytes(received) in stream, "the forwarded stream was not continuous"
+    assert len(received) > 300_000, "far too little got through"
+
+
+def test_ts_source_forwards_everything_when_nothing_matches():
+    """A real gap must not be papered over by guessing at an overlap."""
+    sink = types.SimpleNamespace(written=bytearray())
+    sink.write = sink.written.extend
+    source = caster.TsSource("http://example.invalid/live.ts", sink)
+    source._forward(_ts(1, 100))
+    fresh = _ts(200, 100)
+    assert source._overlap(fresh) == 0
+
+
+def test_ts_source_overlap_prefers_the_smallest_honest_claim():
+    """Repeating null packets must not inflate the overlap into a hole."""
+    sink = types.SimpleNamespace(write=lambda data: None)
+    source = caster.TsSource("http://example.invalid/live.ts", sink)
+    repeated = b"\xff" * 4096
+    source._forward(repeated + _ts(9, 40) + repeated)
+    # The tail ends with the repeated block, so the honest overlap is that
+    # block alone -- not the whole span back to its first appearance.
+    assert source._overlap(repeated) == len(repeated)
+
+
+def test_piped_ingest_only_for_a_live_raw_http_stream():
+    def relay_for(url, live=True):
+        return HlsRelay(url, codecs=["h264", "aac"], live=live)
+    assert relay_for("http://host/live.ts").piped_source()
+    assert relay_for("http://host/stream?token=1").piped_source()
+    assert not relay_for("http://host/live.m3u8").piped_source()
+    assert not relay_for("http://host/live.ts", live=False).piped_source()
+    assert not relay_for("C:/media/movie.ts").piped_source()
+
+
+def test_piped_encoder_reads_the_pipe_and_gets_no_socket_timeout(tmp_path):
+    """A quiet pipe is TsSource reconnecting, not a dead source.
+
+    An -rw_timeout on the piped path would make ffmpeg exit through exactly
+    the gap the reader exists to cover.
+    """
+    r = HlsRelay("http://host/live.ts", codecs=["h264", "aac"], live=True)
+    r.root = str(tmp_path)
+    cmd = r._ffmpeg_cmd(os.path.join(str(tmp_path), "live.m3u8"))
+    assert cmd[cmd.index("-i") + 1] == "pipe:0"
+    assert "-rw_timeout" not in cmd
+    assert "-seekable" not in cmd
+    assert cmd[cmd.index("-f") + 1] == "mpegts"
+
+
+def test_sink_survives_the_encoder_being_replaced():
+    """The reader must never write into the pipe of a dead ffmpeg."""
+    sink = caster._Sink()
+    sink.write(b"before any encoder")      # must not raise
+
+    class Pipe:
+        def __init__(self):
+            self.data = bytearray()
+            self.closed = False
+
+        def write(self, data):
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
+            self.data.extend(data)
+
+        def flush(self):
+            pass
+
+    first, second = Pipe(), Pipe()
+    sink.attach(first)
+    sink.write(b"one")
+    first.closed = True
+    sink.write(b"lost")                    # must not raise
+    sink.attach(second)
+    sink.write(b"two")
+    assert bytes(first.data) == b"one"
+    assert bytes(second.data) == b"two"
+
+
+def test_encoder_last_words_never_repeats_the_source_url():
+    """ffmpeg names its input in its errors, and that names the password."""
+    r = HlsRelay("http://host/live.ts", codecs=["h264", "aac"], live=True)
+    r._stderr_tail.append(caster._redact_urls(
+        "[http @ 0] Stream ends prematurely: http://host:8080/user/secret/1"))
+    words = r.encoder_last_words()
+    assert "secret" not in words
+    assert "<source>" in words

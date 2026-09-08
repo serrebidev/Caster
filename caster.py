@@ -117,6 +117,19 @@ _trace_lock = threading.Lock()
 _trace_t0 = time.monotonic()
 
 
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+
+
+def _redact_urls(text: str) -> str:
+    """Strip source URLs out of anything that may be written down.
+
+    An IPTV URL carries the subscription's username and password in its own
+    path. ffmpeg names its input in most of its errors, so a diagnostic that
+    quotes ffmpeg verbatim would publish those credentials into a trace file.
+    """
+    return _URL_RE.sub("<source>", text)
+
+
 def trace(event: str, detail: str = "") -> None:
     if not _TRACE_PATH:
         return
@@ -413,6 +426,151 @@ def _probe_codecs(url: str, timeout: float = 8.0) -> list:
     return codecs
 
 
+class _Sink:
+    """The encoder's stdin, swappable while something else is writing to it.
+
+    TsSource outlives any one ffmpeg: if the encoder is ever replaced, the
+    reader must not notice, and must never write into a closed pipe.
+    """
+
+    def __init__(self) -> None:
+        self._file = None
+        self._lock = threading.Lock()
+
+    def attach(self, file) -> None:
+        with self._lock:
+            self._file = file
+
+    def write(self, data: bytes) -> None:
+        with self._lock:
+            file = self._file
+        if file is None:
+            return
+        try:
+            file.write(data)
+            file.flush()
+        except (OSError, ValueError):
+            pass    # encoder gone; _supervise brings up the next one
+
+
+class TsSource(threading.Thread):
+    """A live MPEG-TS URL presented to ffmpeg as one unbroken byte stream.
+
+    These IPTV servers close the connection every few seconds, and the next
+    one does not resume where the last stopped: it starts from the server's
+    own buffer, several seconds behind. Measured on 2026-09-07: connections
+    lasting 3-9 seconds, each replaying 4.3 seconds already delivered. Handed
+    straight to ffmpeg -- either as its own reconnect or as a fresh process --
+    that made roughly half of everything the receiver played a repeat, which
+    is what "it keeps jumping backwards" was.
+
+    The replayed bytes are byte-for-byte identical to the ones already sent,
+    so the overlap can simply be found and dropped. Reconnecting here rather
+    than in ffmpeg means the encoder sees one continuous stream, never exits,
+    and never has to be restarted -- so there is no seam to paper over with a
+    discontinuity and no priming pause on the receiver.
+    """
+
+    #: Bytes of already-forwarded stream kept to recognise a replay in. Must
+    #: comfortably exceed the server's buffer depth: ~30s at 2 Mb/s against a
+    #: measured 4.3s replay. It is a bounded window, not a recording.
+    OVERLAP_KEEP = 8 << 20
+    #: How much of a new connection to match. Long enough that a coincidental
+    #: match is impossible, short enough to decide within one read.
+    PROBE = 32 << 10
+    CHUNK = 64 << 10
+    RECONNECT_DELAY = 0.2
+    OPEN_TIMEOUT = 15
+
+    def __init__(self, url: str, sink: _Sink) -> None:
+        super().__init__(daemon=True, name="caster-ts-source")
+        self.url = url
+        self.sink = sink
+        self._stop = threading.Event()
+        self._tail = b""
+        self._response = None
+        self.reconnects = 0     # diagnostics
+        self.deduped = 0        # bytes of replay dropped (diagnostics)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.rotate()
+
+    def rotate(self) -> None:
+        """Drop the current connection; run() opens the next one.
+
+        This is what an under-fed relay needs. Killing the encoder used to be
+        the way to get a fresh connection, and on the piped path it no longer
+        is: ffmpeg is not the thing holding the socket any more.
+        """
+        response, self._response = self._response, None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._one_connection()
+            except Exception as exc:
+                trace("ts.error", type(exc).__name__)
+            if self._stop.is_set():
+                break
+            self.reconnects += 1
+            self._stop.wait(self.RECONNECT_DELAY)
+
+    def _one_connection(self) -> None:
+        request = urllib.request.Request(
+            self.url, headers={"User-Agent": "Lavf/62.0.102"})
+        with urllib.request.urlopen(request,
+                                    timeout=self.OPEN_TIMEOUT) as response:
+            self._response = response
+            first = b""
+            while len(first) < self.PROBE and not self._stop.is_set():
+                chunk = response.read(self.CHUNK)
+                if not chunk:
+                    break
+                first += chunk
+            skip = self._overlap(first)
+            if skip:
+                self.deduped += skip
+                trace("ts.dedupe", f"dropped {skip} replayed bytes")
+            while not self._stop.is_set():
+                if skip >= len(first):
+                    skip -= len(first)
+                else:
+                    self._forward(first[skip:])
+                    skip = 0
+                first = response.read(self.CHUNK)
+                if not first:
+                    return
+
+    def _overlap(self, first: bytes) -> int:
+        """Bytes at the head of a new connection already sent from the last.
+
+        Zero when nothing matches: either the server picked up where it left
+        off, or it jumped so far back that the window no longer holds the
+        join. Forwarding is the safe answer in both cases -- a duplicate is
+        survivable, a hole in an MPEG-TS is not.
+        """
+        if not self._tail or len(first) < 1024:
+            return 0
+        # rfind, never find: a run of MPEG-TS null packets is identical
+        # wherever it appears, so an early match would claim an overlap
+        # bigger than the real one and cut a hole in the stream. The latest
+        # match is the smallest claim, and a small duplicate is survivable.
+        index = self._tail.rfind(first[:self.PROBE])
+        if index < 0:
+            return 0
+        return len(self._tail) - index
+
+    def _forward(self, data: bytes) -> None:
+        self.sink.write(data)
+        self._tail = (self._tail + data)[-self.OVERLAP_KEEP:]
+
+
 class HlsRelay:
     """Remux/transcode an MPEG-TS stream to HLS and serve it on a local port
     so a network receiver can play it.
@@ -451,6 +609,9 @@ class HlsRelay:
     ROTATE_STREAK = 2        # ordinary under-feed needs confirmation
     ROTATE_MIN_AGE = 30.0    # let a fresh connection settle before judging it
     ROTATE_MIN_GAP = 90.0    # floor between forced rotations
+    #: Lines of ffmpeg diagnostics kept for the last exit. A stuck encoder
+    #: can print one warning per frame, so this is a ring, not a log.
+    STDERR_KEEP = 40
 
     def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
                  trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None,
@@ -496,6 +657,30 @@ class HlsRelay:
         #: of the last few seconds followed by a decode failure.
         self._discont_segs: set = set()
         self._playlist_lock = threading.Lock()
+        #: ffmpeg's own last words, kept so an exit can be explained. Every
+        #: encoder death so far has been silent: stderr went to DEVNULL, so
+        #: "why did the stream skip" had no answer beyond an exit code.
+        self._stderr_tail: collections.deque = collections.deque(
+            maxlen=self.STDERR_KEEP)
+        #: Set when this relay reads the source itself and pipes it in. See
+        #: TsSource: it exists to hide a provider that reconnects constantly
+        #: and replays what it already sent.
+        self.ts_source = None
+        self._sink = None
+
+    def piped_source(self) -> bool:
+        """Whether to read the source here and pipe it into ffmpeg.
+
+        Only for a live raw stream over HTTP. A playlist source (.m3u8) is a
+        series of separate requests that ffmpeg has to make itself, and a
+        local file never drops, so neither has anything to gain.
+        """
+        if not self.live:
+            return False
+        url = self.url.lower().split("?")[0]
+        if not url.startswith(("http://", "https://")):
+            return False
+        return not url.endswith((".m3u8", ".m3u"))
 
     def start(self, prime_segments: int = 0) -> str:
         import tempfile
@@ -520,12 +705,19 @@ class HlsRelay:
             # arrive in real time, so every one asked for here is a second of
             # the wait -- which is why this is the floor and not a cushion.
             # The cushion is trail_keep, and that costs nothing up front.
-            deadline = time.monotonic() + 25
+            # Long-GOP input may need more than 25s to publish three target
+            # durations. Return immediately when ready, but allow that real
+            # media requirement to be met before declaring startup failure.
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 if os.path.exists(m3u8):
-                    segs = sum(1 for f in os.listdir(self.root)
-                               if f.endswith(".ts") or f.endswith(".m4s"))
-                    if segs >= want:
+                    completed = self._completed_segments()
+                    # Three files are not necessarily three TARGETDURATIONs:
+                    # variable GOPs can yield (10s, 1s, 1s). Count only
+                    # published media and prime by duration as well.
+                    if (len(completed) >= want
+                            and sum(completed.values()) >=
+                            3 * math.ceil(max(completed.values()))):
                         break
                 if self.proc.poll() is not None:
                     raise RuntimeError(
@@ -593,14 +785,70 @@ class HlsRelay:
         # append_list marks the actual first new segment. Do not guess its
         # name from files on disk: an unfinished segment can be there too.
         cmd = self._ffmpeg_cmd(m3u8, start)
+        # Keep stderr. ffmpeg says exactly why it is leaving -- a 456 from the
+        # provider, a timed-out read, a codec it stopped being able to parse --
+        # and DEVNULL threw that away, leaving only an exit code to reason
+        # from. The pipe MUST be drained or a chatty encoder blocks on a full
+        # buffer and stops producing segments, so the reader is not optional.
+        tail: collections.deque = collections.deque(maxlen=self.STDERR_KEEP)
+        self._stderr_tail = tail
+        piped = self.piped_source()
         self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, **_no_window_kwargs())
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if piped else subprocess.DEVNULL,
+            **_no_window_kwargs())
+        threading.Thread(target=self._drain_stderr, args=(self.proc, tail),
+                         daemon=True, name="caster-ffmpeg-stderr").start()
+        if piped:
+            # The reader outlives the encoder: it holds the tail that
+            # recognises a replay, and losing it would replay one connection's
+            # worth of the channel every time ffmpeg was replaced.
+            if self._sink is None:
+                self._sink = _Sink()
+            self._sink.attach(self.proc.stdin)
+            if self.ts_source is None:
+                self.ts_source = TsSource(self.url, self._sink)
+                self.ts_source.start()
         # A (re)started encoder gets the benefit of the doubt: rotation is
         # judged only after it has had a chance to prove its cadence.
         self._proc_born = time.monotonic()
         self._fail_streak = 0
         self._eval_t0 = None
+
+    @staticmethod
+    def _drain_stderr(proc, tail) -> None:
+        """Collect an encoder's diagnostics into its own bounded ring.
+
+        The ring belongs to one process: a reader outliving its encoder must
+        never append to the next one's tail and explain the wrong death.
+        """
+        stream = proc.stderr
+        if stream is None:
+            return
+        try:
+            for raw in stream:
+                line = raw.decode("utf-8", "replace").strip()[:400]
+                if line:
+                    tail.append(_redact_urls(line))
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def encoder_last_words(self) -> str:
+        """The tail of the last encoder's diagnostics, as one short line.
+
+        ffmpeg repeats itself while a connection dies, so the useful part is
+        the distinct ending, not the count.
+        """
+        seen = []
+        for line in self._stderr_tail:
+            if line not in seen:
+                seen.append(line)
+        return " | ".join(seen[-3:]) if seen else "no diagnostics"
 
     def _supervise(self) -> None:
         """Restart ffmpeg if it dies while the relay is up.
@@ -624,7 +872,9 @@ class HlsRelay:
                 if self.httpd is None:
                     break
                 self._restarted += 1
-                trace("relay.restart", f"encoder exited with code {proc.returncode}")
+                trace("relay.restart",
+                      f"encoder exited with code {proc.returncode}: "
+                      f"{self.encoder_last_words()}")
                 try:
                     self._spawn_ffmpeg()
                 except Exception:
@@ -697,9 +947,18 @@ class HlsRelay:
         self._fail_streak = 0
         self._eval_t0 = None
         self._rotated += 1
+        source = self.ts_source
         trace("relay.rotate",
               f"{ratio:.2f}x media for {failed_windows} consecutive "
-              f"windows ({span:.1f}s last window); restarting the encoder")
+              f"windows ({span:.1f}s last window); dropping the "
+              f"{'source connection' if source else 'encoder'}")
+        if source is not None:
+            # On the piped path ffmpeg is not holding the socket, so killing
+            # it would cost a restart and change nothing upstream. Drop the
+            # connection itself; the reader opens the next one and the
+            # encoder never notices.
+            source.rotate()
+            return
         try:
             self.proc.kill()
         except Exception:
@@ -753,7 +1012,14 @@ class HlsRelay:
             except (OSError, ValueError):
                 pass
         cmd = [_find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
-        if self.url.lower().startswith(("http://", "https://")):
+        piped = self.piped_source()
+        if piped:
+            # TsSource is doing the reading. Give the demuxer the format it
+            # will get -- a pipe cannot be probed by seeking -- and set no
+            # timeout of any kind: a quiet pipe is TsSource reconnecting, and
+            # ffmpeg exiting through that would undo the whole point.
+            cmd += ["-f", "mpegts"]
+        elif self.url.lower().startswith(("http://", "https://")):
             # Survive IPTV sources dropping/jittering instead of stalling.
             # These belong to the HTTP protocol handler and nothing else:
             # handed a local path, ffmpeg refuses the whole command with
@@ -774,7 +1040,11 @@ class HlsRelay:
                 # and _supervise restarts it at the live edge in the same
                 # directory -- the playlist stays monotonic, the receiver
                 # rides through with a short freeze instead of a rewind.
-                # The restart loop is the resilience now, not ffmpeg.
+                #
+                # This branch is now only for playlist sources, which ffmpeg
+                # has to fetch itself. A raw live stream goes down the piped
+                # path instead (see TsSource), where the replay is removed
+                # rather than ridden through.
                 "-seekable", "0",
                 "-rw_timeout", "5000000",   # 5s read timeout on the source
             ]
@@ -787,7 +1057,7 @@ class HlsRelay:
             # has to be set on the demuxer, before -i. After -i it lands on
             # the muxer, where it means nothing.
             "-fflags", "+genpts",         # smooth over source timestamp jumps
-            "-i", self.url,
+            "-i", "pipe:0" if piped else self.url,
         ]
         # Cast receivers play H.264-in-TS but reject anything else (HEVC,
         # AV1...). H.264 sources stay bit-exact; anything else gets the
@@ -815,7 +1085,7 @@ class HlsRelay:
             "-hls_time", str(self.hls_time),
             # Wide window: old segments stay listed/fetchable longer, so a
             # slow playlist poll never races the delete of a needed file.
-            "-hls_list_size", "12",
+            "-hls_list_size", str(max(24, self.trail_keep * 3)),
             # append_list continues the existing playlist across a restart
             # instead of truncating it, which would strip the segments the
             # receiver is still working through.
@@ -860,13 +1130,29 @@ class HlsRelay:
         if not segs:
             return None
         drop = max(0, len(segs) - self.trail_keep)
-        # Monotonic: a receiver re-polling an older view must never see
-        # segments reappear (HLS clients treat that as a broken stream).
-        if self._trail_drop is None or drop > self._trail_drop:
-            self._trail_drop = drop
-        # ...but never past the end of a playlist that has since got shorter,
-        # which is what a restarted encoder produces.
-        drop = min(self._trail_drop, len(segs) - 1)
+        # Keep enough actual media for the receiver's 3x TARGETDURATION
+        # requirement, even when several short GOPs follow one long GOP.
+        # Eight segments on the affected channel measured only 22 seconds
+        # while TARGETDURATION was 10: the old fixed-count trim undercut 30s.
+        try:
+            target = float(next(l.split(":", 1)[1] for l in lines
+                                if l.startswith("#EXT-X-TARGETDURATION:")))
+            durations = [float(l.split(":", 1)[1].rstrip(",")) for l in lines
+                         if l.startswith("#EXTINF:")]
+            if len(durations) == len(segs):
+                total = sum(durations[drop:])
+                while drop > 0 and total < 3 * target:
+                    drop -= 1
+                    total += durations[drop]
+        except (ValueError, StopIteration):
+            pass
+        # A larger cushion must grow forwards; never resurrect segments the
+        # receiver has already scrolled past. A relative-drop high-water mark
+        # would prevent that growth even while the raw base advances.
+        if self._served_seq is not None:
+            drop = max(drop, self._served_seq - base_seq)
+        drop = min(drop, len(segs) - 1)
+        self._trail_drop = drop
 
         def block_start(uri_idx: int) -> int:
             # Index of the first comment line belonging to this segment's
@@ -928,6 +1214,13 @@ class HlsRelay:
         # Tear the supervisor's loop condition down FIRST: httpd=None makes
         # _supervise exit, so it never restarts a relay being torn down.
         httpd, self.httpd = self.httpd, None
+        # Stop reading the source before killing the encoder it feeds, or the
+        # reader spends its next write on a pipe that has just gone.
+        source, self.ts_source = self.ts_source, None
+        if source is not None:
+            source.stop()
+        if self._sink is not None:
+            self._sink.attach(None)
         proc, self.proc = self.proc, None
         if proc and proc.poll() is None:
             proc.terminate()

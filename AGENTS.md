@@ -393,6 +393,53 @@ stall.
 
 ## Live under-feed recovery (2026-09-07)
 
+The served HLS window and startup prime must meet three TARGETDURATIONs in
+actual EXTINF seconds, not simply three/eight filenames. Measured variable
+GOP input served about 22 seconds with TARGETDURATION=10; fixed-count trimming
+undercut the receiver's 30-second requirement. Keep a wider raw window and
+grow the served window forwards without resurrecting previously dropped media.
+The read-only scratchpad/observe_playback.py compares encoded video packet
+hashes across local HLS segments. It confirmed hundreds of repeated video
+packets immediately after encoder restarts while the Cast clock kept moving;
+playlist sequence monotonicity alone does not prove unique content.
+
+## Live TS ingest (2026-09-07)
+
+The IPTV source does not hold a connection. Measured: it closes every 3-9
+seconds, and the next connection does not resume -- it starts from the
+server's own buffer, replaying 4.3 seconds it already sent (byte-for-byte
+identical). ffmpeg's own reconnect spliced that in silently; a fresh ffmpeg
+process did the same behind a DISCONTINUITY. Either way roughly half of what
+the receiver played was a repeat. That is what "it keeps jumping backwards"
+was, and no amount of playlist or cadence tuning could reach it.
+
+`TsSource` reads the source in Python instead and pipes it into ONE ffmpeg
+that never exits. It keeps an 8 MiB window of what it has already forwarded
+and, on each new connection, `rfind`s the new stream's first 32 KiB in that
+window to locate the join. Use `rfind`, never `find`: a run of MPEG-TS null
+packets is identical wherever it appears, and the earliest match would claim
+an overlap bigger than the real one and cut a hole. Dropping too little is a
+survivable duplicate; dropping too much is a hole, which MPEG-TS is not.
+
+Rules for this path:
+- Piped ingest is for a live raw HTTP stream only (`piped_source()`). A
+  playlist source is a series of requests ffmpeg must make itself.
+- Never set `-rw_timeout` or `-seekable` on the pipe. A quiet pipe is
+  TsSource reconnecting; a timeout there defeats the entire mechanism.
+  `-f mpegts` is required: a pipe cannot be probed by seeking.
+- Under-feed rotation drops the source connection (`TsSource.rotate()`), not
+  the encoder. ffmpeg no longer holds the socket, so killing it changes
+  nothing upstream and costs a restart.
+- TsSource outlives any one encoder: its tail is what recognises a replay,
+  and losing it replays a connection's worth of the channel.
+
+ffmpeg's stderr is kept in a bounded ring (`encoder_last_words()`), redacted
+through `_redact_urls`. It went to DEVNULL before, so every encoder death was
+unexplained; it is what identified "Stream ends prematurely" as a server
+close rather than a timeout. ffmpeg names its input in most of its errors and
+that input carries the subscription password -- never write a raw ffmpeg line
+into a trace, a log or a status message.
+
 Cadence baselines must come from completed entries in one raw playlist
 snapshot, never `_newest_seg_number()`: ffmpeg creates the next file before
 completing it, so using it as the baseline loses a segment's duration each
