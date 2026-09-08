@@ -52,6 +52,45 @@ def test_native_hls_rejects_non_live_or_invalid_responses(monkeypatch, body):
     assert caster._native_hls_url('http://example.invalid/u/p/123.ts') is None
 
 
+LONG_SEG_HLS = (b'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:7254\n'
+                b'#EXT-X-TARGETDURATION:17\n'
+                b'#EXTINF:11.386356,\n/hls/aaa\n'
+                b'#EXTINF:16.690000,\n/hls/bbb\n')
+
+
+def test_native_hls_rejected_when_its_segments_would_stall_the_receiver(monkeypatch):
+    """A portal playlist is only worth preferring while it plays better.
+
+    A receiver that reaches the live edge waits out the next segment, so
+    segment length is the worst-case stall. One portal served 16.7s segments
+    behind a TARGETDURATION of 17 while the relay served the same channel in
+    steady 2.00s segments; preferring that feed was the buffering.
+    """
+    monkeypatch.setattr(caster.urllib.request, 'urlopen',
+                        lambda *a, **kw: io.BytesIO(LONG_SEG_HLS))
+    assert caster._native_hls_url('http://example.invalid/u/p/123.ts') is None
+
+
+def test_native_hls_still_preferred_when_its_segments_are_normal(monkeypatch):
+    """The gate must not switch the whole feature off.
+
+    A playlist built to the usual 6s convention still wins: it costs no local
+    encoder and no re-encode.
+    """
+    monkeypatch.setattr(caster.urllib.request, 'urlopen',
+                        lambda *a, **kw: io.BytesIO(LIVE_HLS))
+    assert caster._native_hls_url(
+        'http://example.invalid/u/p/123.ts') == 'http://example.invalid/u/p/123.m3u8'
+
+
+def test_native_hls_rejects_an_unparsable_duration(monkeypatch):
+    """An EXTINF that is not a number leaves the relay as the safe answer."""
+    body = b'#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:soon,\nsegment.ts\n'
+    monkeypatch.setattr(caster.urllib.request, 'urlopen',
+                        lambda *a, **kw: io.BytesIO(body))
+    assert caster._native_hls_url('http://example.invalid/u/p/123.ts') is None
+
+
 def test_native_hls_network_failure_keeps_ts_fallback(monkeypatch):
     def unavailable(*args, **kwargs):
         raise TimeoutError('source unavailable')

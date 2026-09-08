@@ -334,6 +334,32 @@ supervisor's restart count, EXT-X-MEDIA-SEQUENCE monotonicity, segment names,
 and hashing PCM blocks for repeats (a repeat offset by one sample hashes
 differently -- that test is useless).
 
+## Check which path a channel actually takes before measuring anything
+
+`_native_hls_url` hands Chromecast the portal's own sibling `.m3u8` and the
+relay never starts. It fires for any numeric channel URL whose sibling
+returns a live playlist, which on one portal was every channel tried. Two
+releases of relay work were verified against a relay that was not in the
+user's playback path at all; the relay measured beautifully and the user kept
+buffering. Before attributing a fix to anything, call `_native_hls_url` on the
+actual URL and see which branch at `MainFrame._cast_url` runs.
+
+That preference was added to dodge a TS server replaying its buffer on
+reconnect. `TsSource` later solved that properly, so the reason it existed is
+gone while its cost stayed: measured 2026-09-08, three channels' native
+playlists ran 9.9-16.7s per segment behind a 6-segment window, one advertising
+TARGETDURATION 17 then 12, and the whole window's tokenised URLs rotated
+inside a single poll. The relay served the same channel in steady 2.00s
+segments with a 46s cushion. A receiver reaching the live edge waits out the
+next segment, so those durations ARE the stall.
+
+`NATIVE_HLS_SEGMENT_LIMIT` (8.0s) gates it: prefer the portal only while its
+own playlist plays at least as well as the relay would. Judge the EXTINF
+durations, never the advertised TARGETDURATION -- that tag has been seen both
+understating the segments beneath it and changing between reloads. The limit
+sits above the 6s convention so a normally built portal feed is still
+preferred and costs no local encoder.
+
 ## An irregular source GOP is re-encoded, not endured
 
 `GOP_COPY_LIMIT` (5.0s): when priming shows a completed segment longer than

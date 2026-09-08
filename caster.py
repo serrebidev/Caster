@@ -204,6 +204,20 @@ def _looks_like_mpegts(head: bytes) -> bool:
     return len(head) >= 193 and head[192:193] == b"\x47"   # M2TS
 
 
+#: Longest segment a portal's own HLS playlist may contain before Caster
+#: serves the channel through its own relay instead. A receiver that reaches
+#: the live edge waits for the next segment to finish, so segment length is
+#: the worst-case stall, and the relay's own segments are hls_time long (2s).
+#: Measured 2026-09-08 on one portal: three channels' native playlists ran
+#: 9.9-16.7s per segment against a 6-segment window, one of them advertising
+#: TARGETDURATION 17 then 12, while the relay served the same channel in
+#: steady 2.00s segments. 8s sits above ordinary practice (6s is the usual
+#: convention, and Apple's authoring guidance recommends it) and below every
+#: one of those, so a portal that builds its playlist normally is still
+#: preferred and one that cannot be played smoothly is not.
+NATIVE_HLS_SEGMENT_LIMIT = 8.0
+
+
 def _native_hls_url(url: str) -> Optional[str]:
     """Validate a live IPTV portal's sibling HLS feed before remuxing TS.
 
@@ -211,6 +225,11 @@ def _native_hls_url(url: str) -> Optional[str]:
     HLS endpoint supplies stable sequence numbers instead. Only try the
     numeric channel URL convention, and keep the TS fallback for everything
     that does not return an actual live media playlist.
+
+    Preferring that feed is worth it only while it plays better than what the
+    relay would build. TsSource now hides the replay this preference was
+    introduced to dodge, so a portal playlist whose segments are long enough
+    to stall the receiver has nothing left to offer over the relay.
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme.lower() not in ("http", "https"):
@@ -231,6 +250,19 @@ def _native_hls_url(url: str) -> Optional[str]:
                 and any(line.startswith("#EXTINF:") for line in lines)
                 and any(line and not line.startswith("#") for line in lines)
                 and "#EXT-X-ENDLIST" not in lines):
+            # Judge the durations it actually lists, not the TARGETDURATION
+            # it advertises: that tag has been seen both understating the
+            # segments below it and changing between reloads.
+            longest = 0.0
+            for line in lines:
+                if line.startswith("#EXTINF:"):
+                    try:
+                        longest = max(longest, float(
+                            line.split(":", 1)[1].split(",")[0]))
+                    except ValueError:
+                        return None    # unparsable playlist; use the relay
+            if longest > NATIVE_HLS_SEGMENT_LIMIT:
+                return None
             return candidate
     except (OSError, ValueError, UnicodeError):
         pass
