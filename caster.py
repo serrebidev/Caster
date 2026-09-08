@@ -1454,7 +1454,11 @@ class MainFrame(wx.Frame):
         self.set_status("Checking for updates...", speak=False)
 
         def worker() -> None:
-            update = caster_update.latest_update(APP_VERSION)
+            try:
+                update = caster_update.latest_update(APP_VERSION)
+            except Exception as exc:
+                self._ui(self.set_status, f"Update check failed: {exc}")
+                return
             if update is None:
                 self._ui(self.set_status, "No newer release found.")
                 return

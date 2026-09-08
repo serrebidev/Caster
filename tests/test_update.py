@@ -7,6 +7,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
+import sys
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -105,5 +108,62 @@ def test_installer_is_hidden_and_noninteractive(tmp_path, monkeypatch):
     assert kwargs["stdin"] is update.subprocess.DEVNULL
     script = command[-1]
     text = open(script, encoding="utf-8").read()
-    assert "Get-ChildItem -LiteralPath $stage | Copy-Item" in text
+    assert "Copy-Item -LiteralPath $file.FullName" in text
     assert "Start-Process -FilePath" in text
+
+
+def test_update_check_reports_network_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("offline")
+    monkeypatch.setattr(update.urllib.request, "urlopen", fail)
+    with pytest.raises(RuntimeError, match="Could not check"):
+        update.latest_update("0.5.8")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer integration")
+@pytest.mark.parametrize("fail_restart", [False, True])
+def test_real_powershell_installs_nested_payload_with_literal_paths(tmp_path, monkeypatch, fail_restart):
+    # Spaces, Unicode, apostrophes, dollar signs and wildcard brackets are
+    # valid portable-install paths. Exercise Windows PowerShell, not a mock
+    # of its quoting/copy behavior. Only restarting the GUI is substituted.
+    app = tmp_path / "Caster user's $cash [portable] café"
+    (app / "_internal").mkdir(parents=True)
+    (app / "Caster.exe").write_bytes(b"old executable")
+    (app / "_internal" / "library.dll").write_bytes(b"old library")
+    (app / "personal.txt").write_text("keep me")
+    archive = tmp_path / "update [new].zip"
+    _archive(archive, ["Caster.exe", "_internal/library.dll", "_internal/new/data.txt"])
+    calls = []
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(update.subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    update.launch_installer(str(archive), str(app), pid=2147483647)
+    monkeypatch.setattr(update.subprocess, "Popen", real_popen)
+    command = calls[0][0][0]
+    script = Path(command[-1])
+    content = script.read_text(encoding="utf-8")
+    content = content.replace(
+        "Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir -WindowStyle Hidden",
+        "throw 'Simulated restart failure'" if fail_restart else
+        "Set-Content -LiteralPath (Join-Path $appDir 'restarted.txt') -Value 'yes'")
+    script.write_text(content, encoding="utf-8")
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+    log = (tmp_path / "install.log").read_text() if (tmp_path / "install.log").exists() else ""
+    if fail_restart:
+        assert result.returncode == 1
+        assert "Simulated restart failure" in log
+        assert (app / "Caster.exe").read_bytes() == b"old executable"
+        assert (app / "_internal" / "library.dll").read_bytes() == b"old library"
+        assert not (app / "_internal" / "new" / "data.txt").exists()
+        assert (app / "personal.txt").read_text() == "keep me"
+        assert archive.exists()
+        return
+    assert result.returncode == 0, (result.stderr, log)
+    assert (app / "Caster.exe").read_bytes() == b"placeholder"
+    assert (app / "_internal" / "library.dll").read_bytes() == b"placeholder"
+    assert (app / "_internal" / "new" / "data.txt").read_bytes() == b"placeholder"
+    assert (app / "personal.txt").read_text() == "keep me"
+    assert (app / "restarted.txt").exists()
+    assert not archive.exists()
+    assert not script.parent.exists()

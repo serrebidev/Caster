@@ -22,6 +22,14 @@ with `Caster-portable.zip`; the in-app updater reads that asset. Do not call
 PowerShell interactively or visibly: its detached updater helper uses
 `-NoProfile -NonInteractive -WindowStyle Hidden` and `CREATE_NO_WINDOW`.
 
+Updater paths must be data: decode base64 UTF-8 JSON with ConvertFrom-Json in
+PowerShell. JSON-quoted paths are not PowerShell literals (backslashes,
+Unicode escapes, dollar signs and backticks behave differently). Copy explicit
+files with -LiteralPath into matching relative destinations, retry transient
+locks, and retain backups until restart succeeds. Failures go to
+%LOCALAPPDATA%\Caster\updates\install.log. Run the real Windows PowerShell
+integration tests, including failed-restart rollback, before releasing changes.
+
 release.py refuses dirty tree. Deps in requirements.txt. soco optional — without it every
 other protocol still works, Sonos just never appears.
 

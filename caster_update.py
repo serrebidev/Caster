@@ -13,6 +13,7 @@ and starts the replacement.
 from __future__ import annotations
 
 import json
+import base64
 import os
 import re
 import subprocess
@@ -60,8 +61,8 @@ def latest_update(current: str, timeout: float = 8.0) -> Optional[Update]:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError, UnicodeError, urllib.error.HTTPError):
-        return None
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("Could not check for updates. Check your internet connection and try again.") from exc
     if payload.get("draft") or payload.get("prerelease"):
         return None
     tag = str(payload.get("tag_name") or "")
@@ -152,14 +153,22 @@ def launch_installer(archive: str, app_dir: str = "", pid: int = 0) -> None:
     helper_dir = tempfile.mkdtemp(prefix="caster_update_")
     script = os.path.join(helper_dir, "install.ps1")
     values = {"pid": pid, "archive": os.path.abspath(archive),
-              "app_dir": app_dir, "helper_dir": helper_dir}
-    # JSON produces quoted PowerShell string literals without interpolating
-    # a path supplied by the filesystem into executable PowerShell syntax.
+              "app_dir": os.path.abspath(app_dir), "helper_dir": helper_dir}
+    # Decode data, never interpolate filesystem paths as PowerShell syntax.
+    # JSON's backslash escapes are NOT PowerShell escapes; double quotes also
+    # expand dollar signs and backticks in otherwise valid Windows paths.
+    encoded = base64.b64encode(json.dumps(values).encode("utf-8")).decode("ascii")
     content = """$ErrorActionPreference = 'Stop'
-$pidToWait = {pid}
-$archive = {archive}
-$appDir = {app_dir}
-$helperDir = {helper_dir}
+$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')) | ConvertFrom-Json
+$pidToWait = $config.pid
+$archive = $config.archive
+$appDir = $config.app_dir
+$helperDir = $config.helper_dir
+$log = Join-Path (Split-Path -LiteralPath $archive) 'install.log'
+$changed = [Collections.Generic.List[object]]::new()
+$backupRoot = Join-Path $helperDir 'backup'
+try {{
+Add-Content -LiteralPath $log -Value 'Starting Caster update.'
 while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
     Start-Sleep -Milliseconds 250
 }}
@@ -168,11 +177,50 @@ Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force
 if (-not (Test-Path -LiteralPath (Join-Path $stage 'Caster.exe'))) {{
     throw 'Update archive does not contain Caster.exe.'
 }}
-Get-ChildItem -LiteralPath $stage | Copy-Item -Destination $appDir -Recurse -Force
-Start-Process -FilePath (Join-Path $appDir 'Caster.exe')
+# Copy explicit literal filenames, including hidden files, into the matching
+# relative destinations. Pipeline FileInfo paths can be wildcard-expanded and
+# directory-copy semantics can produce nested _internal directories.
+foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {{
+    $relative = $file.FullName.Substring($stage.Length).TrimStart([char]92)
+    $destination = Join-Path $appDir $relative
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination)) | Out-Null
+    $backup = $null
+    if (Test-Path -LiteralPath $destination) {{
+        $backup = Join-Path $backupRoot $relative
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($backup)) | Out-Null
+        Copy-Item -LiteralPath $destination -Destination $backup -Force
+    }}
+    $changed.Add(@{{destination=$destination; backup=$backup}})
+    for ($attempt = 0; ; $attempt++) {{
+        try {{
+            Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+            break
+        }} catch {{
+            if ($attempt -ge 29) {{ throw }}
+            Start-Sleep -Milliseconds 500
+        }}
+    }}
+}}
+Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir -WindowStyle Hidden
+Add-Content -LiteralPath $log -Value 'Caster update installed and restarted.'
 Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $helperDir -Recurse -Force -ErrorAction SilentlyContinue
-""".format(**{key: json.dumps(value) for key, value in values.items()})
+}} catch {{
+    Add-Content -LiteralPath $log -Value ($_ | Out-String)
+    # Restore every touched file if copying or launching fails, so the old
+    # portable app remains usable. Keep the archive and backups for recovery.
+    foreach ($entry in $changed) {{
+        try {{
+            if ($entry.backup) {{
+                Copy-Item -LiteralPath $entry.backup -Destination $entry.destination -Force
+            }} else {{
+                Remove-Item -LiteralPath $entry.destination -Force -ErrorAction SilentlyContinue
+            }}
+        }} catch {{ Add-Content -LiteralPath $log -Value ($_ | Out-String) }}
+    }}
+    exit 1
+}}
+""".format(encoded=encoded)
     with open(script, "w", encoding="utf-8", newline="") as handle:
         handle.write(content)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

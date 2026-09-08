@@ -51,6 +51,10 @@ Caster checks its official GitHub Releases page, asks before downloading, then
 closes, replaces its portable files invisibly, and opens the new version. It
 never checks, downloads, or installs an update automatically.
 
+If installation fails, the updater attempts to restore the previous files and
+keeps its downloaded archive. Details are saved in
+`%LOCALAPPDATA%\Caster\updates\install.log`.
+
 ## Run from source
 
 1. Install Python 3.14.
