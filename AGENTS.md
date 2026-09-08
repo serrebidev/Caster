@@ -17,6 +17,11 @@ py release.py --no-bump      # rebuild, no commit, no tag
 py -m PyInstaller caster.spec --noconfirm
 ```
 
+`release.py` pushes the version commit and tag and creates a GitHub Release
+with `Caster-portable.zip`; the in-app updater reads that asset. Do not call
+PowerShell interactively or visibly: its detached updater helper uses
+`-NoProfile -NonInteractive -WindowStyle Hidden` and `CREATE_NO_WINDOW`.
+
 release.py refuses dirty tree. Deps in requirements.txt. soco optional — without it every
 other protocol still works, Sonos just never appears.
 
@@ -29,6 +34,8 @@ Build output `dist/Caster/`. ffmpeg.exe copied beside exe, 96 MB. Zip ~92 MB, 15
 - `caster_devices.py` - Sonos, Roku, Kodi, MusicCast. No caster imports. Keep it that way, no cycle
 - `caster_ui.py` — NvdaSpeaker, labelled(), HotkeyManager, TrayIcon, SettingsDialog
 - `caster_config.py` — Settings JSON at `%APPDATA%\Caster\settings.json`, QUALITY_PRESETS
+- `caster_update.py` — opt-in GitHub Release update check/download and hidden
+  post-exit portable installer
 
 ## Accessibility rules — hard
 

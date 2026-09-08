@@ -23,6 +23,8 @@ A vibe-coded, screen-reader-friendly desktop caster for Windows. Send a file, a 
 - Audio/video offset control for receivers that run sound ahead of picture.
 - Six system-wide hotkeys, so casting never requires finding the window.
 - Sleep timer, tray controls, favourites, and a recent-URLs list.
+- An opt-in update check that downloads an official portable release and
+  updates invisibly after Caster closes.
 - Speaks status through NVDA directly, rather than leaving it in a status bar nobody is reading.
 
 ## Accessibility
@@ -43,6 +45,11 @@ Grab the latest build from the [Releases page](https://github.com/serrebidev/Cas
 `ffmpeg.exe` ships beside the executable, so there is nothing else to install.
 
 Settings live in `%APPDATA%\Caster\settings.json`. Deleting the folder you extracted leaves them untouched.
+
+To update an existing portable copy, choose **Help > Check for updates**.
+Caster checks its official GitHub Releases page, asks before downloading, then
+closes, replaces its portable files invisibly, and opens the new version. It
+never checks, downloads, or installs an update automatically.
 
 ## Run from source
 

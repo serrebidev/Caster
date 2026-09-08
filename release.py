@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -106,7 +107,9 @@ def main() -> None:
                         capture_output=True).stdout.splitlines()
     if not ff:
         raise SystemExit("ffmpeg.exe not found on PATH")
-    run(["cp", ff[0], os.path.join("dist", "Caster", "ffmpeg.exe")])
+    # Use Python's native copy instead of relying on a Unix-style ``cp``
+    # executable being installed on a Windows build machine.
+    shutil.copy2(ff[0], os.path.join(ROOT, "dist", "Caster", "ffmpeg.exe"))
 
     # Zip the portable folder.
     zp = os.path.join(ROOT, "dist", "Caster-portable.zip")
@@ -122,6 +125,16 @@ def main() -> None:
                 count += 1
     print(f"{vtag}: {count} files -> dist/Caster-portable.zip "
           f"({os.path.getsize(zp) / 1e6:.1f} MB)")
+
+    if mode != "--no-bump":
+        # The in-app updater reads GitHub Releases, so a local zip is not a
+        # release until its tag and portable asset are published there.
+        # Release tags are lightweight, so --follow-tags deliberately skips
+        # them.  Push the branch and this exact tag explicitly.
+        run(["git", "push", "origin", "HEAD"])
+        run(["git", "push", "origin", vtag])
+        run(["gh", "release", "create", vtag, zp,
+             "--title", f"Caster {vtag}", "--generate-notes"])
 
 
 if __name__ == "__main__":

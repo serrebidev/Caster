@@ -102,6 +102,7 @@ from caster_ui import (
     TrayIcon,
     labelled,
 )
+import caster_update
 
 APP_TITLE = "Caster"
 APP_VERSION = "0.5.6"
@@ -1329,6 +1330,9 @@ class MainFrame(wx.Frame):
         h = wx.Menu()
         mi_keys = h.Append(wx.ID_ANY, "&Keyboard shortcuts")
         self.Bind(wx.EVT_MENU, lambda e: self._show_shortcuts(), mi_keys)
+        mi_update = h.Append(wx.ID_ANY, "Check for &updates...",
+                             "Check GitHub Releases for a newer Caster")
+        self.mi_update_id = mi_update.GetId()
         mi_about = h.Append(wx.ID_ABOUT, "&About")
         self.Bind(wx.EVT_MENU,
                   lambda e: wx.MessageBox(
@@ -1364,6 +1368,8 @@ class MainFrame(wx.Frame):
                   id=self.mi_add_fav_id)
         self.Bind(wx.EVT_MENU, lambda e: self.remove_favourite(),
                   id=self.mi_del_fav_id)
+        self.Bind(wx.EVT_MENU, lambda e: self.check_for_updates(),
+                  id=self.mi_update_id)
         self.url_box.Bind(wx.EVT_TEXT_ENTER, lambda e: self.play())
         self.Bind(wx.EVT_MENU, lambda e: self.open_file(),
                   id=self.mi_file_id)
@@ -1427,6 +1433,64 @@ class MainFrame(wx.Frame):
             "Space ticks a device for multi-room\n\n"
             "Anywhere in Windows:\n" + HotkeyManager.describe(),
             "Keyboard shortcuts", wx.ICON_INFORMATION)
+
+    def check_for_updates(self) -> None:
+        """Check GitHub Releases without holding the wx event loop."""
+        self.set_status("Checking for updates...", speak=False)
+
+        def worker() -> None:
+            update = caster_update.latest_update(APP_VERSION)
+            if update is None:
+                self._ui(self.set_status, "No newer release found.")
+                return
+            self._ui(self._offer_update, update)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="caster-update-check").start()
+
+    def _offer_update(self, update) -> None:
+        version = ".".join(map(str, update.version))
+        answer = wx.MessageBox(
+            f"Caster {version} is available. Download and install it?\n\n"
+            "Caster will close only after the download completes.",
+            "Caster update", wx.YES_NO | wx.YES_DEFAULT | wx.ICON_INFORMATION,
+            self)
+        if answer != wx.YES:
+            self.set_status("Update not downloaded.", speak=False)
+            return
+        self.set_status(f"Downloading Caster {version}...", speak=False)
+
+        def worker() -> None:
+            try:
+                archive = caster_update.download(update)
+            except Exception as exc:
+                self._ui(self.set_status, f"Update download failed: {exc}")
+                return
+            self._ui(self._install_update, update, archive)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="caster-update-download").start()
+
+    def _install_update(self, update, archive: str) -> None:
+        version = ".".join(map(str, update.version))
+        answer = wx.MessageBox(
+            f"Caster {version} is downloaded and ready to install.\n\n"
+            "Install now? Caster will close, update invisibly, and reopen.",
+            "Caster update", wx.YES_NO | wx.YES_DEFAULT | wx.ICON_INFORMATION,
+            self)
+        if answer != wx.YES:
+            caster_update.discard(archive)
+            self.set_status("Update cancelled.", speak=False)
+            return
+        try:
+            caster_update.launch_installer(archive)
+        except Exception as exc:
+            caster_update.discard(archive)
+            self.set_status(f"Update install failed: {exc}")
+            return
+        self.set_status(f"Installing Caster {version}.")
+        # The detached helper waits for this process to release Caster.exe.
+        self.Close()
 
     def selected_devices(self) -> list:
         """Every ticked device, or just the highlighted one if none is ticked.
