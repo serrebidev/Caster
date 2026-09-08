@@ -1506,7 +1506,8 @@ class MainFrame(wx.Frame):
         version = ".".join(map(str, update.version))
         answer = wx.MessageBox(
             f"Caster {version} is downloaded and ready to install.\n\n"
-            "Install now? Caster will close, update invisibly, and reopen.",
+            "Install now? All running copies of Caster will close, ending "
+            "any active casts. Caster will update invisibly and reopen.",
             "Caster update", wx.YES_NO | wx.YES_DEFAULT | wx.ICON_INFORMATION,
             self)
         if answer != wx.YES:

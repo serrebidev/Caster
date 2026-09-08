@@ -9,6 +9,8 @@ import json
 import os
 import subprocess
 import sys
+import shutil
+import uuid
 from pathlib import Path
 import zipfile
 
@@ -142,13 +144,31 @@ def test_real_powershell_installs_nested_payload_with_literal_paths(tmp_path, mo
     command = calls[0][0][0]
     script = Path(command[-1])
     content = script.read_text(encoding="utf-8")
+    # Exercise termination with two real, isolated processes. Never target
+    # the user's Caster instances from automated tests.
+    process_name = 'CasterTest' + uuid.uuid4().hex[:8]
+    executable = tmp_path / (process_name + '.exe')
+    shutil.copy2(Path(os.environ['SystemRoot']) / 'System32' / 'ping.exe', executable)
+    children = [subprocess.Popen([str(executable), '-t', '127.0.0.1'],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                for _ in range(2)]
+    content = content.replace("-Name 'Caster'", "-Name '" + process_name + "'")
     content = content.replace(
         "Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir -WindowStyle Hidden",
         "throw 'Simulated restart failure'" if fail_restart else
         "Set-Content -LiteralPath (Join-Path $appDir 'restarted.txt') -Value 'yes'")
     script.write_text(content, encoding="utf-8")
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+    try:
+        assert all(child.poll() is None for child in children)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=40)
+        assert all(child.poll() is not None for child in children)
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
     log = (tmp_path / "install.log").read_text() if (tmp_path / "install.log").exists() else ""
     if fail_restart:
         assert result.returncode == 1

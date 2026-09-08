@@ -29,6 +29,11 @@ files with -LiteralPath into matching relative destinations, retry transient
 locks, and retain backups until restart succeeds. Failures go to
 %LOCALAPPDATA%\Caster\updates\install.log. Run the real Windows PowerShell
 integration tests, including failed-restart rollback, before releasing changes.
+The updater must stop ALL Caster.exe instances before file replacement, not
+only the requesting PID. A second portable instance caused the v0.5.10 update
+to fail with a locked executable. Allow bounded graceful shutdown, then force
+termination and verify exit. Tests substitute unique process names and must
+never terminate a user's running Caster processes.
 
 release.py refuses dirty tree. Deps in requirements.txt. soco optional — without it every
 other protocol still works, Sonos just never appears.

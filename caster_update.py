@@ -160,7 +160,6 @@ def launch_installer(archive: str, app_dir: str = "", pid: int = 0) -> None:
     encoded = base64.b64encode(json.dumps(values).encode("utf-8")).decode("ascii")
     content = """$ErrorActionPreference = 'Stop'
 $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')) | ConvertFrom-Json
-$pidToWait = $config.pid
 $archive = $config.archive
 $appDir = $config.app_dir
 $helperDir = $config.helper_dir
@@ -169,14 +168,29 @@ $changed = [Collections.Generic.List[object]]::new()
 $backupRoot = Join-Path $helperDir 'backup'
 try {{
 Add-Content -LiteralPath $log -Value 'Starting Caster update.'
-while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
-    Start-Sleep -Milliseconds 250
-}}
 $stage = Join-Path $helperDir 'payload'
 Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force
 if (-not (Test-Path -LiteralPath (Join-Path $stage 'Caster.exe'))) {{
     throw 'Update archive does not contain Caster.exe.'
 }}
+# Every portable instance can hold the executable or bundled DLLs open.
+# Finish extraction first, then stop all Caster.exe instances, not just the
+# requesting PID. Give windowed instances a bounded chance to clean up audio
+# and encoders; forcibly terminate any remaining processes.
+$casters = @(Get-Process -Name 'Caster' -ErrorAction SilentlyContinue)
+foreach ($caster in $casters) {{
+    if (-not $caster.HasExited) {{ $caster.CloseMainWindow() | Out-Null }}
+}}
+foreach ($caster in $casters) {{
+    if (-not $caster.HasExited -and -not $caster.WaitForExit(5000)) {{
+        Stop-Process -InputObject $caster -Force -ErrorAction Stop
+        if (-not $caster.WaitForExit(5000)) {{ throw 'Caster did not exit; update stopped.' }}
+    }}
+}}
+if (Get-Process -Name 'Caster' -ErrorAction SilentlyContinue) {{
+    throw 'A Caster instance is still running; update stopped before replacing files.'
+}}
+Add-Content -LiteralPath $log -Value 'All Caster instances exited.'
 # Copy explicit literal filenames, including hidden files, into the matching
 # relative destinations. Pipeline FileInfo paths can be wildcard-expanded and
 # directory-copy semantics can produce nested _internal directories.
