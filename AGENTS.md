@@ -378,6 +378,17 @@ stall.
 
 ## Diagnostics
 
+## Live under-feed recovery (2026-09-07)
+
+The relay must rotate a capped live HTTP connection before the Cast cushion is
+empty, not only after it has fallen to an extreme rate. `HlsRelay` now treats
+under 0.85x media time as sustained under-feed (two 15-second measurements)
+and under 0.60x as immediate starvation. The measurement sums the actual
+`EXTINF` durations for newly written segments; never infer it by multiplying a
+segment count by the last segment's duration, because a long GOP can conceal a
+slow connection. Rotation remains live-HTTP-only, has a 30-second startup
+grace period, and cannot occur more often than every 90 seconds.
+
 Never put real stream URLs or their credentials in source code, tests, or
 agent notes. Use example.invalid fixtures and runtime arguments for live
 checks. Diagnostic traces must not record stream URLs.

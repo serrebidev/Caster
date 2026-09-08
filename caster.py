@@ -437,13 +437,18 @@ class HlsRelay:
     #: fresh connection, which opens hot again: kill the starved encoder and
     #: let the supervisor's restart path bring one up in place (same dir,
     #: continuing numbering, monotonic playlist). Conservative by design: two
-    #: consecutive ~20s windows below 55% of real time, only for sources the
-    #: caller certifies live, never sooner than a minute after (re)start or
-    #: 90s after the previous rotation.
-    ROTATE_RATIO = 0.55      # media-seconds per wall-second that reads as fed
-    ROTATE_EVAL = 20.0       # seconds between cadence evaluations
-    ROTATE_STREAK = 2        # consecutive under-fed windows before rotating
-    ROTATE_MIN_AGE = 45.0    # do not judge an encoder younger than this
+    #: Sustained under-feed rotation applies only to caller-certified live
+    #: HTTP sources, after a short startup grace period and no more than once
+    #: per 90 seconds.
+    # A receiver consumes one media-second per wall-second.  Waiting for the
+    # old 0.55x threshold meant an 18-second Cast cushion had already drained
+    # before a throttled source was rotated.  Detect ordinary under-feed while
+    # there is still room to reconnect; rotate a truly starved feed at once.
+    ROTATE_RATIO = 0.85      # sustained media-seconds per wall-second
+    ROTATE_HARD_RATIO = 0.60 # one window: cushion would otherwise run out
+    ROTATE_EVAL = 15.0       # long-GOP streams still yield stable measurements
+    ROTATE_STREAK = 2        # ordinary under-feed needs confirmation
+    ROTATE_MIN_AGE = 30.0    # let a fresh connection settle before judging it
     ROTATE_MIN_GAP = 90.0    # floor between forced rotations
 
     def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
@@ -662,17 +667,20 @@ class HlsRelay:
             return
         # Close the window and open the next one.
         self._eval_t0 = (now, newest)
-        seg_dur = self._read_seg_dur()
-        if not seg_dur or seg_dur <= 0:
+        media = self._media_since(n0)
+        if media is None:
             return
-        # Media produced per wall-second. A live encoder keeping up scores
-        # ~1.0; one provider's cap measured 0.44.
-        ratio = (newest - n0) * seg_dur / span
+        # Media produced per wall-second.  Sum the actual EXTINF durations of
+        # newly written segments rather than multiplying by the latest one:
+        # source GOPs vary, and a long final segment otherwise makes a slow
+        # connection look healthy (or a healthy one look starved).
+        ratio = media / span
         if ratio >= self.ROTATE_RATIO:
             self._fail_streak = 0
             return
         self._fail_streak += 1
-        if self._fail_streak < self.ROTATE_STREAK:
+        if (ratio >= self.ROTATE_HARD_RATIO
+                and self._fail_streak < self.ROTATE_STREAK):
             return
         # Sustained under-feed: rotate to a connection that opens hot.
         self._last_rotate = now
@@ -687,26 +695,33 @@ class HlsRelay:
         except Exception:
             pass   # already gone; nothing to kill
 
-    def _read_seg_dur(self) -> Optional[float]:
-        """Media seconds per segment, from the encoder's own EXTINF line.
+    def _media_since(self, after: int) -> Optional[float]:
+        """Return exact media seconds in segments numbered after ``after``.
 
-        Used as the cadence yardstick: at full rate a segment lands every
-        EXTINF seconds of wall time, so this sidesteps hls_time's overcut.
+        The raw encoder playlist is deliberately wider than the served Cast
+        window, so each short cadence evaluation can read the segment
+        durations it needs even when the receiver is held behind live.
         """
         if self.root is None:
             return None
         try:
             with open(os.path.join(self.root, "live.m3u8"), "r",
-                      encoding="utf-8", errors="replace") as f:
+                       encoding="utf-8", errors="replace") as f:
                 dur = None
+                total = 0.0
                 for line in f:
                     if line.startswith("#EXTINF:"):
                         try:
                             dur = float(line.split(":", 1)[1]
-                                        .split(",", 1)[0])
+                                         .split(",", 1)[0])
                         except (ValueError, IndexError):
                             dur = None
-                return dur
+                        continue
+                    name = re.fullmatch(r"seg(\d+)\.ts", line.strip())
+                    if name and dur is not None and int(name.group(1)) > after:
+                        total += dur
+                    dur = None
+                return total
         except OSError:
             return None
 

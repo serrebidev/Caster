@@ -1057,18 +1057,20 @@ def test_underfeed_rotation_kills_a_starved_encoder(relay):
     """Two consecutive under-fed windows rotate to a fresh connection.
 
     One provider's cap measured 0.44 media-seconds per wall-second: a
-    20s window that should yield eight 2.5s segments yields three or four.
+    A 20s window that should yield eight 2.5s segments yields six.  It is
+    under the sustained 0.85x threshold but not so starved that it should
+    rotate on one measurement.
     The relay must kill the encoder so the supervisor restarts it, because
     ffmpeg itself never notices -- the connection stays up, just slow.
     """
     r = _live_relay(relay)
     _segments(r.root, 40)          # newest seg00039
     r._check_underfeed(160.0)      # opens the cadence window
-    _segments(r.root, 43)          # +3 in 20s: 0.375x -- under-fed
+    _segments(r.root, 46)          # +6 in 20s: 0.75x -- under-fed
     r._check_underfeed(180.0)
     assert r._fail_streak == 1
     assert r.proc.killed == 0      # one bad window is not enough
-    _segments(r.root, 46)          # +3 more: still 0.375x
+    _segments(r.root, 52)          # +6 more: still 0.75x
     r._check_underfeed(200.0)
     assert r._fail_streak == 0
     assert r.proc.killed == 1      # rotated
@@ -1090,6 +1092,38 @@ def test_underfeed_rotation_leaves_a_healthy_encoder_alone(relay):
     r._check_underfeed(200.0)
     assert r.proc.killed == 0
     assert r._rotated == 0
+
+
+def test_underfeed_rotation_immediately_replaces_a_starved_encoder(relay):
+    """A 0.44x provider cap drains the Cast cushion before a second window."""
+    r = _live_relay(relay)
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    _segments(r.root, 43)          # +3 in 20s: 0.375x, below hard limit
+    r._check_underfeed(180.0)
+    assert r.proc.killed == 1
+    assert r._rotated == 1
+
+
+def test_underfeed_rotation_sums_actual_new_segment_durations(relay):
+    """A long final GOP must not hide starvation in the preceding segments."""
+    r = _live_relay(relay)
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    durations = [2.5] * 40 + [0.1, 0.1, 0.1, 10.0]
+    for n in range(40, 44):
+        with open(os.path.join(r.root, f"seg{n:05d}.ts"), "wb"):
+            pass
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-MEDIA-SEQUENCE:0"]
+    for n, duration in enumerate(durations):
+        lines += [f"#EXTINF:{duration},", f"seg{n:05d}.ts"]
+    with open(os.path.join(r.root, "live.m3u8"), "w",
+              encoding="utf-8", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+    r._check_underfeed(180.0)
+    # The exact 10.3 media seconds are 0.515x.  Multiplying the four new
+    # segments by the final 10-second GOP would incorrectly call it 2.0x.
+    assert r.proc.killed == 1
 
 
 def test_underfeed_rotation_requires_certified_live_http(relay):
@@ -1120,7 +1154,7 @@ def test_underfeed_rotation_waits_for_a_window_and_encoder_age(relay):
     ROTATE_MIN_AGE before it is judged at all."""
     r = _live_relay(relay)
     _segments(r.root, 40)
-    r._check_underfeed(120.0)      # age 20s < 45s: not judged
+    r._check_underfeed(120.0)      # age 20s < minimum: not judged
     assert r._eval_t0 is None
     _segments(r.root, 40)
     r._proc_born = 100.0
