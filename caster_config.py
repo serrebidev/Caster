@@ -243,18 +243,25 @@ class Settings:
 #: them is a 45-second wait, not a six-second one. Three segments satisfy the
 #: receiver whatever their length; asking for more only makes a long-GOP
 #: channel look broken.
+#:
+#: `hls_trail_seconds` is the same cushion measured the way that actually
+#: matters. A count of segments says nothing about time when the source cuts
+#: them at its own keyframes: on one live channel eight segments ran from 25
+#: to 40 seconds, while the input arrived in bursts up to 13 seconds apart.
+#: The cushion has to cover the worst of those bursts with room to spare, so
+#: it is a floor in seconds and the segment count is only its lower bound.
 QUALITY_PRESETS = {
     "latency": {"fps": 30, "bitrate": "3M", "max_width": 1280,
                 "max_height": 720, "keyframe_seconds": 0.4,
-                "hls_time": 2, "hls_prime": 3, "hls_trail": 6,
+                "hls_time": 2, "hls_prime": 3, "hls_trail": 6, "hls_trail_seconds": 25,
                 "label": "Lowest delay (720p)"},
     "balanced": {"fps": 30, "bitrate": "6M", "max_width": 1920,
                  "max_height": 1080, "keyframe_seconds": 0.5,
-                 "hls_time": 2, "hls_prime": 3, "hls_trail": 8,
+                 "hls_time": 2, "hls_prime": 3, "hls_trail": 8, "hls_trail_seconds": 45,
                  "label": "Balanced (1080p)"},
     "quality": {"fps": 60, "bitrate": "12M", "max_width": 1920,
                 "max_height": 1080, "keyframe_seconds": 1.0,
-                "hls_time": 2, "hls_prime": 3, "hls_trail": 12,
+                "hls_time": 2, "hls_prime": 3, "hls_trail": 12, "hls_trail_seconds": 60,
                 "label": "Best picture (1080p60)"},
 }
 

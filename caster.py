@@ -587,6 +587,12 @@ class HlsRelay:
     # minimum-buffer rule of 3x TARGETDURATION, below which it refuses to
     # start at all.
     TRAIL_KEEP = 6
+    #: The same cushion as a floor in seconds. A segment count is the wrong
+    #: unit when the source cuts on its own keyframes: measured on one live
+    #: channel, eight segments was anywhere from 25 to 40 seconds while the
+    #: input arrived in bursts up to 13 seconds apart. Whichever of the two
+    #: is deeper wins.
+    TRAIL_SECONDS = 45.0
 
     #: Sustained under-feed detection. Some IPTV CDNs cap a connection's
     #: throughput by age: it opens at full rate and decays (measured at 0.44x
@@ -615,7 +621,8 @@ class HlsRelay:
 
     def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
                  trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None,
-                 live: Optional[bool] = None) -> None:
+                 live: Optional[bool] = None,
+                 trail_seconds: float = TRAIL_SECONDS) -> None:
         self.url = url
         #: Segment length. Shorter means the receiver can start sooner, since
         #: everything below is counted in segments, not seconds.
@@ -624,6 +631,7 @@ class HlsRelay:
         #: floor, not a preference: it is what clears 3x TARGETDURATION.
         self.prime_segments = max(3, int(prime_segments))
         self.trail_keep = max(3, int(trail_keep))
+        self.trail_seconds = max(0.0, float(trail_seconds))
         #: Stream codecs, when the caller has already paid to find them out.
         #: Probing costs a whole extra connection to the source, and IPTV
         #: servers are slow to accept one and slower to authorise it.
@@ -1130,18 +1138,19 @@ class HlsRelay:
         if not segs:
             return None
         drop = max(0, len(segs) - self.trail_keep)
-        # Keep enough actual media for the receiver's 3x TARGETDURATION
-        # requirement, even when several short GOPs follow one long GOP.
-        # Eight segments on the affected channel measured only 22 seconds
-        # while TARGETDURATION was 10: the old fixed-count trim undercut 30s.
+        # Keep enough actual media, in seconds. Two floors apply: the cast
+        # receiver refuses to start below 3x TARGETDURATION, and this source
+        # delivers in bursts, so the cushion has to outlast the longest quiet
+        # spell between them or the receiver reaches the end and rebuffers.
         try:
             target = float(next(l.split(":", 1)[1] for l in lines
                                 if l.startswith("#EXT-X-TARGETDURATION:")))
             durations = [float(l.split(":", 1)[1].rstrip(",")) for l in lines
                          if l.startswith("#EXTINF:")]
             if len(durations) == len(segs):
+                want = max(3 * target, self.trail_seconds)
                 total = sum(durations[drop:])
-                while drop > 0 and total < 3 * target:
+                while drop > 0 and total < want:
                     drop -= 1
                     total += durations[drop]
         except (ValueError, StopIteration):
@@ -2698,6 +2707,7 @@ class MainFrame(wx.Frame):
                         hls_time=chosen["hls_time"],
                         prime_segments=chosen["hls_prime"],
                         trail_keep=chosen["hls_trail"],
+                        trail_seconds=chosen["hls_trail_seconds"],
                         codecs=codecs, live=live)
 
     def _play_chromecast(self, dev: Device, url: str, mime: str = "",

@@ -403,6 +403,16 @@ hashes across local HLS segments. It confirmed hundreds of repeated video
 packets immediately after encoder restarts while the Cast clock kept moving;
 playlist sequence monotonicity alone does not prove unique content.
 
+The receiver's cushion is a DURATION, not a segment count (`hls_trail_seconds`).
+A count says nothing about time when the source cuts on its own keyframes:
+measured on the live channel, segments ran 1.0s to 7.9s, so the eight-segment
+cushion was 34s while input arrived in bursts up to 13s apart. The floor is
+`max(3 * TARGETDURATION, trail_seconds)` -- the receiver's own minimum-buffer
+rule still applies underneath. Set it from the quality preset: it is delay
+traded against tolerance, which is the user's choice, not a constant. Serve
+whatever exists before the cushion is deep enough, or every channel start
+becomes a minute of silence.
+
 ## Live TS ingest (2026-09-07)
 
 The IPTV source does not hold a connection. Measured: it closes every 3-9

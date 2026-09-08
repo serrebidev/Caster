@@ -354,9 +354,14 @@ def _playlist(seq: int, first: int, count: int, target: int = 2) -> str:
 
 @pytest.fixture
 def relay(tmp_path):
-    """A relay with a temp root and no ffmpeg, server or thread behind it."""
+    """A relay with a temp root and no ffmpeg, server or thread behind it.
+
+    trail_seconds=0 leaves the receiver's own 3x TARGETDURATION floor as
+    the only one, so these tests exercise segment-count trimming. The
+    seconds-based cushion has its own tests.
+    """
     r = HlsRelay("http://example.invalid/live.ts", hls_time=2,
-                 prime_segments=3, trail_keep=8)
+                 prime_segments=3, trail_keep=8, trail_seconds=0)
     r.root = str(tmp_path)
     return r
 
@@ -1404,3 +1409,67 @@ def test_encoder_last_words_never_repeats_the_source_url():
     words = r.encoder_last_words()
     assert "secret" not in words
     assert "<source>" in words
+
+
+# --------------------------------------------------------------------------
+# The cushion is a duration, not a segment count
+# --------------------------------------------------------------------------
+
+def _deep_relay(tmp_path, seconds):
+    r = HlsRelay("http://example.invalid/live.ts", hls_time=2,
+                 prime_segments=3, trail_keep=8, trail_seconds=seconds)
+    r.root = str(tmp_path)
+    return r
+
+
+def test_cushion_holds_its_seconds_when_segments_are_short(tmp_path):
+    """Eight one-second segments is eight seconds, and that is not a cushion.
+
+    Measured on a live channel: the source cuts at its own keyframes, so a
+    fixed count of them bought anywhere from 25 to 40 seconds while the input
+    arrived in bursts up to 13 seconds apart. Whoever is short wins, and it
+    has to be the seconds.
+    """
+    r = _deep_relay(tmp_path, 45)
+    out = _serve(r, _playlist(0, 0, 60, target=1))
+    held = sum(float(l.split(":")[1].rstrip(",")) for l in out.splitlines()
+               if l.startswith("#EXTINF:"))
+    assert held >= 45
+    assert out.count("#EXTINF:") > r.trail_keep
+
+
+def test_cushion_never_undercuts_the_receivers_own_floor(tmp_path):
+    """3x TARGETDURATION is the receiver's rule, not a preference.
+
+    A shallow preset must not talk the relay below the depth a cast receiver
+    refuses to start at.
+    """
+    r = _deep_relay(tmp_path, 0)
+    raw = _playlist(0, 0, 40).replace("#EXT-X-TARGETDURATION:2",
+                                      "#EXT-X-TARGETDURATION:10")
+    out = _serve(r, raw)
+    held = sum(float(l.split(":")[1].rstrip(",")) for l in out.splitlines()
+               if l.startswith("#EXTINF:"))
+    assert held >= 30
+
+
+def test_cushion_serves_what_there_is_before_it_is_deep_enough(tmp_path):
+    """A channel that has only just started must still play.
+
+    Waiting for the full cushion before serving anything would turn every
+    start into a minute of silence.
+    """
+    r = _deep_relay(tmp_path, 45)
+    out = _serve(r, _playlist(0, 0, 6, target=1))
+    assert out.count("#EXTINF:") == 6
+    assert _seq_of(out) == 0
+
+
+def test_deeper_cushion_is_configured_by_the_quality_preset():
+    """The delay/robustness trade stays the user's, as it is for hls_trail."""
+    import caster_config
+    depths = {name: p["hls_trail_seconds"]
+              for name, p in caster_config.QUALITY_PRESETS.items()}
+    assert depths["latency"] < depths["balanced"] < depths["quality"]
+    assert all(d >= 13 for d in depths.values()), \
+        "a cushion under the measured 13s input burst is no cushion"
