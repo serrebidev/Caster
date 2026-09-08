@@ -472,9 +472,15 @@ class TsSource(threading.Thread):
     """
 
     #: Bytes of already-forwarded stream kept to recognise a replay in. Must
-    #: comfortably exceed the server's buffer depth: ~30s at 2 Mb/s against a
-    #: measured 4.3s replay. It is a bounded window, not a recording.
-    OVERLAP_KEEP = 8 << 20
+    #: comfortably exceed the server's buffer depth. A missed match is not a
+    #: dropped frame but the "it keeps jumping backwards" bug, so the window
+    #: is sized for the worst replay seen and then some: rotating for
+    #: throughput reconnects far more often than the server's own drops did,
+    #: and the replay grows with the reconnect rate. Measured 2026-09-08 at a
+    #: ~10s rotation cadence, replays reached 5.7 MB against a 3.58 Mb/s
+    #: channel -- 1.4x margin on the old 8 MB. 16 MB is ~36s at that
+    #: bitrate. It is a bounded window, not a recording.
+    OVERLAP_KEEP = 16 << 20
     #: How much of a new connection to match. Long enough that a coincidental
     #: match is impossible, short enough to decide within one read.
     PROBE = 32 << 10
@@ -611,10 +617,40 @@ class HlsRelay:
     # there is still room to reconnect; rotate a truly starved feed at once.
     ROTATE_RATIO = 0.85      # sustained media-seconds per wall-second
     ROTATE_HARD_RATIO = 0.60 # one window: cushion would otherwise run out
-    ROTATE_EVAL = 15.0       # long-GOP streams still yield stable measurements
+    #: The measurement window. It cannot be shortened to chase a faster
+    #: rotation cadence: a source that delivers in bursts is idle between
+    #: them, and a window shorter than its burst period can land entirely
+    #: inside one gap and read 0x on a perfectly healthy stream. One
+    #: provider (2026-09-08) bursts at up to 131 Mb/s with gaps to 10.6s
+    #: between them while tracking real time exactly; a 10s window rotated
+    #: it twice in three minutes for no reason, a 15s window not once in
+    #: four. `3 * longest segment` covers a long GOP; this covers bursty
+    #: delivery, which the segment length says nothing about.
+    ROTATE_EVAL = 15.0
     ROTATE_STREAK = 2        # ordinary under-feed needs confirmation
+    #: Rotation costs what the path costs. Killing the encoder buys a fresh
+    #: connection at the price of a restart, a discontinuity and a priming
+    #: pause, so it stays rare. On the piped path (TsSource) it is a socket
+    #: swap: ffmpeg never notices, there is no seam, and the only cost is the
+    #: ~2s connect and whatever replay the dedupe cannot drop. The old single
+    #: 90s floor priced both the same and throttled the cheap one to match
+    #: the expensive one.
+    #:
+    #: Measured against one provider (2026-09-08), unique deduplicated feed
+    #: against a 3.58 Mb/s channel, by how long each connection was held:
+    #: 8s -> 2.27x, 15s -> 1.20x, 30s -> 0.89x, never -> 0.57x. The server
+    #: opens hot and decays within ~10 seconds, and the cap is per
+    #: connection, not per account: two simultaneous connections each ran at
+    #: the full opening rate. Holding one for 90s therefore guaranteed a
+    #: 0.57x feed -- the cushion drained about once every 90s, which is what
+    #: "it buffers once in a while" was. ROTATE_EVAL bounds how often the
+    #: verdict can arrive, so the real cadence is ~15s and the feed it buys
+    #: is 1.20x: less than a 8s cadence would give, and the most that can be
+    #: taken without misjudging a bursty source.
     ROTATE_MIN_AGE = 30.0    # let a fresh connection settle before judging it
     ROTATE_MIN_GAP = 90.0    # floor between forced rotations
+    ROTATE_MIN_AGE_PIPED = 12.0  # a socket swap needs no settling time
+    ROTATE_MIN_GAP_PIPED = 10.0  # match a provider that decays in ~10s
     #: Lines of ffmpeg diagnostics kept for the last exit. A stuck encoder
     #: can print one warning per frame, so this is a ring, not a log.
     STDERR_KEEP = 40
@@ -910,9 +946,14 @@ class HlsRelay:
             return
         if not self.url.lower().startswith(("http://", "https://")):
             return
-        if now - self._proc_born < self.ROTATE_MIN_AGE:
+        # A socket swap is cheap and an encoder kill is not, so the two
+        # paths do not get to rotate at the same cadence.
+        piped = self.ts_source is not None
+        min_age = self.ROTATE_MIN_AGE_PIPED if piped else self.ROTATE_MIN_AGE
+        min_gap = self.ROTATE_MIN_GAP_PIPED if piped else self.ROTATE_MIN_GAP
+        if now - self._proc_born < min_age:
             return
-        if now - self._last_rotate < self.ROTATE_MIN_GAP:
+        if now - self._last_rotate < min_gap:
             return
         segments = self._completed_segments()
         if not segments:

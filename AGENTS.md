@@ -464,8 +464,54 @@ under 0.85x media time as sustained under-feed (two 15-second measurements)
 and under 0.60x as immediate starvation. The measurement sums the actual
 `EXTINF` durations for newly written segments; never infer it by multiplying a
 segment count by the last segment's duration, because a long GOP can conceal a
-slow connection. Rotation remains live-HTTP-only, has a 30-second startup
-grace period, and cannot occur more often than every 90 seconds.
+slow connection. Rotation remains live-HTTP-only.
+
+Rotation is priced by what the path costs, because the two paths do not cost
+the same. Killing the encoder buys a fresh connection at the price of a
+restart, a discontinuity and a priming pause, so it keeps a 30-second startup
+grace and a 90-second floor. On the piped path (`TsSource`) rotation is a
+socket swap: ffmpeg never notices, there is no seam, and the only cost is the
+reconnect plus whatever replay the dedupe cannot drop, so that path uses a
+12-second grace and a 10-second floor (`ROTATE_MIN_AGE_PIPED`,
+`ROTATE_MIN_GAP_PIPED`). A single 90-second floor for both throttled the cheap
+path to the expensive path's cadence.
+
+That mattered because these caps are per connection, not per account: two
+simultaneous connections to one provider each ran at the full opening rate,
+so a fresh socket really is a fresh allowance. Measured 2026-09-08 against a
+3.58 Mb/s channel, unique deduplicated feed by how long each connection was
+held: 8s gave 2.27x, 15s 1.20x, 30s 0.89x, and holding one indefinitely
+0.57x. The old floor pinned a degraded connection to that last figure, and a
+0.57x feed drains the cushion about once every 90 seconds -- the reported
+"it buffers once in a while".
+
+`ROTATE_EVAL` stays at 15s and must not be shortened to chase a faster
+cadence. `3 * longest segment` stretches the window for a long GOP, but it
+says nothing about how the bytes arrive, and a burst-delivery source is idle
+between bursts. A second provider (2026-09-08) bursts at up to 131 Mb/s with
+gaps of up to 10.6s while tracking real time exactly, at 720p60 with a 2.0s
+GOP -- so `3 * segment` is only 6s there. A 10s window landed inside those
+gaps and rotated a healthy connection twice in three minutes; a 15s window
+did not rotate once in four. The cadence that buys is ~15s, worth 1.20x on
+the throttled provider: less than an 8s cadence would give, and the most
+that can be taken without misjudging a bursty one.
+
+Beware when measuring this: the degradation is intermittent. A capture that
+shows a healthy 1.2x on a long connection has not disproved the throttle, it
+has missed it, so an end-to-end A/B on a live channel cannot be trusted to
+discriminate between cadences. Prefer the deduplicated-throughput-versus-
+connection-lifetime measurement above, which is reproducible within one run.
+
+Widening the reconnect rate widens the replay: at a ~10s cadence, replays
+reached 5.7 MB, only 1.4x margin on the old 8 MB `OVERLAP_KEEP`, and a single
+rotation on the burst-delivery provider replayed 6.8 MB. A missed match is
+not a dropped frame, it is the "keeps jumping backwards" bug, so the window
+is now 16 MB (~36s at 3.58 Mb/s).
+
+These two providers fail in opposite directions and a change here has to be
+measured against both: one throttles a held connection and needs rotating,
+the other delivers in bursts and must be left alone. Testing only the
+channel that prompted the change will ship a regression to the other.
 
 Never put real stream URLs or their credentials in source code, tests, or
 agent notes. Use example.invalid fixtures and runtime arguments for live

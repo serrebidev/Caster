@@ -1159,6 +1159,91 @@ def test_underfeed_rotation_sums_actual_new_segment_durations(relay):
     assert r.proc.killed == 1
 
 
+class _FakeSource:
+    """A stand-in TsSource: records how often the socket was dropped."""
+
+    def __init__(self) -> None:
+        self.rotations = 0
+
+    def rotate(self) -> None:
+        self.rotations += 1
+
+
+def test_piped_underfeed_drops_the_socket_and_never_the_encoder(relay):
+    """On the piped path a fresh connection costs a socket, not a restart.
+
+    ffmpeg is not holding the upstream socket there, so killing it would buy
+    a discontinuity and a priming pause and change nothing upstream.
+    """
+    r = _live_relay(relay)
+    r.ts_source = _FakeSource()
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)      # opens the cadence window
+    _segments(r.root, 41)          # 2.5s of media in 16s: 0.16x
+    r._check_underfeed(176.0)
+    assert r.ts_source.rotations == 1
+    assert r.proc.killed == 0      # the encoder sees one unbroken stream
+
+
+def test_piped_rotation_repeats_on_the_cadence_a_socket_swap_can_afford(relay):
+    """A source that decays in ~10s has to be rotated on that timescale.
+
+    Measured against one provider: held for 8s a connection yielded 2.27x
+    the channel bitrate, for 15s 1.20x, for 30s 0.89x, and held indefinitely
+    0.57x. The 90s floor pinned it to the last of those, so the cushion
+    drained roughly once every 90 seconds. That floor exists to stop an
+    encoder being killed every few seconds; a socket swap does not pay that
+    price and does not need that protection.
+    """
+    r = _live_relay(relay)
+    r.ts_source = _FakeSource()
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    _segments(r.root, 41)
+    r._check_underfeed(176.0)
+    assert r.ts_source.rotations == 1
+    # 8s after rotating is still inside the piped floor: no second window.
+    r._check_underfeed(184.0)
+    assert r._eval_t0 is None
+    # 11s after, the floor is clear and a still-starved source rotates again.
+    r._check_underfeed(187.0)      # opens the window
+    _segments(r.root, 42)
+    r._check_underfeed(203.0)
+    assert r.ts_source.rotations == 2
+
+
+def test_underfeed_will_not_judge_a_window_shorter_than_the_eval_period(relay):
+    """A burst-delivery source is idle between bursts, so a short window lies.
+
+    One provider bursts at up to 131 Mb/s with gaps of 10.6s while tracking
+    real time exactly. A window that lands inside a gap reads 0x; it must not
+    be allowed to close and rotate a healthy connection.
+    """
+    r = _live_relay(relay)
+    r.ts_source = _FakeSource()
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    # 12s later the source has published nothing: mid-burst-gap, not starved.
+    r._check_underfeed(172.0)
+    assert r.ts_source.rotations == 0
+    assert r._eval_t0 == (160.0, 39)   # the window is still open, not judged
+
+
+def test_encoder_path_keeps_the_long_floor_between_rotations(relay):
+    """Killing ffmpeg stays rare: a restart is a seam the receiver can see."""
+    r = _live_relay(relay)          # no ts_source: the encoder-kill path
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    _segments(r.root, 41)
+    r._check_underfeed(176.0)
+    assert r.proc.killed == 1
+    # The same timeline that rotates twice on the piped path rotates once here.
+    r._check_underfeed(187.0)
+    _segments(r.root, 42)
+    r._check_underfeed(203.0)
+    assert r.proc.killed == 1
+
+
 def test_underfeed_counts_segment_that_was_in_progress_at_window_start(relay):
     r = _live_relay(relay)
     _segments(r.root, 40, dur=10)
