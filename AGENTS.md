@@ -334,6 +334,48 @@ supervisor's restart count, EXT-X-MEDIA-SEQUENCE monotonicity, segment names,
 and hashing PCM blocks for repeats (a repeat offset by one sample hashes
 differently -- that test is useless).
 
+## An irregular source GOP is re-encoded, not endured
+
+`GOP_COPY_LIMIT` (5.0s): when priming shows a completed segment longer than
+this, the video is re-encoded with `-force_key_frames expr:gte(t,n_forced*N)`
+so keyframes land on segment boundaries. With `-c copy` a segment can only end
+on a keyframe, so segment length IS the source GOP and no playlist tuning can
+shorten it -- the receiver simply waits at the live edge for the next keyframe,
+heard as a stall of exactly that length. One channel measured keyframes 1.0s to
+7.7s apart, 27% over 4s, serving segments up to 8.9s, reported as "buffering
+between 3-7 seconds". Re-encoded, every segment is 2.00s.
+
+Detection is free and needs no extra probe connection: priming already writes
+segments, and with a copy their durations are the keyframe spacing. Decide
+BEFORE the URL is handed over -- the same switch made later is a mid-stream
+discontinuity, made during priming it is invisible and costs only a second
+prime (measured 14s -> 22s on that channel). `_discard_primed_segments` wipes
+the directory rather than leaving a seam, because re-encoded video does not
+continue the copied video's decoder configuration and the two must not share a
+playlist.
+
+Set the limit above every healthy source, not just below the broken one: three
+other providers measured 2.0-2.6s median with a 4.1s worst case, so 5.0s
+re-encodes only what a copy genuinely cannot serve. A clean channel must stay
+bit-exact -- verify that a known-good one still reports
+`force_keyframes=False` after any change here.
+
+`_Sink.attach` closes the pipe it replaces. Leaving it to the garbage
+collector means finalisation flushes into a killed encoder's pipe, and that
+failure lands outside every handler as an unraisable
+`OSError: [Errno 22] Invalid argument` at interpreter shutdown.
+
+## EXT-X-TARGETDURATION must not shrink
+
+RFC 8216 4.3.3.1 forbids it changing between reloads of a live playlist, and
+ffmpeg recomputes it from its own window -- so an irregular GOP made the served
+value oscillate 10 -> 6 -> 10. A player sizes its buffer and live-edge start
+distance from that number. `trailing_playlist` ratchets it: never decreasing,
+still free to grow, since an EXTINF longer than TARGETDURATION violates the
+spec in the other direction. ffmpeg writes the tag AHEAD of MEDIA-SEQUENCE, so
+it arrives in the `lines[:seq_idx]` prefix, not the header slice whose comment
+says "version/targetduration"; the ratchet is applied to both.
+
 ## HLS segment length is the source GOP, not hls_time
 
 With `-c copy` ffmpeg can only cut at a keyframe, so `-hls_time 1` on a source

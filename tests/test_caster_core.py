@@ -404,6 +404,40 @@ def test_trailing_playlist_sequence_never_goes_backwards(relay):
     assert seen == sorted(seen), f"MEDIA-SEQUENCE went backwards: {seen}"
 
 
+def _target_of(text: str) -> int:
+    lines = [l for l in text.splitlines()
+             if l.startswith("#EXT-X-TARGETDURATION:")]
+    assert len(lines) == 1, f"expected one TARGETDURATION line, got {lines}"
+    return int(lines[0].split(":", 1)[1])
+
+
+def test_trailing_playlist_target_duration_never_shrinks(relay):
+    """RFC 8216 4.3.3.1: TARGETDURATION must not change between reloads.
+
+    ffmpeg recomputes it from whatever is in its own window, so a source
+    whose GOP is irregular makes it oscillate -- measured 10 -> 6 -> 10 on
+    one channel with keyframes 1.0s to 7.7s apart. A player sizes its buffer
+    and its live-edge start distance from this number; handing it a smaller
+    one than it has already acted on invites a rebuffer.
+    """
+    seen = [_target_of(_serve(relay, _playlist(100, 100, 12, target=10))),
+            _target_of(_serve(relay, _playlist(101, 101, 12, target=6))),
+            _target_of(_serve(relay, _playlist(102, 102, 12, target=2))),
+            _target_of(_serve(relay, _playlist(103, 103, 12, target=10)))]
+    assert seen == [10, 10, 10, 10], f"TARGETDURATION shrank: {seen}"
+
+
+def test_trailing_playlist_target_duration_still_grows(relay):
+    """The ratchet must not pin it below a genuinely longer segment.
+
+    An EXTINF longer than TARGETDURATION is itself a violation, so when the
+    source's GOP lengthens the served value has to follow it up.
+    """
+    seen = [_target_of(_serve(relay, _playlist(100, 100, 12, target=2))),
+            _target_of(_serve(relay, _playlist(101, 101, 12, target=8)))]
+    assert seen == [2, 8], f"TARGETDURATION failed to grow: {seen}"
+
+
 def test_trailing_playlist_rewrites_a_short_playlist_too(relay):
     """A playlist shorter than trail_keep must still be rewritten.
 
@@ -1382,6 +1416,51 @@ class _Replaying(threading.Thread):
                     pass
 
 
+class _FakePipe:
+    """A stand-in for an encoder's stdin that records being closed."""
+
+    def __init__(self, fail_on_close: bool = False) -> None:
+        self.closed = 0
+        self.written = b""
+        self._fail_on_close = fail_on_close
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed += 1
+        if self._fail_on_close:
+            raise OSError(22, "Invalid argument")
+
+
+def test_sink_closes_the_pipe_it_replaces():
+    """A replaced encoder's stdin is closed here, not by the collector.
+
+    Its process has already been killed, so the flush that finalisation
+    attempts fails outside any handler -- an unraisable OSError at
+    interpreter shutdown rather than an error anything can catch.
+    """
+    sink = caster._Sink()
+    first, second = _FakePipe(), _FakePipe()
+    sink.attach(first)
+    sink.attach(second)
+    assert first.closed == 1
+    assert second.closed == 0
+    sink.write(b"x")
+    assert second.written == b"x"
+
+
+def test_sink_survives_a_pipe_that_fails_to_close():
+    """The dead pipe is the expected case, so its error cannot propagate."""
+    sink = caster._Sink()
+    sink.attach(_FakePipe(fail_on_close=True))
+    sink.attach(_FakePipe())          # must not raise
+    sink.write(b"y")
+
+
 def test_ts_source_drops_the_replayed_bytes_and_leaves_no_hole():
     """The whole point: one continuous stream out of a replaying source."""
     stream = _ts(3, 4000)          # ~750 KiB
@@ -1474,6 +1553,11 @@ def test_sink_survives_the_encoder_being_replaced():
 
         def flush(self):
             pass
+
+        def close(self):
+            # A real BufferedWriter has this, and _Sink closes the pipe it
+            # replaces rather than leaving it to the garbage collector.
+            self.closed = True
 
     first, second = Pipe(), Pipe()
     sink.attach(first)

@@ -439,7 +439,19 @@ class _Sink:
 
     def attach(self, file) -> None:
         with self._lock:
-            self._file = file
+            previous, self._file = self._file, file
+        if previous is not None and previous is not file:
+            # Dispose of the replaced pipe here rather than leaving it to the
+            # garbage collector. Its encoder has already been killed, so the
+            # buffered flush that finalisation attempts fails -- and it fails
+            # outside every handler that could deal with it, surfacing as an
+            # unraisable "OSError: [Errno 22] Invalid argument" during
+            # interpreter shutdown. write() swallows the same error; this is
+            # the one path that could not.
+            try:
+                previous.close()
+            except (OSError, ValueError):
+                pass
 
     def write(self, data: bytes) -> None:
         with self._lock:
@@ -651,6 +663,18 @@ class HlsRelay:
     ROTATE_MIN_GAP = 90.0    # floor between forced rotations
     ROTATE_MIN_AGE_PIPED = 12.0  # a socket swap needs no settling time
     ROTATE_MIN_GAP_PIPED = 10.0  # match a provider that decays in ~10s
+    #: Longest completed segment a stream copy may produce before the video
+    #: is re-encoded with forced keyframes. With -c copy a segment can only
+    #: end on a keyframe, so segment length IS the source GOP, and a channel
+    #: that emits one every 8s forces 8s segments -- the receiver then waits
+    #: that long at the live edge, heard as a stall of exactly that length.
+    #: Measured on one channel: keyframes 1.0s to 7.7s apart, 27% over 4s,
+    #: served segments up to 8.9s, reported as 3-7 second buffering. A clean
+    #: channel sits at hls_time (2s here) and never trips this; the two other
+    #: providers measured ran 2.0-2.6s median with a 4.1s worst case, so the
+    #: limit is set above them: only a source a copy cannot serve is
+    #: re-encoded.
+    GOP_COPY_LIMIT = 5.0
     #: Lines of ffmpeg diagnostics kept for the last exit. A stuck encoder
     #: can print one warning per frame, so this is a ring, not a log.
     STDERR_KEEP = 40
@@ -677,6 +701,9 @@ class HlsRelay:
         self.port = 0
         self.root = None
         self.video_transcoded = False  # True: source video not H.264
+        #: True: re-encode H.264 video purely to place keyframes, because the
+        #: source's own are too far apart to cut regular segments on.
+        self.force_keyframes = False
         self._trail_drop = None   # segments hidden from the served playlist
         self._last_good = None    # last known-good playlist bytes
         #: Highest EXT-X-MEDIA-SEQUENCE ever served. An HLS client treats a
@@ -684,6 +711,9 @@ class HlsRelay:
         #: is a ratchet: whatever ffmpeg's own numbering does across a
         #: restart, what leaves here never decreases.
         self._served_seq = None
+        #: Highest EXT-X-TARGETDURATION ever served, for the same reason: the
+        #: spec forbids it changing, and ffmpeg varies it on an irregular GOP.
+        self._served_target = None
         self._restarted = 0       # upstream-drop restarts (diagnostics)
         #: True only when the caller certifies the source is live. Under-feed
         #: rotation restarts a connection from the live edge, which for a VOD
@@ -744,31 +774,27 @@ class HlsRelay:
 
             m3u8 = os.path.join(self.root, "live.m3u8")
             self._spawn_ffmpeg()
-            # Prime: accumulate the minimum backlog the receiver will accept
-            # BEFORE handing it the URL. On a live source these segments
-            # arrive in real time, so every one asked for here is a second of
-            # the wait -- which is why this is the floor and not a cushion.
-            # The cushion is trail_keep, and that costs nothing up front.
-            # Long-GOP input may need more than 25s to publish three target
-            # durations. Return immediately when ready, but allow that real
-            # media requirement to be met before declaring startup failure.
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
-                if os.path.exists(m3u8):
-                    completed = self._completed_segments()
-                    # Three files are not necessarily three TARGETDURATIONs:
-                    # variable GOPs can yield (10s, 1s, 1s). Count only
-                    # published media and prime by duration as well.
-                    if (len(completed) >= want
-                            and sum(completed.values()) >=
-                            3 * math.ceil(max(completed.values()))):
-                        break
-                if self.proc.poll() is not None:
-                    raise RuntimeError(
-                        "ffmpeg exited early while starting relay")
-                time.sleep(0.1)
-            else:
-                raise RuntimeError("relay produced no HLS playlist in time")
+            self._prime(m3u8, want)
+            # Priming has just measured the source's GOP for free: with
+            # -c copy a segment can only end on a keyframe, so the segments
+            # sitting on disk ARE the keyframe spacing. If they are too long
+            # to serve, re-encode with keyframes we place ourselves.
+            #
+            # Decide HERE, before the receiver has the URL. The same switch
+            # made later is a mid-stream discontinuity and a rebuffer; made
+            # now it is invisible, and the only cost is priming twice. The
+            # source connection is not one of the things thrown away: on the
+            # piped path TsSource outlives the encoder.
+            if not self.force_keyframes and self._copy_gop_too_long():
+                longest = max(self._completed_segments().values())
+                trace("relay.keyframes",
+                      f"source segments reach {longest:.1f}s (limit "
+                      f"{self.GOP_COPY_LIMIT:.0f}s); re-encoding video to "
+                      f"place keyframes every {self.hls_time}s")
+                self.force_keyframes = True
+                self._discard_primed_segments()
+                self._spawn_ffmpeg()
+                self._prime(m3u8, want)
         except BaseException:
             # Every exit from here leaks a server, its thread, an ffmpeg and
             # a temp directory if it does not tear them down itself.
@@ -781,6 +807,78 @@ class HlsRelay:
         threading.Thread(target=self._supervise, daemon=True,
                          name="caster-relay-supervisor").start()
         return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
+
+    def _prime(self, m3u8: str, want: int) -> None:
+        """Wait until enough media exists for a receiver to accept the URL.
+
+        Accumulate the minimum backlog the receiver will accept BEFORE
+        handing it the URL. On a live source these segments arrive in real
+        time, so every one asked for here is a second of the wait -- which is
+        why this is the floor and not a cushion. The cushion is trail_keep,
+        and that costs nothing up front. Long-GOP input may need more than
+        25s to publish three target durations. Return immediately when ready,
+        but allow that real media requirement to be met before declaring
+        startup failure.
+        """
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if os.path.exists(m3u8):
+                completed = self._completed_segments()
+                # Three files are not necessarily three TARGETDURATIONs:
+                # variable GOPs can yield (10s, 1s, 1s). Count only
+                # published media and prime by duration as well.
+                if (len(completed) >= want
+                        and sum(completed.values()) >=
+                        3 * math.ceil(max(completed.values()))):
+                    return
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    "ffmpeg exited early while starting relay")
+            time.sleep(0.1)
+        raise RuntimeError("relay produced no HLS playlist in time")
+
+    def _copy_gop_too_long(self) -> bool:
+        """Whether a stream copy cannot cut segments short enough to serve.
+
+        Only meaningful about a copy: when the video is already being
+        re-encoded the keyframes are ours to place, so there is nothing to
+        detect and nothing to fix.
+        """
+        if self.video_transcoded or self.force_keyframes:
+            return False
+        completed = self._completed_segments()
+        if not completed:
+            return False
+        return max(completed.values()) > self.GOP_COPY_LIMIT
+
+    def _discard_primed_segments(self) -> None:
+        """Throw away everything primed so far and start the numbering over.
+
+        Only safe before the URL has been handed out. Re-encoded video does
+        not continue the copied video's decoder configuration, so the two
+        must not share a playlist; nothing has been served yet, so the
+        cheapest correct answer is an empty directory rather than a seam.
+        """
+        prev = self.proc
+        self.proc = None
+        if prev is not None and prev.poll() is None:
+            prev.kill()
+            try:
+                prev.wait(timeout=5)
+            except Exception:
+                prev.kill()
+        try:
+            for name in os.listdir(self.root):
+                if re.fullmatch(r"seg(\d+)\.ts", name) or name == "live.m3u8":
+                    try:
+                        os.remove(os.path.join(self.root, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        self._last_good = None
+        self._trail_drop = None
+        self._discont_segs.clear()
 
     def _newest_seg_number(self) -> int:
         """Highest segNNNNN.ts on disk, or -1 before the first one."""
@@ -1117,8 +1215,16 @@ class HlsRelay:
             codecs = _probe_codecs(self.url)
         bad_video = {"hevc", "h265", "av1", "mpeg2video", "mpeg4", "vp9"}
         self.video_transcoded = any(c in bad_video for c in codecs)
-        if self.video_transcoded:
-            cmd += ["-c:v", pick_h264_encoder(), "-c:a", "copy"]
+        # Re-encoding buys the right to place keyframes. Whether we are here
+        # because the codec is unplayable or because the source's keyframes
+        # are too sparse to cut on, put one at every segment boundary: it
+        # costs nothing extra once the encoder is already running, and an
+        # HLS muxer left waiting for the encoder's own GOP writes nothing.
+        transcode = self.video_transcoded or self.force_keyframes
+        if transcode:
+            cmd += ["-c:v", pick_h264_encoder(), "-c:a", "copy",
+                    "-force_key_frames",
+                    f"expr:gte(t,n_forced*{self.hls_time})"]
         else:
             cmd += ["-c", "copy"]   # remux only: bit-exact, no quality loss
         # Put the H.264 parameter sets in front of every keyframe. An HLS
@@ -1127,7 +1233,7 @@ class HlsRelay:
         # so without this the first segment of a channel can arrive describing
         # frames with nothing to describe them by. Costs a few bytes a
         # keyframe and nothing else.
-        if not self.video_transcoded:
+        if not transcode:
             cmd += ["-bsf:v", "dump_extra=freq=keyframe"]
         cmd += [
             "-f", "hls",
@@ -1233,8 +1339,33 @@ class HlsRelay:
         # by a DISCONTINUITY tag -- the receiver then re-initialises its
         # decoder at the seam instead of splicing the two timelines, which
         # played the last few seconds twice and then failed.
-        out = lines[:seq_idx]
-        out = [line for line in out
+        # RFC 8216 4.3.3.1: EXT-X-TARGETDURATION must not change between
+        # reloads of a live playlist. ffmpeg recomputes it from whatever is
+        # in its own window, so a source with an irregular GOP makes it
+        # oscillate: measured 10 -> 6 -> 10 on one channel whose keyframes
+        # ran 1.0s to 7.7s apart, 27% of them over 4s. A player sizes its
+        # buffer and its live-edge start distance from this number, and
+        # handing it a smaller one than it has already acted on invites the
+        # rebuffer it is meant to prevent. Ratchet it: never decrease. It
+        # must still be free to GROW, because an EXTINF longer than
+        # TARGETDURATION is a violation in the other direction.
+        #
+        # ffmpeg writes it ahead of MEDIA-SEQUENCE, so it arrives in the
+        # prefix below rather than the header slice further down; apply the
+        # ratchet to both so the layout is not load-bearing.
+        def target_ratchet(line: str) -> str:
+            if not line.startswith("#EXT-X-TARGETDURATION:"):
+                return line
+            try:
+                value = int(float(line.split(":", 1)[1]))
+            except ValueError:
+                return line
+            if self._served_target is not None:
+                value = max(value, self._served_target)
+            self._served_target = value
+            return f"#EXT-X-TARGETDURATION:{value}"
+
+        out = [target_ratchet(line) for line in lines[:seq_idx]
                if not line.startswith("#EXT-X-DISCONTINUITY-SEQUENCE:")]
         out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}")
         first = re.fullmatch(r"seg(\d+)\.ts", lines[segs[drop]].strip())
@@ -1242,7 +1373,8 @@ class HlsRelay:
             # Preserve timeline IDs when a restart seam leaves the window.
             count = sum(n < int(first.group(1)) for n in self._discont_segs)
             out.append(f"#EXT-X-DISCONTINUITY-SEQUENCE:{count}")
-        out.extend(lines[seq_idx + 1:header_end])  # version/targetduration
+        out.extend(target_ratchet(line)
+                   for line in lines[seq_idx + 1:header_end])
         for uri_idx in segs[drop:]:
             num = re.fullmatch(r"seg(\d+)\.ts", lines[uri_idx].strip())
             if num and int(num.group(1)) in self._discont_segs:
