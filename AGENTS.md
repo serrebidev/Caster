@@ -388,6 +388,14 @@ stall.
 
 ## Live under-feed recovery (2026-09-07)
 
+Cadence baselines must come from completed entries in one raw playlist
+snapshot, never `_newest_seg_number()`: ffmpeg creates the next file before
+completing it, so using it as the baseline loses a segment's duration each
+window and can force healthy connections to restart. Measure at least three
+observed GOP durations; if the playlist has already rolled past the baseline,
+discard the incomplete measurement rather than treating missing media as zero.
+Unnecessary restarts can replay an IPTV server's initial content buffer.
+
 The relay must rotate a capped live HTTP connection before the Cast cushion is
 empty, not only after it has fallen to an extreme rate. `HlsRelay` now treats
 under 0.85x media time as sustained under-feed (two 15-second measurements)

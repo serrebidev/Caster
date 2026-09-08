@@ -21,6 +21,7 @@ import http.server
 import io
 import mimetypes
 import os
+import math
 import re
 import shutil
 import socket
@@ -623,6 +624,7 @@ class HlsRelay:
                 if self.httpd is None:
                     break
                 self._restarted += 1
+                trace("relay.restart", f"encoder exited with code {proc.returncode}")
                 try:
                     self._spawn_ffmpeg()
                 except Exception:
@@ -654,22 +656,29 @@ class HlsRelay:
             return
         if now - self._last_rotate < self.ROTATE_MIN_GAP:
             return
-        newest = self._newest_seg_number()
-        if newest < 0:
+        segments = self._completed_segments()
+        if not segments:
             return
+        newest = max(segments)
         if self._eval_t0 is None:
             # Open a cadence window: count segments from here for EVAL secs.
             self._eval_t0 = (now, newest)
             return
         t0, n0 = self._eval_t0
         span = now - t0
-        if span < self.ROTATE_EVAL:
+        # Segment publication is bursty: with stream-copy a long GOP can
+        # leave a healthy encoder apparently idle between keyframes.
+        if span < max(self.ROTATE_EVAL, 3 * max(segments.values())):
             return
         # Close the window and open the next one.
         self._eval_t0 = (now, newest)
-        media = self._media_since(n0)
-        if media is None:
+        if min(segments) > n0 + 1:
+            # The raw playlist rolled past this window. Its missing media
+            # cannot be counted as zero (fast/short-GOP streams do this).
+            self._fail_streak = 0
             return
+        media = sum(duration for number, duration in segments.items()
+                    if number > n0)
         # Media produced per wall-second.  Sum the actual EXTINF durations of
         # newly written segments rather than multiplying by the latest one:
         # source GOPs vary, and a long final segment otherwise makes a slow
@@ -683,32 +692,33 @@ class HlsRelay:
                 and self._fail_streak < self.ROTATE_STREAK):
             return
         # Sustained under-feed: rotate to a connection that opens hot.
+        failed_windows = self._fail_streak
         self._last_rotate = now
         self._fail_streak = 0
         self._eval_t0 = None
         self._rotated += 1
         trace("relay.rotate",
-              f"{ratio:.2f}x media for {self.ROTATE_STREAK} consecutive "
-              f"windows; restarting the encoder")
+              f"{ratio:.2f}x media for {failed_windows} consecutive "
+              f"windows ({span:.1f}s last window); restarting the encoder")
         try:
             self.proc.kill()
         except Exception:
             pass   # already gone; nothing to kill
 
-    def _media_since(self, after: int) -> Optional[float]:
-        """Return exact media seconds in segments numbered after ``after``.
+    def _completed_segments(self) -> dict[int, float]:
+        """Read completed segments from one atomic encoder playlist snapshot.
 
-        The raw encoder playlist is deliberately wider than the served Cast
-        window, so each short cadence evaluation can read the segment
-        durations it needs even when the receiver is held behind live.
+        Never use the newest file on disk as the cadence baseline: ffmpeg
+        creates that file BEFORE finishing it. Doing so omits its eventual
+        duration from every window and can rotate a healthy live connection.
         """
         if self.root is None:
-            return None
+            return {}
         try:
             with open(os.path.join(self.root, "live.m3u8"), "r",
                        encoding="utf-8", errors="replace") as f:
                 dur = None
-                total = 0.0
+                segments = {}
                 for line in f:
                     if line.startswith("#EXTINF:"):
                         try:
@@ -717,13 +727,15 @@ class HlsRelay:
                         except (ValueError, IndexError):
                             dur = None
                         continue
+                    if not line.strip() or line.startswith("#"):
+                        continue
                     name = re.fullmatch(r"seg(\d+)\.ts", line.strip())
-                    if name and dur is not None and int(name.group(1)) > after:
-                        total += dur
+                    if name and dur is not None and math.isfinite(dur) and dur > 0:
+                        segments[int(name.group(1))] = dur
                     dur = None
-                return total
+                return segments
         except OSError:
-            return None
+            return {}
 
     def _ffmpeg_cmd(self, m3u8: str, start_number: int = 0) -> list:
         """ffmpeg command producing HLS for this relay's source."""

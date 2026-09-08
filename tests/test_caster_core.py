@@ -1120,10 +1120,50 @@ def test_underfeed_rotation_sums_actual_new_segment_durations(relay):
     with open(os.path.join(r.root, "live.m3u8"), "w",
               encoding="utf-8", newline="") as f:
         f.write("\n".join(lines) + "\n")
-    r._check_underfeed(180.0)
-    # The exact 10.3 media seconds are 0.515x.  Multiplying the four new
-    # segments by the final 10-second GOP would incorrectly call it 2.0x.
+    r._check_underfeed(190.0)
+    # Wait three GOPs: the exact 10.3 media seconds are 0.343x. Multiplying
+    # the four new segments by the final GOP would incorrectly call it 1.33x.
     assert r.proc.killed == 1
+
+
+def test_underfeed_counts_segment_that_was_in_progress_at_window_start(relay):
+    r = _live_relay(relay)
+    _segments(r.root, 40, dur=10)
+    # ffmpeg opens the next file before publishing it in the playlist.
+    with open(os.path.join(r.root, 'seg00040.ts'), 'wb'):
+        pass
+    r._check_underfeed(160)
+    assert r._eval_t0 == (160, 39)
+    _segments(r.root, 43, dur=10)
+    r._check_underfeed(190)
+    _segments(r.root, 46, dur=10)
+    r._check_underfeed(220)
+    assert r.proc.killed == 0
+    assert r._fail_streak == 0
+
+
+def test_underfeed_does_not_judge_a_healthy_long_gop_between_keyframes(relay):
+    r = _live_relay(relay)
+    _segments(r.root, 40, dur=20)
+    r._check_underfeed(160)
+    r._check_underfeed(176)  # no keyframe yet, but not a stalled source
+    assert r.proc.killed == 0
+    _segments(r.root, 43, dur=20)
+    r._check_underfeed(220)
+    assert r.proc.killed == 0
+
+
+def test_underfeed_missing_window_is_not_counted_as_zero(relay):
+    r = _live_relay(relay)
+    _serve(r, _playlist(0, 0, 12, target=1))
+    r._check_underfeed(160)
+    # A healthy source published 20 seconds. Eight already scrolled out of
+    # the raw 12-segment window: measuring only the remaining 12 is wrong.
+    _serve(r, _playlist(20, 20, 12, target=1))
+    r._check_underfeed(180)
+    _serve(r, _playlist(40, 40, 12, target=1))
+    r._check_underfeed(200)
+    assert r.proc.killed == 0
 
 
 def test_underfeed_rotation_requires_certified_live_http(relay):
