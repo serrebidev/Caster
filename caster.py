@@ -958,7 +958,11 @@ class HlsRelay:
                 prev.kill()
         try:
             for name in os.listdir(self.root):
-                if re.fullmatch(r"seg(\d+)\.ts", name) or name == "live.m3u8":
+                # `.tmp` too: hls_flags temp_file writes a segment beside its
+                # final name and renames on completion, so a killed encoder
+                # leaves one behind that the seg%05d.ts pattern does not see.
+                if (re.fullmatch(r"seg(\d+)\.ts(\.tmp)?", name)
+                        or name in ("live.m3u8", "live.m3u8.tmp")):
                     try:
                         os.remove(os.path.join(self.root, name))
                     except OSError:
@@ -1113,9 +1117,54 @@ class HlsRelay:
                 continue
             if proc is not None:
                 try:
+                    self._check_gop()
+                except Exception:
+                    pass
+                if self.proc is not proc:
+                    continue    # _check_gop replaced the encoder
+                try:
                     self._check_underfeed(now)
                 except Exception:
                     pass
+
+    def _check_gop(self) -> None:
+        """Promote a copy to forced keyframes when the source stretches.
+
+        start() already measures the GOP once, during priming, and re-encodes
+        when a copy cannot cut segments short enough. That measurement is
+        cheap and invisible, but it only ever sees the first few seconds of
+        the channel -- and a source's keyframe spacing is not a constant.
+
+        Measured on the Big Bang channel, 2026-09-09, casting to a real
+        receiver: priming saw segments of 1.001s, 1.043s and 0.959s, so the
+        copy was kept; a hundred seconds later the same encoder was writing
+        3.003s, then 9.509s, and the Chromecast froze at a current_time that
+        never moved again while the relay ran on healthily -- 0 restarts, 0
+        upstream reconnects, every advertised segment present on disk. With
+        -c copy a segment can only end on a keyframe, so a 9.5s segment IS a
+        9.5s wait at the live edge. No playlist tuning shortens it, and the
+        under-feed rotation cannot see it because the feed is not slow.
+
+        So the same verdict start() reaches once is reached continuously.
+        The switch costs an encoder restart, which on the piped path keeps
+        the upstream connection (the sink is re-attached, no new socket to a
+        provider that counts them) and is marked with a discontinuity the
+        receiver already knows how to cross. One seam, once, against a stall
+        every time the source's GOP stretches.
+        """
+        if self.video_transcoded or self.force_keyframes:
+            return              # already placing our own keyframes
+        if not self.live:
+            return              # a finite asset is not worth re-encoding
+        if not self._copy_gop_too_long():
+            return
+        longest = max(self._completed_segments().values())
+        trace("relay.keyframes.promote",
+              f"source segment reached {longest:.1f}s mid-stream (limit "
+              f"{self.GOP_COPY_LIMIT:.0f}s); re-encoding to place keyframes "
+              f"every {self.hls_time}s")
+        self.force_keyframes = True
+        self._spawn_ffmpeg()    # picks the new flag up from _ffmpeg_cmd
 
     def _check_underfeed(self, now: float) -> None:
         """Rotate the source connection when a live encoder under-produces.
@@ -1254,7 +1303,18 @@ class HlsRelay:
             # will get -- a pipe cannot be probed by seeking -- and set no
             # timeout of any kind: a quiet pipe is TsSource reconnecting, and
             # ffmpeg exiting through that would undo the whole point.
-            cmd += ["-f", "mpegts"]
+            #
+            # thread_queue_size is the queue between the thread reading this
+            # pipe and the muxer, and its default of 8 packets is sized for a
+            # source that arrives evenly. These do not: one provider was
+            # measured bursting to 131 Mb/s with gaps of up to 10.6s between
+            # bursts while tracking real time exactly (see ROTATE_EVAL). A
+            # burst that outruns an 8-packet queue is dropped input, which is
+            # a hole in the TS rather than a delay. Raising it costs memory
+            # and nothing else. It does NOT fix a starved CPU -- the copy
+            # path has no such problem -- it fixes exactly the bursty
+            # delivery this source is known for.
+            cmd += ["-thread_queue_size", "4096", "-f", "mpegts"]
         elif self.url.lower().startswith(("http://", "https://")):
             # Survive IPTV sources dropping/jittering instead of stalling.
             # These belong to the HTTP protocol handler and nothing else:
@@ -1343,11 +1403,68 @@ class HlsRelay:
             # Keep at least twice the cushion, plus a margin, so falling
             # behind costs a rebuffer and not the stream.
             "-hls_list_size", str(self._list_size()),
+            # Leaving the playlist and leaving the disk are two different
+            # moments, and the default collapses them: hls_delete_threshold
+            # is 1, so a segment file is unlinked one segment after its URI
+            # stops being advertised. The receiver starts at the OLDEST
+            # segment it is shown, which puts it one slip away from asking
+            # for a file that no longer exists -- and a 404 there is not a
+            # rebuffer but the permanent freeze recorded in AGENTS.md, the
+            # receiver stuck at 41.8s while the playlist ran to sequence 172.
+            #
+            # RFC 8216 6.2.2 asks for exactly this margin: a removed segment
+            # SHOULD stay fetchable for its own duration plus the duration of
+            # the longest playlist served, so retention wants to be about
+            # twice the advertised window. hls_list_size buys that by
+            # ADVERTISING more, which also moves where a receiver starts and
+            # how it reads the live edge; this buys it on disk alone, where
+            # it costs nothing a receiver can see. One cushion's worth of
+            # already-dropped segments, floored so a short window still gets
+            # a usable grace.
+            "-hls_delete_threshold", str(self._delete_threshold()),
             # append_list continues the existing playlist across a restart
             # instead of truncating it, which would strip the segments the
             # receiver is still working through.
+            #
+            # temp_file writes each segment and each playlist rewrite to a
+            # neighbouring .tmp and renames it into place, so nothing served
+            # over the HTTP hop is ever half-written. _completed_segments
+            # already notes that ffmpeg creates a segment file before it
+            # finishes it; this makes the file appear only once it is whole.
+            #
+            # NO program_date_time, and the reason is the whole design here.
+            # Google's Web Receiver docs say a refreshed live manifest is
+            # merged on #EXT-X-PROGRAM-DATE-TIME when present and only falls
+            # back to #EXT-X-MEDIA-SEQUENCE otherwise, which reads like an
+            # argument for adding it: the sequence number is the fragile half
+            # of that pair, which is why _served_seq has to ratchet it.
+            #
+            # The argument against is that the ratchet is not a workaround
+            # for a weak anchor, it IS the anchor: _trailing_playlist rewrites
+            # the sequence so that whatever a restarted encoder does to its
+            # own numbering, what leaves here never goes backwards. PDT is
+            # passed through from ffmpeg untouched, so adding it would hand
+            # the receiver a second timeline that the rewrite does not govern
+            # -- and by Google's own description the receiver would prefer
+            # that one over the rewritten sequence.
+            #
+            # That is reasoning, not a measurement. It was tried against a
+            # real receiver on 2026-09-09 and the attempt produced no usable
+            # verdict: over four 360s casts of one channel to RB Room the
+            # SAME code scored 145/180 samples PLAYING on one run and 2/180
+            # on another, because the upstream channel degraded across the
+            # session (by the end it was being served at 0.41x with segments
+            # up to 10.4s). Run-to-run variance swamped the change, in both
+            # directions, so nothing was learned about PDT either way.
+            #
+            # It stays out on the burden of proof: it is an unproven addition
+            # to the one part of the playlist this class rewrites most
+            # carefully. Anyone revisiting it needs a source that holds still
+            # long enough to measure, not this one.
             "-hls_flags",
-            "delete_segments+append_list" if append else "delete_segments",
+            ("delete_segments+temp_file+append_list"
+             if append else
+             "delete_segments+temp_file"),
             "-start_number", str(start_number),
             "-hls_segment_filename", os.path.join(self.root, "seg%05d.ts"),
             m3u8,
@@ -1365,6 +1482,25 @@ class HlsRelay:
                       self.trail_keep * self.hls_time)
         wanted = math.ceil((cushion * 2 + 30) / max(1, self.hls_time))
         return max(24, self.trail_keep * 3, wanted)
+
+    def _delete_threshold(self) -> int:
+        """Segments kept on disk after their URI leaves the playlist.
+
+        The grace a receiver gets to finish fetching something it was shown
+        a moment ago. ffmpeg's default is 1 segment, which is no grace at
+        all for a receiver sitting at the oldest advertised URI.
+
+        Sized in seconds like everything else here, because a count is
+        meaningless while the segment length belongs to the source's GOP: one
+        cushion's worth, so a receiver may fall a whole cushion behind the
+        oldest thing it was offered and still be served. Floored at 15 so a
+        short cushion still leaves a usable margin, and it costs only disk --
+        at 2s segments and a 45s cushion this is ~23 files that no longer
+        appear in any playlist.
+        """
+        seconds = max(self.trail_seconds, self.trail_keep * self.hls_time,
+                      3 * self.hls_time)
+        return max(15, math.ceil(seconds / max(1, self.hls_time)))
 
     def trailing_playlist(self):
         # Concurrent HTTP polls must see a consistent timeline.

@@ -872,25 +872,119 @@ def test_ffmpeg_cmd_drops_the_bitstream_filter_when_transcoding(
     assert cmd[cmd.index("-c:a") + 1] == "copy"
 
 
-@pytest.mark.parametrize("start_number,flags", [
-    (0, "delete_segments"),
-    (137, "delete_segments+append_list"),
-])
+@pytest.mark.parametrize("start_number,appends", [(0, False), (137, True)])
 def test_ffmpeg_cmd_appends_rather_than_truncates_after_a_restart(
-        start_number, flags, tmp_path, no_ffmpeg):
+        start_number, appends, tmp_path, no_ffmpeg):
     """A restart must continue the playlist, not start it over.
 
     Without append_list ffmpeg truncates live.m3u8, stripping the segments
     the receiver is still working through, and without -start_number the
     restarted encoder writes seg00000.ts over a name the receiver already
     played.
+
+    Asserted as a set membership rather than the whole flag string: the other
+    flags travel with every command and are each other tests' business, so
+    spelling them out here makes this test fail for reasons it is not about.
     """
     cmd = _cmd("http://iptv.invalid/live.ts", tmp_path, no_ffmpeg,
                start_number=start_number)
-    assert cmd[cmd.index("-hls_flags") + 1] == flags
+    flags = set(cmd[cmd.index("-hls_flags") + 1].split("+"))
+    assert ("append_list" in flags) is appends
+    assert "delete_segments" in flags
     if start_number:
         assert "-start_number" in cmd
         assert cmd[cmd.index("-start_number") + 1] == str(start_number)
+
+
+def test_ffmpeg_cmd_keeps_dropped_segments_on_disk_for_a_lagging_receiver(
+        tmp_path, no_ffmpeg):
+    """Leaving the playlist and leaving the disk must not be one moment.
+
+    ffmpeg's hls_delete_threshold default is 1, so a segment file is unlinked
+    one segment after its URI stops being advertised. The receiver starts at
+    the OLDEST segment it is shown, which puts it one slip from a 404 -- and
+    a 404 there is not a rebuffer but a permanent freeze (a receiver was
+    observed stuck at 41.8s while the playlist advanced past sequence 172).
+
+    RFC 8216 6.2.2 asks for a removed segment to stay fetchable for roughly
+    the length of the playlist that carried it, so the grace is sized against
+    the cushion the receiver is deliberately held behind, not left at 1.
+    """
+    relay = HlsRelay("http://iptv.invalid/live.ts", hls_time=2,
+                     prime_segments=3, trail_keep=8, trail_seconds=45.0,
+                     codecs=["h264", "aac"])
+    relay.root = str(tmp_path)
+    cmd = relay._ffmpeg_cmd(os.path.join(relay.root, "live.m3u8"))
+
+    assert "-hls_delete_threshold" in cmd, (
+        "segments are deleted one after leaving the playlist by default")
+    grace = int(cmd[cmd.index("-hls_delete_threshold") + 1])
+    assert grace > 1
+    # The grace has to be worth something in SECONDS, because a count means
+    # nothing while segment length belongs to the source's GOP.
+    assert grace * relay.hls_time >= relay.trail_seconds, (
+        f"{grace} segments is {grace * relay.hls_time}s of grace against a "
+        f"{relay.trail_seconds}s cushion")
+
+
+def test_ffmpeg_cmd_never_publishes_a_half_written_file(tmp_path, no_ffmpeg):
+    """temp_file: nothing served over the HTTP hop is partially written.
+
+    _completed_segments already records that ffmpeg creates a segment file
+    before it finishes writing it. The relay serves that same directory to a
+    receiver, so the window between create and complete is fetchable. Writing
+    beside the final name and renaming closes it for segments and for each
+    playlist rewrite alike.
+    """
+    cmd = _cmd("http://iptv.invalid/live.ts", tmp_path, no_ffmpeg)
+    assert "temp_file" in cmd[cmd.index("-hls_flags") + 1].split("+")
+
+
+def test_ffmpeg_cmd_leaves_the_wall_clock_out_of_the_playlist(
+        tmp_path, no_ffmpeg):
+    """No program_date_time: the sequence ratchet must stay the only anchor.
+
+    Google's Web Receiver documentation says a refreshed live manifest is
+    merged on #EXT-X-PROGRAM-DATE-TIME when present and falls back to
+    #EXT-X-MEDIA-SEQUENCE otherwise, which reads like a reason to add it.
+    It is a reason not to. _trailing_playlist rewrites the sequence so that
+    whatever a restarted encoder does to its numbering, what leaves here
+    never goes backwards; PDT is passed through untouched, so adding it hands
+    the receiver a second timeline the rewrite does not govern -- and the
+    receiver prefers that one.
+
+    This is reasoning rather than a measurement: an attempt to settle it on a
+    real receiver produced no usable verdict, because over four 360s casts of
+    one channel the SAME code scored 145/180 samples PLAYING on one run and
+    2/180 on another as the upstream source degraded across the session. It
+    stays out on the burden of proof -- an unproven addition to the one part
+    of the playlist this class rewrites most carefully.
+    """
+    cmd = _cmd("http://iptv.invalid/live.ts", tmp_path, no_ffmpeg)
+    flags = cmd[cmd.index("-hls_flags") + 1].split("+")
+    assert "program_date_time" not in flags
+
+
+def test_ffmpeg_cmd_queues_a_bursty_pipe_deeply_enough(tmp_path, no_ffmpeg):
+    """A burst that outruns the input queue is a hole in the TS, not a delay.
+
+    The default thread_queue_size is 8 packets, sized for a source that
+    arrives evenly. These do not: one provider was measured bursting to
+    131 Mb/s with gaps of up to 10.6s while tracking real time exactly. Only
+    the piped path needs it -- that is the one where TsSource hands ffmpeg a
+    pipe rather than letting it read the socket itself.
+    """
+    relay = HlsRelay("http://iptv.invalid/live.ts", hls_time=2,
+                     prime_segments=3, trail_keep=8, codecs=["h264", "aac"],
+                     live=True)
+    relay.root = str(tmp_path)
+    assert relay.piped_source(), "expected the piped path for a live TS URL"
+    cmd = relay._ffmpeg_cmd(os.path.join(relay.root, "live.m3u8"))
+
+    assert "-thread_queue_size" in cmd
+    assert int(cmd[cmd.index("-thread_queue_size") + 1]) >= 1024
+    # An input option: after -i it applies to the output and does nothing.
+    assert cmd.index("-thread_queue_size") < cmd.index("-i")
 
 
 @pytest.mark.parametrize("hls_time", [1, 2, 4])
@@ -1789,3 +1883,89 @@ def test_deeper_cushion_is_configured_by_the_quality_preset():
     assert depths["latency"] < depths["balanced"] < depths["quality"]
     assert all(d >= 13 for d in depths.values()), \
         "a cushion under the measured 13s input burst is no cushion"
+
+
+# ---------------------------------------------------------------------------
+# A source whose GOP stretches after priming
+# ---------------------------------------------------------------------------
+
+def _relay_with_playlist(tmp_path, durations, live=True):
+    """A relay whose encoder playlist holds segments of these durations."""
+    relay = HlsRelay("http://iptv.invalid/live.ts", hls_time=2,
+                     prime_segments=3, trail_keep=8,
+                     codecs=["h264", "aac"], live=live)
+    relay.root = str(tmp_path)
+    body = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:10",
+            "#EXT-X-MEDIA-SEQUENCE:0"]
+    for i, d in enumerate(durations):
+        body += [f"#EXTINF:{d:.6f},", f"seg{i:05d}.ts"]
+    (tmp_path / "live.m3u8").write_text("\n".join(body) + "\n",
+                                        encoding="utf-8")
+    return relay
+
+
+def test_a_gop_that_stretches_after_priming_is_promoted(tmp_path, monkeypatch):
+    """Priming sees the first few seconds; the source is not bound by them.
+
+    Measured on a real channel casting to a real receiver (2026-09-09):
+    priming saw 1.001s, 1.043s and 0.959s segments so the copy was kept, and
+    a hundred seconds later the same encoder wrote a 9.509s segment. With
+    -c copy a segment ends only on a keyframe, so that is a 9.5s wait at the
+    live edge -- the Chromecast froze at a current_time that never moved
+    again while the relay reported 0 restarts and 0 upstream reconnects.
+    Under-feed rotation cannot catch it: the feed is not slow.
+    """
+    relay = _relay_with_playlist(tmp_path, [1.001, 1.043, 0.959, 3.003, 9.509])
+    spawned = []
+    monkeypatch.setattr(relay, "_spawn_ffmpeg", lambda: spawned.append(True))
+
+    assert not relay.force_keyframes
+    relay._check_gop()
+
+    assert relay.force_keyframes, "a 9.5s segment must not be endured"
+    assert spawned == [True], "the encoder has to be restarted to apply it"
+
+
+def test_a_well_behaved_source_is_left_as_a_copy(tmp_path, monkeypatch):
+    """Re-encoding costs a seam and a CPU; only a source that needs it pays.
+
+    The two other providers measured ran 2.0-2.6s median with a 4.1s worst
+    case, which is why GOP_COPY_LIMIT sits at 5s rather than at hls_time.
+    """
+    relay = _relay_with_playlist(tmp_path, [2.0, 2.6, 2.0, 4.1, 2.2])
+    spawned = []
+    monkeypatch.setattr(relay, "_spawn_ffmpeg", lambda: spawned.append(True))
+
+    relay._check_gop()
+
+    assert not relay.force_keyframes
+    assert spawned == [], "a copy that serves fine must not be restarted"
+
+
+def test_the_promotion_happens_once_and_never_reverses(tmp_path, monkeypatch):
+    """The long segments stay in the playlist after the switch.
+
+    Re-firing on them would restart the encoder every couple of seconds,
+    which is a discontinuity every couple of seconds.
+    """
+    relay = _relay_with_playlist(tmp_path, [1.0, 9.5, 9.5])
+    spawned = []
+    monkeypatch.setattr(relay, "_spawn_ffmpeg", lambda: spawned.append(True))
+
+    for _ in range(5):
+        relay._check_gop()
+
+    assert relay.force_keyframes
+    assert spawned == [True], f"restarted {len(spawned)} times, expected once"
+
+
+def test_a_finite_asset_is_never_promoted(tmp_path, monkeypatch):
+    """A local file or VOD has no live edge to stall at."""
+    relay = _relay_with_playlist(tmp_path, [1.0, 12.0], live=False)
+    spawned = []
+    monkeypatch.setattr(relay, "_spawn_ffmpeg", lambda: spawned.append(True))
+
+    relay._check_gop()
+
+    assert not relay.force_keyframes
+    assert spawned == []

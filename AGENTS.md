@@ -429,6 +429,98 @@ re-encodes only what a copy genuinely cannot serve. A clean channel must stay
 bit-exact -- verify that a known-good one still reports
 `force_keyframes=False` after any change here.
 
+## Priming sees the first few seconds, not the channel
+
+`GOP_COPY_LIMIT` is checked twice: once in `start()` from the primed segments,
+and then continuously in `_check_gop()` off the supervisor. The second one is
+not redundant. A source's keyframe spacing is not a constant, and the priming
+window is far too short to characterise it: measured 2026-09-09 casting to a
+real Chromecast, priming saw 1.001s, 1.043s and 0.959s so the copy was kept,
+and a hundred seconds later the same encoder wrote 3.003s and then 9.509s.
+The receiver froze at a `current_time` that never moved again while the relay
+reported 0 restarts, 0 rotations, 0 upstream reconnects and every advertised
+segment present on disk. With `-c copy` a segment ends only on a keyframe, so
+a 9.5s segment IS a 9.5s wait at the live edge, and under-feed rotation cannot
+see it because the feed is not slow.
+
+The promotion is one-way and live-only. On the piped path it costs no new
+upstream connection -- `_spawn_ffmpeg` re-attaches the sink, so `TsSource`
+keeps its socket -- and one discontinuity the receiver already knows how to
+cross. A `_check_gop` that fires repeatedly would be a discontinuity every
+couple of seconds, so it must stay one-way even though the long segments sit
+in the playlist for a full window afterwards.
+
+## Leaving the playlist and leaving the disk are different moments
+
+`-hls_delete_threshold` (`_delete_threshold()`), because ffmpeg's default is 1:
+a segment file is unlinked one segment after its URI stops being advertised.
+`_trailing_playlist` trims from the NEWEST end, so the oldest URI the receiver
+is shown is also ffmpeg's oldest -- the receiver starts its life one slip away
+from a 404, and a 404 there is the permanent freeze, not a rebuffer.
+
+RFC 8216 6.2.2 asks for a removed segment to stay fetchable for its own
+duration plus the duration of the longest playlist served, so retention wants
+to be about twice the advertised window. `hls_list_size` buys that by
+ADVERTISING more, which also moves where a receiver starts and how it reads
+the live edge. The threshold buys it on disk alone, where nothing a receiver
+can see changes. Sized in seconds like everything else here (a count means
+nothing while segment length belongs to the source's GOP): one cushion's
+worth, floored at 15, which is ~23 files at the balanced preset.
+
+## No EXT-X-PROGRAM-DATE-TIME, on the burden of proof
+
+Google's Web Receiver docs say a refreshed live manifest is merged on
+`#EXT-X-PROGRAM-DATE-TIME` when present and falls back to
+`#EXT-X-MEDIA-SEQUENCE` otherwise, which reads like an argument for adding it.
+The argument against is that the sequence ratchet in `_trailing_playlist` is
+not a workaround for a weak anchor, it IS the anchor: PDT is passed through
+from ffmpeg untouched, so adding it hands the receiver a second timeline the
+rewrite does not govern -- and the receiver would prefer that one.
+
+That is reasoning, not a measurement. The attempt to settle it on a real
+receiver produced no verdict (see below). It stays out because it is an
+unproven addition to the part of the playlist this class rewrites most
+carefully, not because it was shown to be harmful.
+
+## An IPTV source is not a fixed quantity, so A/B across a session is invalid
+
+The most expensive lesson of 2026-09-09. Four 360s casts of one channel to one
+Chromecast, alternating the build under test, produced 27/180 samples PLAYING,
+then 145/180, then 18/180, then 2/180 -- and the 145 and the 2 were the SAME
+code. The channel degraded across the hour: by the last run it was serving
+0.41x with segments up to 10.4s. Every difference attributed to the code in
+between was noise, and a conclusion had already been written into a comment
+before the control run exposed it.
+
+Repeated testing is part of the cause, not just a witness to it. Providers cap
+throughput by connection age and count connections per account, so an hour of
+relay restarts and forced rotations is itself a load test that makes the
+source worse. Both providers measured healthy early and badly by the end.
+
+So: run the control immediately before or after the variable, never an hour
+apart; treat any single cast as one sample of a moving quantity; and give the
+provider a rest before believing a result. `test_the_receiver_keeps_playing_a_live_channel`
+encodes this -- it measures the relay's own output alongside the receiver and
+SKIPS on an under-delivering source, because a red test there has to mean the
+relay broke.
+
+## Live device tests
+
+`py -m pytest -m live` with the receivers named in the environment:
+
+```
+CASTER_TEST_STREAM      an http(s) live MPEG-TS URL
+CASTER_TEST_CHROMECAST  friendly name of a Cast receiver
+CASTER_TEST_AIRPLAY     name of an AirPlay (RAOP) receiver
+CASTER_TEST_MUSICCAST   IP of a Yamaha MusicCast receiver
+```
+
+Anything unset skips. The AirPlay pair are regression guards only: that path
+never touches `HlsRelay` (`_play_airplay` builds its own pipe in
+`_raop_source`), so relay work cannot fix it and must not break it. ffmpeg
+EXITING on that pipe is normal -- there are no reconnect flags, and the
+runner reopens at the live edge.
+
 `_Sink.attach` closes the pipe it replaces. Leaving it to the garbage
 collector means finalisation flushes into a killed encoder's pipe, and that
 failure lands outside every handler as an unraisable
