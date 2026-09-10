@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import queue
+import socket
 import struct
 
 import pytest
@@ -18,7 +19,8 @@ import pytest
 import caster_extras
 from caster_extras import (CONTAINERS, AudioTap, ScreenSource,
                            _upnp_fetch_control, grabber_machine_key,
-                           pick_screen_grabber, upnp_sink_mimes, wav_header)
+                           mdns_host, pick_screen_grabber, ssdp_sockets,
+                           upnp_discover, upnp_sink_mimes, wav_header)
 
 DESC_URL = "http://192.168.1.65:49154/desc/device.xml"
 
@@ -47,6 +49,97 @@ def soap_protocol_info(sink: str) -> bytes:
         "</u:GetProtocolInfoResponse>"
         "</s:Body></s:Envelope>"
     ).encode()
+
+
+# ---------------------------------------------------------------------------
+# SSDP interface selection
+# ---------------------------------------------------------------------------
+
+def test_ssdp_opens_a_socket_on_every_non_loopback_ipv4_interface(
+        monkeypatch, no_network):
+    """A VPN must not make discovery send only through its virtual adapter."""
+    class FakeSocket:
+        def __init__(self):
+            self.bound = None
+            self.multicast_interface = None
+            self.timeout = None
+            self.closed = False
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def bind(self, address):
+            self.bound = address
+
+        def setsockopt(self, _level, _option, value):
+            self.multicast_interface = socket.inet_ntoa(value)
+
+        def close(self):
+            self.closed = True
+
+    made = []
+    monkeypatch.setattr(
+        caster_extras.socket, "getaddrinfo",
+        lambda *_: [
+            (socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("192.0.2.10", 0)),
+            (socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("127.0.0.1", 0)),
+            (socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("198.51.100.7", 0)),
+            (socket.AF_INET, socket.SOCK_DGRAM, 0, "", ("192.0.2.10", 0)),
+        ])
+    monkeypatch.setattr(caster_extras.socket, "socket",
+                        lambda *_: made.append(FakeSocket()) or made[-1])
+
+    sockets = ssdp_sockets()
+
+    assert sockets == made
+    assert [sock.bound for sock in sockets] == [
+        ("192.0.2.10", 0), ("198.51.100.7", 0)]
+    assert [sock.multicast_interface for sock in sockets] == [
+        "192.0.2.10", "198.51.100.7"]
+    assert all(sock.timeout == 0.5 for sock in sockets)
+    for sock in sockets:
+        sock.close()
+    assert all(sock.closed for sock in sockets)
+
+
+def test_mdns_host_prefers_ipv4_and_keeps_ipv6_only_services():
+    """A first IPv6 record must not make a Cast or Kodi service disappear."""
+    dual_stack = type("Info", (), {
+        "parsed_addresses": lambda self: ["2001:db8::20", "192.0.2.20"],
+    })()
+    ipv6_only = type("Info", (), {
+        "parsed_addresses": lambda self: ["2001:db8::21"],
+    })()
+
+    assert mdns_host(dual_stack) == "192.0.2.20"
+    assert mdns_host(ipv6_only) == "2001:db8::21"
+
+
+def test_upnp_sends_each_search_on_every_ssdp_interface(monkeypatch):
+    """Receiving on one adapter cannot make us skip another LAN interface."""
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def sendto(self, message, destination):
+            self.sent.append((message, destination))
+
+        def close(self):
+            self.closed = True
+
+    sockets = [FakeSocket(), FakeSocket()]
+    monotonic = iter([0.0, 0.0, 0.0, 1.0])
+    monkeypatch.setattr(caster_extras, "ssdp_sockets", lambda: sockets)
+    monkeypatch.setattr(caster_extras.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(caster_extras.select, "select",
+                        lambda *_: ([], [], []))
+
+    assert upnp_discover(timeout=1) == []
+    assert all(len(sock.sent) == 1 for sock in sockets)
+    assert all(sock.sent[0][1] == ("239.255.255.250", 1900)
+               for sock in sockets)
+    assert all(sock.closed for sock in sockets)
 
 
 # ---------------------------------------------------------------------------

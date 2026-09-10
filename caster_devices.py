@@ -20,12 +20,15 @@ import concurrent.futures
 import concurrent.futures as _futures
 import json
 import re
+import select
 import socket
 import threading
 import time
 import urllib.parse
 import urllib.request as _urlreq
 import uuid
+
+from caster_extras import mdns_host, ssdp_sockets
 
 # ---------------------------------------------------------------------------
 # Sonos
@@ -362,9 +365,12 @@ def kodi_discover(timeout: int = 4, zc=None) -> list:
                 return None
             if not info or not info.addresses:
                 return None
-            host = socket.inet_ntoa(info.addresses[0])
+            host = mdns_host(info)
+            if not host:
+                return None
             label = name.split(".")[0] or host
-            return (label, f"http://{host}:{info.port or 8080}")
+            netloc = f"[{host}]" if ":" in host else host
+            return (label, f"http://{netloc}:{info.port or 8080}")
 
         pending = list(hits)
         if not pending:
@@ -447,8 +453,9 @@ def _ssdp_search(search_target: str, timeout: int = 4) -> list:
         f"ST: {search_target}\r\n"
         "\r\n"
     ).encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(0.5)
+    socks = ssdp_sockets()
+    if not socks:
+        return []
     locations = []
     try:
         # Repeated across the window for the same reason as the UPnP search in
@@ -459,26 +466,34 @@ def _ssdp_search(search_target: str, timeout: int = 4) -> list:
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_search and searches < 3:
-                try:
-                    sock.sendto(msg, ("239.255.255.250", 1900))
-                except OSError:
-                    pass
+                for sock in socks:
+                    try:
+                        sock.sendto(msg, ("239.255.255.250", 1900))
+                    except OSError:
+                        pass
                 searches += 1
                 next_search = now + timeout / 4
             try:
-                data, _ = sock.recvfrom(65536)
-            except socket.timeout:
+                ready, _, _ = select.select(
+                    socks, [], [], min(0.5, max(0.0, deadline - now)))
+            except (OSError, ValueError):
+                break
+            if not ready:
                 continue
-            for line in data.decode("utf-8", "replace").splitlines():
-                if line.lower().startswith("location:"):
-                    location = line.split(":", 1)[1].strip()
-                    if location and location not in locations:
-                        locations.append(location)
-                    break
-    except OSError:
-        pass
+            for sock in ready:
+                try:
+                    data, _ = sock.recvfrom(65536)
+                except OSError:
+                    continue
+                for line in data.decode("utf-8", "replace").splitlines():
+                    if line.lower().startswith("location:"):
+                        location = line.split(":", 1)[1].strip()
+                        if location and location not in locations:
+                            locations.append(location)
+                        break
     finally:
-        sock.close()
+        for sock in socks:
+            sock.close()
     return locations
 
 

@@ -12,6 +12,7 @@ their terminal state within a couple of poll intervals.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import http.client
 import http.server
@@ -86,6 +87,28 @@ def test_probe_never_calls_a_stream_vod_on_no_evidence(monkeypatch):
     monkeypatch.setattr(caster.time, 'sleep', lambda *_: None)
     out = caster.probe_media('https://example.invalid/u/p/12345')
     assert out['is_live'] is True
+
+
+def test_probe_has_a_total_startup_budget(monkeypatch):
+    """A repeatedly timing-out probe must not create a minute-long startup.
+
+    The normal retry path is retained for flaky CDNs, but once its total
+    budget expires the caller proceeds with the conservative live verdict.
+    """
+    timeouts, sleeps = [], []
+    ticks = iter((100.0, 100.0, 103.1, 108.0))
+    monkeypatch.setattr(caster.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(caster.urllib.request, "urlopen",
+                        lambda _req, timeout: (
+                            timeouts.append(timeout),
+                            (_ for _ in ()).throw(TimeoutError("down")))[1])
+    monkeypatch.setattr(caster.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    out = caster.probe_media("https://example.invalid/u/p/12345")
+
+    assert timeouts == [caster.PROBE_ATTEMPT_TIMEOUT]
+    assert sleeps == [0.3]
+    assert out["is_live"] is True
 
 
 class _FakeResponse:
@@ -194,7 +217,8 @@ def test_cast_prefers_native_hls_with_receiver_fallback(frame, monkeypatch, reje
     mc = types.SimpleNamespace(
         status=types.SimpleNamespace(media_session_id=1),
         play_media=lambda url, mime, **kw: loaded.append(url),
-        block_until_active=lambda timeout: None)
+        block_until_active=lambda timeout: pytest.fail(
+            "playback readiness must be driven by media status polling"))
     cast = types.SimpleNamespace(media_controller=mc, app_id=frame.CAST_APP_ID,
                                  status=types.SimpleNamespace(volume_level=None),
                                  wait=lambda timeout: None)
@@ -353,6 +377,51 @@ def test_airplay_runner_only_kills_its_own_ffmpeg_process(frame):
     assert first.kills == 1
     assert second.kills == 0
     assert frame._air_ffmpeg_procs == {"Second (AirPlay)": second}
+
+
+@pytest.mark.parametrize(("url", "has_http_options"), [
+    ("C:/media/movie.mkv", False),
+    ("https://example.invalid/live.ts", True),
+])
+def test_raop_ffmpeg_uses_http_options_only_for_http_sources(
+        frame, monkeypatch, url, has_http_options):
+    """A local video must not be rejected before RAOP can receive its audio."""
+    commands = []
+    stream = object()
+    proc = types.SimpleNamespace(stdout=stream)
+
+    async def spawn(*cmd, **_kwargs):
+        commands.append(cmd)
+        return proc
+
+    frame._air_kind = "video"
+    frame._pending_seek = None
+    frame._air_ffmpeg_procs = {}
+    frame._ui = lambda *args, **kwargs: None
+    frame.set_status = lambda *args, **kwargs: None
+    frame.loop_thread = types.SimpleNamespace(loop=None)
+    monkeypatch.setattr(caster, "_find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(caster, "SyncStreamReader",
+                        lambda stdout, _loop: stdout)
+    monkeypatch.setattr(caster.asyncio, "create_subprocess_exec", spawn)
+
+    assert asyncio.run(frame._raop_source(url, None, "Room (AirPlay)")) is stream
+    cmd = commands[0]
+    assert ("-seekable" in cmd) is has_http_options
+    assert ("-rw_timeout" in cmd) is has_http_options
+
+
+def test_prime_promotes_after_the_first_long_copy_segment(tmp_path):
+    """One over-limit GOP is enough evidence to re-encode before loading."""
+    relay = HlsRelay("http://iptv.invalid/live.ts", codecs=["h264", "aac"])
+    relay.root = str(tmp_path)
+    playlist = tmp_path / "live.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:7\n#EXTINF:6.000000,\nseg00000.ts\n",
+        encoding="utf-8")
+    relay.proc = types.SimpleNamespace(poll=lambda: None)
+
+    assert relay._prime(str(playlist), want=3) is True
 
 
 # --------------------------------------------------------------------------

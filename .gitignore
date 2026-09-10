@@ -14,6 +14,7 @@ dist/
 
 # Workspace
 .freebuff/
+.firecrawl/
 
 # pytest temp files
 .pytest-tmp/

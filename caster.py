@@ -61,6 +61,7 @@ from caster_extras import (
     upnp_stop,
     upnp_set_volume,
     FileServer,
+    mdns_host,
     upnp_host,
 )
 
@@ -187,6 +188,10 @@ _CT_AUDIO = {"audio/mpeg", "audio/aac", "audio/aacp", "audio/mp4", "audio/x-m4a"
 #: Bytes read to identify a stream. Enough to find the packet stride several
 #: times over even when the response begins mid-packet.
 PROBE_BYTES = 2048
+#: URL inspection selects a safe transport path, but must not turn five
+#: individual socket timeouts into a minute of silence before playback starts.
+PROBE_ATTEMPT_TIMEOUT = 3.0
+PROBE_TOTAL_TIMEOUT = 8.0
 
 
 def _looks_like_mpegts(head: bytes) -> bool:
@@ -339,9 +344,14 @@ def probe_media(url: str) -> dict:
     # instead of believing an answer that told us nothing.
     ct = ""
     head = b""
+    deadline = time.monotonic() + PROBE_TOTAL_TIMEOUT
     for attempt in range(5):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(
+                    req, timeout=min(PROBE_ATTEMPT_TIMEOUT, remaining)) as r:
                 body = r.read(PROBE_BYTES)
                 body_ct = (r.headers.get("Content-Type")
                            or "").split(";")[0].strip().lower()
@@ -355,7 +365,12 @@ def probe_media(url: str) -> dict:
         if len(head) >= 3 * 188 + 1:
             break
         if attempt < 4:
-            time.sleep(0.3 * 2 ** attempt)   # 503s come in clusters
+            # 503s arrive in clusters, but a retry has no value once the
+            # bounded probe budget is exhausted.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.3 * 2 ** attempt, remaining))
     if ct in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
         result["mime"] = ct
         result["is_audio"] = False
@@ -863,7 +878,7 @@ class HlsRelay:
 
             m3u8 = os.path.join(self.root, "live.m3u8")
             self._spawn_ffmpeg()
-            self._prime(m3u8, want)
+            long_copy_gop = self._prime(m3u8, want)
             # Priming has just measured the source's GOP for free: with
             # -c copy a segment can only end on a keyframe, so the segments
             # sitting on disk ARE the keyframe spacing. If they are too long
@@ -874,7 +889,8 @@ class HlsRelay:
             # now it is invisible, and the only cost is priming twice. The
             # source connection is not one of the things thrown away: on the
             # piped path TsSource outlives the encoder.
-            if not self.force_keyframes and self._copy_gop_too_long():
+            if (not self.force_keyframes
+                    and (long_copy_gop or self._copy_gop_too_long())):
                 longest = max(self._completed_segments().values())
                 trace("relay.keyframes",
                       f"source segments reach {longest:.1f}s (limit "
@@ -897,29 +913,38 @@ class HlsRelay:
                          name="caster-relay-supervisor").start()
         return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
 
-    def _prime(self, m3u8: str, want: int) -> None:
+    def _prime(self, m3u8: str, want: int) -> bool:
         """Wait until enough media exists for a receiver to accept the URL.
 
         Accumulate the minimum backlog the receiver will accept BEFORE
         handing it the URL. On a live source these segments arrive in real
         time, so every one asked for here is a second of the wait -- which is
         why this is the floor and not a cushion. The cushion is trail_keep,
-        and that costs nothing up front. Long-GOP input may need more than
-        25s to publish three target durations. Return immediately when ready,
-        but allow that real media requirement to be met before declaring
-        startup failure.
+        and that costs nothing up front. A completed segment beyond
+        GOP_COPY_LIMIT is enough evidence to restart with forced keyframes:
+        waiting for two more long segments before making that decision was
+        the direct cause of 30--60 second starts. Returns True only for that
+        early-promotion case, otherwise False when the receiver's media
+        requirement is met.
         """
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if os.path.exists(m3u8):
                 completed = self._completed_segments()
+                # A stream copy can cut only at the source's keyframes. One
+                # completed over-limit segment therefore proves copying
+                # cannot give the receiver prompt HLS segments. Re-encode
+                # now, then prime three short segments, instead of collecting
+                # three long ones merely to reach the same conclusion.
+                if self._copy_gop_too_long():
+                    return True
                 # Three files are not necessarily three TARGETDURATIONs:
                 # variable GOPs can yield (10s, 1s, 1s). Count only
                 # published media and prime by duration as well.
                 if (len(completed) >= want
                         and sum(completed.values()) >=
                         3 * math.ceil(max(completed.values()))):
-                    return
+                    return False
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     "ffmpeg exited early while starting relay")
@@ -2313,7 +2338,6 @@ class MainFrame(wx.Frame):
         """
         if zc is None:
             return {}
-        import socket as socket_mod
 
         found: dict[str, Device] = {}
         seen: set[str] = set()
@@ -2337,7 +2361,9 @@ class MainFrame(wx.Frame):
                     else (v or "")
                 )
                 props[kd] = vd
-            host = socket_mod.inet_ntoa(info.addresses[0])
+            host = mdns_host(info)
+            if not host:
+                return
             fn = props.get("fn") or name.split(".")[0]
             device = Device("chromecast", fn, {
                 "host": host,
@@ -3245,7 +3271,6 @@ class MainFrame(wx.Frame):
                     before = getattr(mc.status, "media_session_id", None)
                     mc.play_media(play_url, load_mime,
                                   stream_type=stream_type)
-                    mc.block_until_active(15)
                     trace("cast.load", f"{load_mime} {stream_type} "
                                        f"prev_session={before}")
                     settled = self._await_playing(mc, before)
@@ -3259,7 +3284,6 @@ class MainFrame(wx.Frame):
                         play_url = relay.start()
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime, stream_type=stream_type)
-                        mc.block_until_active(15)
                         settled = self._await_playing(mc, before)
                     if not settled:
                         # Load rejected; flip stream type and retry once.
@@ -3268,7 +3292,6 @@ class MainFrame(wx.Frame):
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime,
                                       stream_type=stream_type)
-                        mc.block_until_active(15)
                         trace("cast.retry", stream_type)
                         settled = self._await_playing(mc, before)
                     if settled:
@@ -3319,6 +3342,7 @@ class MainFrame(wx.Frame):
             cancelled = False
             atv = None
             stream_task = None
+            probe_job = None
             wake = asyncio.Event()
             shutdown = asyncio.Event()
             self._air_wake = wake
@@ -3329,14 +3353,17 @@ class MainFrame(wx.Frame):
                     self._air_kind = "live"
                     self._air_is_live = True
                 else:
-                    # Probe once up front (executor thread).
-                    probe = await asyncio.get_running_loop().run_in_executor(
-                        None, probe_media, url)
                     vid = youtube_id(url)
-                    self._air_kind = "youtube" if vid else (
-                        "audio" if probe["is_audio"] else "video")
-                    self._air_is_live = (bool(probe["is_live"])
-                                         and self._air_kind == "video")
+                    if vid:
+                        # yt-dlp resolves YouTube itself. Probing a watch
+                        # page first is needless work and can be slow.
+                        self._air_kind = "youtube"
+                    else:
+                        # RAOP's RTSP setup and this small format probe do
+                        # not depend on each other. Overlap them so a portal
+                        # delay is not serialized with receiver connection.
+                        probe_job = asyncio.get_running_loop().run_in_executor(
+                            None, probe_media, url)
 
                 self._ui(self.set_status, f"Connecting to {dev.name}...")
                 atv = await pyatv.connect(dev.key, self.loop_thread.loop,
@@ -3345,6 +3372,13 @@ class MainFrame(wx.Frame):
                 self._atvs[dev.label] = atv
                 if shutdown.is_set():
                     raise asyncio.CancelledError()
+
+                if probe_job is not None:
+                    probe = await probe_job
+                    self._air_kind = ("audio" if probe["is_audio"]
+                                      else "video")
+                    self._air_is_live = (bool(probe["is_live"])
+                                         and self._air_kind == "video")
 
                 # Stream/restart loop: pause cancels the stream task and waits
                 # on `wake` while KEEPING the RAOP session alive; resume/seek
@@ -3441,6 +3475,14 @@ class MainFrame(wx.Frame):
                     self._air_state = "stopped"
                     self._air_wake = None
                     self._air_shutdown = None
+                if probe_job is not None:
+                    if not probe_job.done():
+                        probe_job.cancel()
+                    else:
+                        try:
+                            probe_job.result()
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 if cancelled:
                     self._ui(lambda: self.set_status("Stopped."))
 
@@ -3493,8 +3535,11 @@ class MainFrame(wx.Frame):
         trace("air.ffmpeg.spawn")
         ffmpeg = _find_ffmpeg()
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
-        # Survive IPTV source drops/jitter instead of feeding silence.
-        cmd += [
+        # These are HTTP protocol options. ffmpeg rejects -rw_timeout for a
+        # local path before opening it, so a local movie's audio could never
+        # reach an AirPlay speaker while this option was unconditional.
+        if url.lower().startswith(("http://", "https://")):
+            cmd += [
             # A live stream has no byte positions to come back to, and this
             # source now IGNORES -seekable 0: on a drop it serves its buffer
             # from an earlier point and ffmpeg splices that in -- the overlap
@@ -3502,12 +3547,13 @@ class MainFrame(wx.Frame):
             # wall-second, 2026-09-05). So no reconnect flags at all: a drop
             # ends the pipe and the RAOP runner's restart loop reopens at
             # the live edge. Only meaningful for http(s).
-            *(("-seekable", "0") if url.lower().startswith(
-                ("http://", "https://")) else ()),
+            "-seekable", "0",
             "-rw_timeout", "5000000",
-            # Look at as little of the stream as it takes to find the audio.
-            # The defaults inspect five seconds before emitting a byte, and
-            # every one of those is silence at the start of a channel.
+            ]
+        # Look at as little of the stream as it takes to find the audio.
+        # The defaults inspect five seconds before emitting a byte, and
+        # every one of those is silence at the start of a channel.
+        cmd += [
             "-analyzeduration", "1000000",
             "-probesize", "1000000",
         ]
@@ -4319,7 +4365,6 @@ class MainFrame(wx.Frame):
                     before = getattr(mc.status, "media_session_id", None)
                     trace("cast.recover", label)
                     mc.play_media(url, mime, stream_type=stream_type)
-                    mc.block_until_active(15)
                     if (self._await_playing(mc, before)
                             and not self._stop_flag
                             and self._cast_live_loads.get(label) is load):

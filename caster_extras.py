@@ -12,10 +12,12 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import http.server
+import ipaddress
 import io
 import os
 import queue
 import re
+import select
 import shutil
 import socket
 import struct
@@ -67,6 +69,88 @@ def _no_window_kwargs() -> dict:
 SSDP_SEARCHES = 3
 
 
+def ssdp_sockets() -> list[socket.socket]:
+    """Sockets which send SSDP over each usable IPv4 interface.
+
+    An unbound UDP socket follows Windows' preferred route.  On a machine
+    with a VPN, WSL or another virtual adapter that can be a point-to-point
+    interface rather than the LAN, so an otherwise valid M-SEARCH never
+    reaches the television.  SSDP is link-local multicast: send the small
+    search on every real local IPv4 interface and collect the unicast replies
+    on the matching socket.
+
+    ``getaddrinfo`` needs no optional dependency and is available on Windows
+    and the supported test platforms.  Falling back to one unbound socket
+    keeps the normal single-interface case working even where the hostname
+    has no registered address.
+    """
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None,
+                                   socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        infos = []
+    sources: list[str] = []
+    for info in infos:
+        host = info[4][0]
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            continue
+        if (address.is_loopback or address.is_unspecified
+                or host in sources):
+            continue
+        sources.append(host)
+    if not sources:
+        sources = ["0.0.0.0"]
+
+    sockets: list[socket.socket] = []
+    for source in sources:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                             socket.IPPROTO_UDP)
+        sock.settimeout(0.5)
+        try:
+            if source != "0.0.0.0":
+                # Binding the source receives its unicast replies; setting
+                # the multicast interface also makes the intended outbound
+                # route explicit instead of trusting Windows' route metric.
+                sock.bind((source, 0))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                socket.inet_aton(source))
+        except OSError:
+            sock.close()
+            continue
+        sockets.append(sock)
+    return sockets
+
+
+def mdns_host(info) -> str:
+    """Return a Zeroconf service address, preferring IPv4 when both exist.
+
+    ``ServiceInfo.addresses`` is raw packed bytes.  Passing a 16-byte IPv6
+    address to ``inet_ntoa`` raises, silently dropping a service from a
+    threaded browser.  Modern zeroconf already exposes parsed addresses;
+    retain a byte-level fallback for older versions.  IPv4 remains the first
+    choice because the app's local media server is IPv4, but IPv6-only
+    services remain discoverable for protocols which can use them directly.
+    """
+    try:
+        addresses = list(info.parsed_addresses())
+    except (AttributeError, OSError):
+        addresses = []
+    if not addresses:
+        for raw in getattr(info, "addresses", ()):
+            try:
+                if len(raw) == 4:
+                    addresses.append(socket.inet_ntoa(raw))
+                elif len(raw) == 16:
+                    addresses.append(socket.inet_ntop(socket.AF_INET6, raw))
+            except (OSError, TypeError):
+                continue
+    if not addresses:
+        return ""
+    return next((host for host in addresses if ":" not in host), addresses[0])
+
+
 def upnp_discover(timeout: int = 6) -> list:
     """SSDP M-SEARCH for AVTransport media renderers.
 
@@ -86,8 +170,9 @@ def upnp_discover(timeout: int = 6) -> list:
         "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"
         "\r\n"
     ).encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(0.5)
+    socks = ssdp_sockets()
+    if not socks:
+        return []
     locations = []
     try:
         # SSDP is UDP multicast and lossy by design: a reply that collides or
@@ -101,28 +186,36 @@ def upnp_discover(timeout: int = 6) -> list:
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_search and searches < SSDP_SEARCHES:
-                try:
-                    sock.sendto(msg, ("239.255.255.250", 1900))
-                except OSError:
-                    pass
+                for sock in socks:
+                    try:
+                        sock.sendto(msg, ("239.255.255.250", 1900))
+                    except OSError:
+                        pass
                 searches += 1
                 next_search = now + timeout / (SSDP_SEARCHES + 1)
             try:
-                data, addr = sock.recvfrom(65536)
-            except socket.timeout:
-                continue
-            except OSError:
+                ready, _, _ = select.select(
+                    socks, [], [], min(0.5, max(0.0, deadline - now)))
+            except (OSError, ValueError):
                 break
-            text = data.decode("utf-8", "replace")
-            loc = None
-            for line in text.splitlines():
-                if line.lower().startswith("location:"):
-                    loc = line.split(":", 1)[1].strip()
-                    break
-            if loc and loc not in locations:
-                locations.append(loc)
+            if not ready:
+                continue
+            for sock in ready:
+                try:
+                    data, _ = sock.recvfrom(65536)
+                except OSError:
+                    continue
+                text = data.decode("utf-8", "replace")
+                loc = None
+                for line in text.splitlines():
+                    if line.lower().startswith("location:"):
+                        loc = line.split(":", 1)[1].strip()
+                        break
+                if loc and loc not in locations:
+                    locations.append(loc)
     finally:
-        sock.close()
+        for sock in socks:
+            sock.close()
     if not locations:
         return []
     # Descriptions are fetched after the socket closes, not from inside the
