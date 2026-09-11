@@ -230,38 +230,29 @@ class Settings:
 #: resolution all trade against it -- so they move together behind one choice.
 #: Capture and relay tuning per quality choice.
 #:
-#: The three hls_* keys steer the MPEG-TS relay, and the trade they make is
-#: delay against tolerance for a stuttering source. `hls_trail` is how far
-#: behind the live edge the receiver is deliberately held: a deep cushion
-#: swallows IPTV jitter, a shallow one gets the picture up sooner. Cast
-#: receivers refuse to start below 3x the segment length, so `hls_prime`
-#: never drops under 3 -- that is the floor, not a preference.
-#:
-#: And it must not go ABOVE it either. With -c copy ffmpeg can only cut a
-#: segment at a keyframe, so a segment is as long as the source GOP however
-#: short hls_time is: one source emits one every 7.5s, so priming six of
-#: them is a 45-second wait, not a six-second one. Three segments satisfy the
-#: receiver whatever their length; asking for more only makes a long-GOP
-#: channel look broken.
-#:
-#: `hls_trail_seconds` is the same cushion measured the way that actually
-#: matters. A count of segments says nothing about time when the source cuts
-#: them at its own keyframes: on one live channel eight segments ran from 25
-#: to 40 seconds, while the input arrived in bursts up to 13 seconds apart.
-#: The cushion has to cover the worst of those bursts with room to spare, so
-#: it is a floor in seconds and the segment count is only its lower bound.
+#: Playlist history and startup buffering are different. Cast starts near
+#: the live edge unless given a position, regardless of retained history.
+#: `hls_start_seconds` supplies a modest initial cushion, and Caster loads
+#: its own live relay from the beginning of the available seekable window.
+#: `hls_trail_seconds` retains the longer window for jitter and recovery.
+#: Keep hls_prime at three: extra buffering is requested in seconds, never
+#: in an assumed number of source GOPs. Long-GOP promotion happens before
+#: waiting for the startup cushion, so eight 7.5s GOPs cannot cost a minute.
 QUALITY_PRESETS = {
     "latency": {"fps": 30, "bitrate": "3M", "max_width": 1280,
                 "max_height": 720, "keyframe_seconds": 0.4,
                 "hls_time": 2, "hls_prime": 3, "hls_trail": 6, "hls_trail_seconds": 25,
+                "hls_start_seconds": 12,
                 "label": "Lowest delay (720p)"},
     "balanced": {"fps": 30, "bitrate": "6M", "max_width": 1920,
                  "max_height": 1080, "keyframe_seconds": 0.5,
                  "hls_time": 2, "hls_prime": 3, "hls_trail": 8, "hls_trail_seconds": 45,
+                 "hls_start_seconds": 16,
                  "label": "Balanced (1080p)"},
     "quality": {"fps": 60, "bitrate": "12M", "max_width": 1920,
                 "max_height": 1080, "keyframe_seconds": 1.0,
                 "hls_time": 2, "hls_prime": 3, "hls_trail": 12, "hls_trail_seconds": 60,
+                "hls_start_seconds": 20,
                 "label": "Best picture (1080p60)"},
 }
 

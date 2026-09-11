@@ -767,6 +767,47 @@ Scanned 2026-09-04 with the app's own discovery, so no protocol guessing is need
 - `192.168.1.70` AirPlay device with pairing **Mandatory**. Caster has no pyatv
   pairing flow, so it cannot be cast to and that is not a bug to chase.
 
+## Buffered Cast starts and frozen receiver recovery (2026-09-11)
+
+Correction to older notes above: `_trailing_playlist` retains the NEWEST
+media, trimming old entries. It does not hide the live edge or force a
+receiver to stay 45 seconds behind. Google's default live start is near the
+edge, regardless of how much history the manifest contains.
+
+`hls_start_seconds` now primes 12/16/20 actual media seconds for the
+latency/balanced/quality presets, independently of the longer retained
+history. `_cast_load_options` sends `current_time=0` only for an owned live
+relay; the receiver clamps this to its available window. External manifests
+and finite media keep their default start. Keep both parts: with a controlled
+real-time H.264/AAC source, a real Cast receiver repeatedly buffered with six
+seconds primed, including with an explicit start. With sixteen seconds and
+the explicit start, every two-second sample over the next minute was PLAYING.
+Both Media Foundation and libx264 reproduced the shallow-buffer failure, so
+switching encoders is not the fix. Healthy source GOPs still use stream copy.
+
+HLS's duration check rounds EXTINF to the nearest integer, not upwards.
+Three 2.002-second segments meet a target of 2; do not turn that into a
+target of 3 and an unnecessary five-segment wait. Respect the declared
+target too, and use the served target ratchet when sizing the served window.
+Piped under-feed recovery now runs while priming, before the supervisor
+starts. Hardware encoder discovery has one eight-second budget and a
+2.5-second per-driver limit, rather than a minute per failed candidate.
+
+Live Cast recovery also observes the receiver's position and session ID.
+PLAYING or BUFFERING without clock progress for twenty seconds reloads the
+existing media URL, bounded to once per thirty seconds. A deliberate PAUSED
+state is left alone. Stop clears the observations and load identity is
+rechecked before recovery. A transient status read failure is inconclusive.
+This does not open a second provider connection or restart the relay.
+
+Validation on the two user-supplied links saw starts around 10 and 30 seconds,
+but source throughput varied and buffering still occurred. On the latter
+run, a persistent receiver freeze was automatically recovered and all samples
+for the remaining 47 seconds were PLAYING. Do not describe this as proof of
+buffer-free IPTV: the controlled source establishes the buffering fix, while
+the provider run establishes that the recovery path actually executes.
+Keep provider URLs and credentials out of committed diagnostics and tests.
+
 ## Editing traps
 
 - Working tree is LF, git autocrlf is on. Patch scripts must pass `newline=""` on read AND

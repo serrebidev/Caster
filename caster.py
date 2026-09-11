@@ -458,6 +458,8 @@ def _find_ffmpeg() -> str:
 
 _ENC_CANDIDATES = ("h264_qsv", "h264_amf", "h264_nvenc", "h264_mf", "libx264")
 _encoder_cache: Optional[str] = None
+ENCODER_PROBE_TIMEOUT = 2.5
+ENCODER_PROBE_BUDGET = 8.0
 
 
 def pick_h264_encoder() -> str:
@@ -471,7 +473,11 @@ def pick_h264_encoder() -> str:
         return _encoder_cache
     ff = _find_ffmpeg()
     results = {}
+    deadline = time.monotonic() + ENCODER_PROBE_BUDGET
     for enc in _ENC_CANDIDATES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         args = [
             ff, "-hide_banner", "-loglevel", "error",
             "-f", "lavfi", "-i",
@@ -481,7 +487,8 @@ def pick_h264_encoder() -> str:
         try:
             t0 = time.monotonic()
             p = subprocess.run(args, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=60,
+                               stderr=subprocess.DEVNULL,
+                               timeout=min(ENCODER_PROBE_TIMEOUT, remaining),
                                **_no_window_kwargs())
             dt = time.monotonic() - t0
             if p.returncode == 0:
@@ -700,14 +707,10 @@ class HlsRelay:
     ffmpeg is killed and the server closed by stop(); nothing runs when idle.
     """
 
-    # Segments the RECEIVER is shown. The encoder keeps more on disk; hiding
-    # the newest ones puts the receiver a few seconds behind the live edge so
-    # upstream IPTV jitter lands in a cushion instead of stalling playback.
-    # That cushion is also the delay, second for second, which is why the
-    # quality preset gets to set it: a stuttering IPTV feed wants it deep, a
-    # clean one wants the picture up sooner. The floor is the cast receiver's
-    # minimum-buffer rule of 3x TARGETDURATION, below which it refuses to
-    # start at all.
+    # History the receiver is shown. The playlist keeps its newest entries;
+    # it does NOT hide the live edge. startup_seconds and an explicit Cast
+    # start position provide the initial playback cushion. Longer history
+    # lets a lagging receiver recover without losing the segment it needs.
     TRAIL_KEEP = 6
     #: The same cushion as a floor in seconds. A segment count is the wrong
     #: unit when the source cuts on its own keyframes: measured on one live
@@ -786,7 +789,8 @@ class HlsRelay:
     def __init__(self, url: str, hls_time: int = 2, prime_segments: int = 3,
                  trail_keep: int = TRAIL_KEEP, codecs: Optional[list] = None,
                  live: Optional[bool] = None,
-                 trail_seconds: float = TRAIL_SECONDS) -> None:
+                 trail_seconds: float = TRAIL_SECONDS,
+                 startup_seconds: float = 0.0) -> None:
         self.url = url
         #: Segment length. Shorter means the receiver can start sooner, since
         #: everything below is counted in segments, not seconds.
@@ -796,6 +800,8 @@ class HlsRelay:
         self.prime_segments = max(3, int(prime_segments))
         self.trail_keep = max(3, int(trail_keep))
         self.trail_seconds = max(0.0, float(trail_seconds))
+        self.startup_seconds = max(0.0, float(startup_seconds))
+        self.play_url = None
         #: Stream codecs, when the caller has already paid to find them out.
         #: Probing costs a whole extra connection to the source, and IPTV
         #: servers are slow to accept one and slower to authorise it.
@@ -911,16 +917,17 @@ class HlsRelay:
         # the playlist keeps advancing and the receiver never notices.
         threading.Thread(target=self._supervise, daemon=True,
                          name="caster-relay-supervisor").start()
-        return f"http://{self._lan_ip()}:{self.port}/live.m3u8"
+        self.play_url = f"http://{self._lan_ip()}:{self.port}/live.m3u8"
+        return self.play_url
 
     def _prime(self, m3u8: str, want: int) -> bool:
         """Wait until enough media exists for a receiver to accept the URL.
 
-        Accumulate the minimum backlog the receiver will accept BEFORE
-        handing it the URL. On a live source these segments arrive in real
-        time, so every one asked for here is a second of the wait -- which is
-        why this is the floor and not a cushion. The cushion is trail_keep,
-        and that costs nothing up front. A completed segment beyond
+        Accumulate the HLS minimum and the chosen live startup cushion before
+        handing out the URL. A longer history alone does not move Cast back
+        from the live edge; the load also selects an explicit start position.
+        The cushion is measured in seconds, not a count of source GOPs.
+        A completed segment beyond
         GOP_COPY_LIMIT is enough evidence to restart with forced keyframes:
         waiting for two more long segments before making that decision was
         the direct cause of 30--60 second starts. Returns True only for that
@@ -941,13 +948,33 @@ class HlsRelay:
                 # Three files are not necessarily three TARGETDURATIONs:
                 # variable GOPs can yield (10s, 1s, 1s). Count only
                 # published media and prime by duration as well.
+                # HLS rounds EXTINF to the nearest integer, not upwards.
+                # A normal 23.976/29.97fps segment is 2.002s: ceil made
+                # three such segments wait for five (10s instead of 6s).
+                target = max(1, int(max(completed.values(), default=0) + 0.5))
+                try:
+                    with open(m3u8, encoding="utf-8") as playlist:
+                        for line in playlist:
+                            if line.startswith("#EXT-X-TARGETDURATION:"):
+                                target = max(target, int(line.split(":", 1)[1]))
+                                break
+                except (OSError, ValueError):
+                    pass
                 if (len(completed) >= want
-                        and sum(completed.values()) >=
-                        3 * math.ceil(max(completed.values()))):
+                        and sum(completed.values()) >= max(
+                            3 * target, self.startup_seconds if self.live else 0)):
                     return False
+            if self.proc is None:
+                raise RuntimeError("relay stopped while starting")
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     "ffmpeg exited early while starting relay")
+            # The supervisor starts AFTER priming. A throttled connection
+            # used to wait out this entire 60s deadline with recovery off.
+            # On the piped path recovery only swaps the upstream socket;
+            # the encoder and the completed startup media survive it.
+            if self.ts_source is not None:
+                self._check_underfeed(time.monotonic())
             time.sleep(0.1)
         raise RuntimeError("relay produced no HLS playlist in time")
 
@@ -1533,9 +1560,11 @@ class HlsRelay:
             return self._trailing_playlist()
 
     def _trailing_playlist(self):
-        """Playlist bytes trimmed to the trailing TRAIL_KEEP segments, so the
-        receiver rides a few seconds behind the live edge. Returns None only
-        before enough segments exist (the raw file is served then)."""
+        """A sliding history window, with duration and sequence safeguards.
+
+        Keeping history alone does not select the receiver's play position.
+        Returns None before a usable playlist exists.
+        """
         if not self.root:
             return None   # relay already stopped; straggler request
         p = os.path.join(self.root, "live.m3u8")
@@ -1565,8 +1594,9 @@ class HlsRelay:
         # delivers in bursts, so the cushion has to outlast the longest quiet
         # spell between them or the receiver reaches the end and rebuffers.
         try:
-            target = float(next(l.split(":", 1)[1] for l in lines
-                                if l.startswith("#EXT-X-TARGETDURATION:")))
+            target = max(self._served_target or 0, float(next(
+                l.split(":", 1)[1] for l in lines
+                if l.startswith("#EXT-X-TARGETDURATION:"))))
             durations = [float(l.split(":", 1)[1].rstrip(",")) for l in lines
                          if l.startswith("#EXTINF:")]
             if len(durations) == len(segs):
@@ -1695,6 +1725,7 @@ class HlsRelay:
         if self.root:
             shutil.rmtree(self.root, ignore_errors=True)
         self.root = None
+        self.play_url = None
 
 
 class SyncStreamReader(io.BufferedIOBase):
@@ -1932,6 +1963,8 @@ class MainFrame(wx.Frame):
         self._casts: dict[str, pychromecast.Chromecast] = {}
         self._cast_live_loads = {}
         self._cast_recovering = set()
+        self._cast_progress = {}
+        self._cast_retry_at = {}
         self._atvs: dict[str, object] = {}
         self.stream_task: Optional[asyncio.Task] = None
         self._runner_fut: Optional[concurrent.futures.Future] = None
@@ -3157,7 +3190,20 @@ class MainFrame(wx.Frame):
                         prime_segments=chosen["hls_prime"],
                         trail_keep=chosen["hls_trail"],
                         trail_seconds=chosen["hls_trail_seconds"],
+                        startup_seconds=chosen["hls_start_seconds"],
                         codecs=codecs, live=live)
+
+    def _cast_load_options(self, url: str) -> dict:
+        """Use the buffered start of our live relay; Cast clamps to its window.
+
+        With no currentTime, the receiver chooses the live edge and ignores
+        most of the retained history. Only apply this to a relay we own, so
+        external playlists and finite media retain their normal behaviour.
+        """
+        for relay in getattr(self, "_relays", ()):
+            if getattr(relay, "play_url", None) == url and relay.live:
+                return {"current_time": 0}
+        return {}
 
     def _play_chromecast(self, dev: Device, url: str, mime: str = "",
                          is_live: Optional[bool] = None) -> None:
@@ -3196,7 +3242,7 @@ class MainFrame(wx.Frame):
                     # would ever tear it down, and the next play would read
                     # its stale PLAYING status as its own.
                     try:
-                        cast.disconnect(blocking=False)
+                        cast.disconnect(timeout=2)
                     except Exception:
                         pass
                     return
@@ -3270,7 +3316,8 @@ class MainFrame(wx.Frame):
                     # thing played; the new one has to be told apart from it.
                     before = getattr(mc.status, "media_session_id", None)
                     mc.play_media(play_url, load_mime,
-                                  stream_type=stream_type)
+                                  stream_type=stream_type,
+                                  **self._cast_load_options(play_url))
                     trace("cast.load", f"{load_mime} {stream_type} "
                                        f"prev_session={before}")
                     settled = self._await_playing(mc, before)
@@ -3283,7 +3330,8 @@ class MainFrame(wx.Frame):
                         self._keep_relay(relay)
                         play_url = relay.start()
                         before = getattr(mc.status, "media_session_id", None)
-                        mc.play_media(play_url, load_mime, stream_type=stream_type)
+                        mc.play_media(play_url, load_mime, stream_type=stream_type,
+                                      **self._cast_load_options(play_url))
                         settled = self._await_playing(mc, before)
                     if not settled:
                         # Load rejected; flip stream type and retry once.
@@ -3291,7 +3339,8 @@ class MainFrame(wx.Frame):
                                        else "LIVE")
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime,
-                                      stream_type=stream_type)
+                                      stream_type=stream_type,
+                                      **self._cast_load_options(play_url))
                         trace("cast.retry", stream_type)
                         settled = self._await_playing(mc, before)
                     if settled:
@@ -3886,6 +3935,8 @@ class MainFrame(wx.Frame):
         # Multi-room casts create several, and self.cast only holds one.
         casts, self._casts = dict(self._casts), {}
         self._cast_live_loads = {}
+        self._cast_progress = {}
+        self._cast_retry_at = {}
         for cast in casts.values():
             try:
                 cast.stop_app()
@@ -4336,15 +4387,39 @@ class MainFrame(wx.Frame):
                 pass
         self._check_sonos_resync(source)
 
+    CAST_STALL_TIMEOUT = 20.0
+    CAST_RECOVERY_INTERVAL = 30.0
+
     def _recover_live_casts(self) -> None:
-        """Reload an ended live URL using its existing relay and connection."""
+        """Recover ended or frozen live playback on the receiver itself."""
+        now = time.monotonic()
         for label, load in list(self._cast_live_loads.items()):
             cast, url, mime, stream_type = load
             if label in self._cast_recovering:
                 continue
             try:
                 status = cast.media_controller.status
-                if status is None or status.player_state != "IDLE":
+                if status is None:
+                    continue
+                state = status.player_state
+                if state in ("PLAYING", "BUFFERING"):
+                    position = getattr(status, "current_time", None)
+                    session = getattr(status, "media_session_id", None)
+                    if position is None:
+                        continue
+                    previous = self._cast_progress.get(label)
+                    if (previous is None or previous[0] is not load
+                            or previous[1:3] != (session, position)):
+                        self._cast_progress[label] = (load, session, position, now)
+                        continue
+                    if now - previous[3] < self.CAST_STALL_TIMEOUT:
+                        continue
+                elif state != "IDLE":
+                    # A deliberate pause must never be resumed by the watchdog.
+                    self._cast_progress.pop(label, None)
+                    continue
+                retry = self._cast_retry_at.get(label)
+                if retry and retry[0] is load and now < retry[1]:
                     continue
             except Exception as exc:
                 # Status arrives asynchronously.  A socket that is briefly
@@ -4353,6 +4428,7 @@ class MainFrame(wx.Frame):
                 trace("cast.recover.status_failed", type(exc).__name__)
                 continue
             self._cast_recovering.add(label)
+            self._cast_retry_at[label] = (load, now + self.CAST_RECOVERY_INTERVAL)
 
             def recover(label=label, load=load):
                 cast, url, mime, stream_type = load
@@ -4364,7 +4440,8 @@ class MainFrame(wx.Frame):
                     mc = cast.media_controller
                     before = getattr(mc.status, "media_session_id", None)
                     trace("cast.recover", label)
-                    mc.play_media(url, mime, stream_type=stream_type)
+                    mc.play_media(url, mime, stream_type=stream_type,
+                                  **self._cast_load_options(url))
                     if (self._await_playing(mc, before)
                             and not self._stop_flag
                             and self._cast_live_loads.get(label) is load):

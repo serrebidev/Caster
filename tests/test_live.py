@@ -38,9 +38,8 @@ AIRPLAY = os.environ.get("CASTER_TEST_AIRPLAY", "")
 
 needs_receiver = pytest.mark.skipif(not MUSICCAST,
                                     reason="set CASTER_TEST_MUSICCAST")
-#: How long to watch the receiver. It has to outlast the deep cushion the
-#: relay holds it behind (45s at the balanced preset) several times over,
-#: or a stall that only shows up once the cushion drains is simply missed.
+#: Watch well beyond both the startup cushion (16s balanced) and retained
+#: playlist history (45s). History alone does not set a receiver's playhead.
 CAST_WATCH = 240
 
 needs_cast = pytest.mark.skipif(not (STREAM and CHROMECAST),
@@ -314,6 +313,7 @@ def _relay_for(url):
                            prime_segments=chosen["hls_prime"],
                            trail_keep=chosen["hls_trail"],
                            trail_seconds=chosen["hls_trail_seconds"],
+                           startup_seconds=chosen["hls_start_seconds"],
                            codecs=["h264", "aac"], live=True)
 
 
@@ -387,7 +387,7 @@ def test_the_receiver_keeps_playing_a_live_channel():
 
         mc = cast.media_controller
         mc.play_media(play_url, "application/vnd.apple.mpegurl",
-                      stream_type="LIVE")
+                      stream_type="LIVE", current_time=0)
         mc.block_until_active(20)
         before = sum(relay._completed_segments().values())
         samples, freezes = _watch_receiver(mc, CAST_WATCH)
