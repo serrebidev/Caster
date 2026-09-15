@@ -764,6 +764,15 @@ class HlsRelay:
     # there is still room to reconnect; rotate a truly starved feed at once.
     ROTATE_RATIO = 0.85      # sustained media-seconds per wall-second
     ROTATE_HARD_RATIO = 0.60 # one window: cushion would otherwise run out
+    #: The piped path's sustained threshold. A socket swap costs no seam, so
+    #: it can afford to act on a connection that is only slightly slow.
+    #: Measured 2026-09-15 on the Big Bang channel to RB Room: the provider
+    #: held ONE connection for minutes (0 reconnects) while it decayed to
+    #: 0.87-0.93x. Every window cleared 0.85, so nothing rotated, and a
+    #: receiver consuming 1.0x reached the live edge every minute or two --
+    #: freezes of 14s and 42s. Below real time is below real time: any
+    #: sustained shortfall drains the cushion, only the rate differs.
+    ROTATE_RATIO_PIPED = 0.95
     #: The measurement window. It cannot be shortened to chase a faster
     #: rotation cadence: a source that delivers in bursts is idle between
     #: them, and a window shorter than its burst period can land entirely
@@ -948,6 +957,26 @@ class HlsRelay:
         self.play_url = f"http://{self._lan_ip()}:{self.port}/live.m3u8"
         return self.play_url
 
+    def _live_target(self) -> int:
+        """The EXT-X-TARGETDURATION a live relay advertises, at the least.
+
+        A Cast receiver does not play a live playlist from where it is told
+        to: it holds about three target durations behind the newest segment.
+        Measured 2026-09-15 on RB Room with 2s segments and current_time=0,
+        it jumped past the startup cushion and sat 0.1-6s behind the edge,
+        so a feed a little under real time froze it every minute or two
+        while the relay held 46s of history it never used.
+
+        Advertising a third of the startup cushion puts that cushion where
+        the receiver actually plays. Segments stay hls_time long -- EXTINF
+        only has to be no longer than the target -- so keyframes, rotation
+        and the retained window are untouched. A finite asset is not played
+        at a live edge and keeps the encoder's own value.
+        """
+        if not self.live or not self.startup_seconds:
+            return 0
+        return max(self.hls_time, math.ceil(self.startup_seconds / 3))
+
     def _prime(self, m3u8: str, want: int) -> bool:
         """Wait until enough media exists for a receiver to accept the URL.
 
@@ -979,7 +1008,8 @@ class HlsRelay:
                 # HLS rounds EXTINF to the nearest integer, not upwards.
                 # A normal 23.976/29.97fps segment is 2.002s: ceil made
                 # three such segments wait for five (10s instead of 6s).
-                target = max(1, int(max(completed.values(), default=0) + 0.5))
+                target = max(1, int(max(completed.values(), default=0) + 0.5),
+                             self._live_target())
                 try:
                     with open(m3u8, encoding="utf-8") as playlist:
                         for line in playlist:
@@ -1308,7 +1338,7 @@ class HlsRelay:
         # source GOPs vary, and a long final segment otherwise makes a slow
         # connection look healthy (or a healthy one look starved).
         ratio = media / span
-        if ratio >= self.ROTATE_RATIO:
+        if ratio >= (self.ROTATE_RATIO_PIPED if piped else self.ROTATE_RATIO):
             self._fail_streak = 0
             return
         self._fail_streak += 1
@@ -1642,7 +1672,7 @@ class HlsRelay:
         # delivers in bursts, so the cushion has to outlast the longest quiet
         # spell between them or the receiver reaches the end and rebuffers.
         try:
-            target = max(self._served_target or 0, float(next(
+            target = max(self._served_target or 0, self._live_target(), float(next(
                 l.split(":", 1)[1] for l in lines
                 if l.startswith("#EXT-X-TARGETDURATION:"))))
             durations = [float(l.split(":", 1)[1].rstrip(",")) for l in lines
@@ -1713,6 +1743,7 @@ class HlsRelay:
                 value = int(float(line.split(":", 1)[1]))
             except ValueError:
                 return line
+            value = max(value, self._live_target())
             if self._served_target is not None:
                 value = max(value, self._served_target)
             self._served_target = value

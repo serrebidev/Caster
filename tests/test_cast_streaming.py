@@ -212,6 +212,57 @@ def test_idle_recovery_is_rate_limited_and_uses_owned_relay_buffer(watchdog):
     assert len(calls) == 2
 
 
+def _served_target(body: str) -> int:
+    return int(next(line.split(":", 1)[1] for line in body.splitlines()
+                    if line.startswith("#EXT-X-TARGETDURATION:")))
+
+
+def test_live_relay_advertises_a_target_that_holds_the_receiver_back(tmp_path):
+    """Cast plays a live playlist about 3x TARGETDURATION behind its edge.
+
+    Measured on RB Room with 2s segments: the receiver jumped past the
+    startup cushion and sat 0.1-6s behind the newest segment, so a feed at
+    0.87x froze it within minutes. The advertised target is the only lever
+    that moves where it plays; segments stay 2s long.
+    """
+    relay = caster.HlsRelay("http://example.invalid/live.ts", live=True,
+                            startup_seconds=16, trail_seconds=0)
+    relay.root = str(tmp_path)
+    playlist(tmp_path / "live.m3u8", [2.002] * 20)
+    body = relay.trailing_playlist().decode()
+    assert _served_target(body) == 6
+    durations = [float(line.split(":")[1].rstrip(",")) for line in body.splitlines()
+                 if line.startswith("#EXTINF:")]
+    assert max(durations) <= 6        # RFC 8216: EXTINF never exceeds it
+
+
+def test_finite_relay_keeps_the_encoder_target(tmp_path):
+    relay = caster.HlsRelay("http://example.invalid/movie.ts", live=False,
+                            startup_seconds=16, trail_seconds=0)
+    relay.root = str(tmp_path)
+    playlist(tmp_path / "live.m3u8", [2.002] * 20)
+    assert _served_target(relay.trailing_playlist().decode()) == 2
+
+
+def test_prime_waits_for_three_advertised_targets(tmp_path, monkeypatch):
+    """The receiver refuses to start below 3x the target it is SHOWN."""
+    relay = caster.HlsRelay("http://example.invalid/live.ts", codecs=["h264", "aac"],
+                            live=True, startup_seconds=16)
+    relay.root = str(tmp_path)
+    relay.proc = types.SimpleNamespace(poll=lambda: None)
+    path = tmp_path / "live.m3u8"
+    playlist(path, [2.002] * 8)       # 16.0s: meets the cushion, not 3 x 6
+    waits = []
+
+    def advance(_):
+        waits.append(True)
+        playlist(path, [2.002] * 9)   # 18.0s
+
+    monkeypatch.setattr(caster.time, "sleep", advance)
+    assert relay._prime(str(path), 3) is False
+    assert waits == [True]
+
+
 def test_prime_can_be_cancelled_before_any_media(tmp_path):
     relay = caster.HlsRelay("http://example.invalid/live.ts", live=True)
     relay.root = str(tmp_path)

@@ -878,6 +878,37 @@ Keep provider URLs and credentials out of committed diagnostics and tests.
 - Quit from the tray used to switch `minimise_to_tray` off for good; it now
   uses `Close(force=True)`, as does installing an update.
 
+## Cast plays 3x TARGETDURATION behind the live edge (2026-09-15)
+
+Correction to "Buffered Cast starts" above: `current_time=0` does NOT hold
+RB Room at the start of the window. Within seconds the receiver jumps to
+about 3x EXT-X-TARGETDURATION behind the newest segment and stays there. With
+2s segments that was 0.1-6s, so the 16s startup prime and 46s of history
+were never used.
+
+Big Bang to RB Room, back to back, same source rate (0.99x vs 1.00x mean):
+
+- old: TARGETDURATION 2, 60% of samples PLAYING, freezes 8/14/42/48s, gap to
+  edge 0-6s
+- `_live_target()` = ceil(hls_start_seconds / 3) advertised (6 at balanced):
+  100% PLAYING over 358s, no freeze, gap 12.5-20.7s
+
+The target is advertised only. Segments stay hls_time long, EXTINF stays
+under the target, keyframes and rotation are untouched. Priming waits for 3x
+the advertised target, the served cushion and the ratchet use it too. Finite
+relays keep ffmpeg's value. To move the receiver's delay, change the target,
+not the history, prime or start position.
+
+Same run: this provider held ONE connection for minutes (0 reconnects) while
+it sagged to 0.87-0.93x, above the old 0.85 rotation line, so it was never
+rotated. `ROTATE_RATIO_PIPED = 0.95` now applies to the socket-swap path;
+the encoder-kill path keeps 0.85. That threshold did not fire in the 360s
+verification run, so it is unit-tested only, and it has NOT been measured
+against the burst-delivery provider described under Live TS ingest.
+
+Encoder is not the limit on this channel: h264_mf re-encode used 0.13 of a
+core. Big Bang's GOP reached 9.8s during priming, so it is always re-encoded.
+
 ## Editing traps
 
 - Working tree is LF, git autocrlf is on. Patch scripts must pass `newline=""` on read AND

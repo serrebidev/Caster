@@ -1711,6 +1711,33 @@ def test_piped_rotation_repeats_on_the_cadence_a_socket_swap_can_afford(relay):
     assert r.ts_source.rotations == 2
 
 
+def test_piped_rotation_catches_a_connection_just_below_real_time(relay):
+    """0.875x held for minutes froze RB Room twice; a socket swap fixes it."""
+    r = _live_relay(relay)
+    r.ts_source = _FakeSource()
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)      # opens the window
+    _segments(r.root, 47)          # +7 x 2.5s in 20s: 0.875x
+    r._check_underfeed(180.0)
+    assert r.ts_source.rotations == 0   # one window is not enough
+    _segments(r.root, 54)
+    r._check_underfeed(200.0)
+    assert r.ts_source.rotations == 1
+    assert r.proc.killed == 0
+
+
+def test_encoder_path_still_tolerates_a_mildly_slow_feed(relay):
+    """Killing ffmpeg costs a seam, so its threshold stays at 0.85x."""
+    r = _live_relay(relay)
+    _segments(r.root, 40)
+    r._check_underfeed(160.0)
+    _segments(r.root, 47)          # 0.875x
+    r._check_underfeed(180.0)
+    _segments(r.root, 54)
+    r._check_underfeed(200.0)
+    assert r.proc.killed == 0
+
+
 def test_underfeed_will_not_judge_a_window_shorter_than_the_eval_period(relay):
     """A burst-delivery source is idle between bursts, so a short window lies.
 
