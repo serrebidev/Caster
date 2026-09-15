@@ -808,6 +808,76 @@ buffer-free IPTV: the controlled source establishes the buffering fix, while
 the provider run establishes that the recovery path actually executes.
 Keep provider URLs and credentials out of committed diagnostics and tests.
 
+## Audit findings (2026-09-14)
+
+- pychromecast 14.0.10 has NO `Chromecast.stop_app()` and `disconnect()`
+  takes only `timeout` (0 = do not block). Both old calls raised inside a
+  bare except, so Stop never reached the TV and every socket thread leaked.
+  `set_volume` IS there (an instance attribute set in `__init__`) but waits
+  for the receiver's reply, so it runs off the UI thread. Check signatures
+  with `inspect` before trusting a pychromecast call inside `except: pass`.
+- Stop ends the media session, not the receiver app. Launching the Default
+  Media Receiver on RB Room measured 9.7 s; a warm receiver starts a file in
+  about 6 s. `cast.app_id` is None right after `cast.wait()` until the first
+  status arrives: never force-launch on None.
+- Updater: `Start-Process -WindowStyle Hidden` on Caster.exe becomes the
+  app's first ShowWindow. Measured: wx frame IsWindowVisible=0. Hidden is for
+  the PowerShell helper only. A failed update rolls back AND reopens the old
+  Caster.
+- `set_status` in the status timer must pass `speak=False`: the position
+  changes each tick, so the repeat filter never caught it and NVDA read the
+  clock every 1.5 s.
+- Windows mimetypes on this box: .ts/.m2ts `video/vnd.dlna.mpeg-tts`, .m3u8
+  `audio/x-mpegurl`, .m4a `audio/m4a`, .aac `audio/vnd.dlna.adts`.
+  `FileServer._TYPES` overrides them.
+- Over HTTP every MPEG-TS probes as live. A local .ts/.m2ts sent through
+  FileServer then took the piped TsSource path: the whole file arrived in
+  0.2 s, each reconnect was discarded as a full replay, and the Cast never
+  started. `cast_file` passes `is_live=False` to every transport.
+- AirPlay was broken for everything but a local file path. pyatv 0.17 with
+  miniaudio 1.61 cannot play a stream it cannot seek. Measured offline on
+  identical bytes: ffmpeg's WAV (LIST chunk before data) from a non-seekable
+  reader or asyncio.StreamReader -> DecodeError -17 (MA_AT_END); a plain WAV
+  header -> opens, decodes 0 bytes; the same bytes from a seekable reader ->
+  plays. On R&B Room the ffmpeg pipe hung 45 s without switching input, and
+  a FileServer WAV URL failed in 3.8 s and was announced "Finished.".
+  `SeekablePipeReader` keeps the first 256 KB and 1 MB behind the read
+  position; every AirPlay source (ffmpeg pipe, capture tap) goes through it.
+  A seek far past what has arrived PARKS without pulling: ffmpeg writes a pipe
+  WAV's RIFF and data sizes as 0xFFFFFFFF, pyatv's metadata parse skips by
+  that and then seeks by sample values read as chunk sizes. Clamp-and-read
+  walked the whole stream (endless on a live one, on the event loop), the
+  window trimmed behind it, and a 25 s clip decoded 7.43 s offline and ended
+  at 17 s on R&B Room. Parked, all clips decode in full (25.0 s).
+- `-seekable 0` on the RAOP ffmpeg is for live only. A finite MOV/M4A/MP4
+  without faststart needs seeking to open: with it, a .mov over HTTP decoded
+  nothing and the app said "Finished." after 2.1 s. A local file cast to
+  AirPlay hands ffmpeg the path, not the FileServer URL.
+  The old `SyncStreamReader` also deadlocked: pyatv parses metadata ON the
+  event loop thread, and each read went through run_coroutine_threadsafe to
+  that same loop. Never route a pyatv source read through the loop.
+- Every AirPlay URL goes through ffmpeg, audio and YouTube included: pyatv's
+  URL source uses miniaudio, which knows WAV, FLAC, MP3 and Vorbis only.
+- A stream_file that raises is an AirPlay error, not "Finished.".
+- R&B Room is now at 192.168.1.67 (pyatv scan, YXC answers there), not .65.
+  netusb/getPlayInfo reports "pause", play_time 0 through a whole AirPlay
+  stream; the input switching to "airplay" is the usable signal. pyatv sends
+  a volume SET_PARAMETER on every session start, which moves the amp.
+- A finished non-live relay must not be restarted: the supervisor looped a
+  local .m2ts forever, and `_trailing_playlist` dropped ffmpeg's ENDLIST.
+- RB Room refuses AVI (MPEG-4) and WMV outright; the Cast path now falls back
+  to the relay, which re-encodes video and converts audio a TS cannot carry
+  (Opus, Vorbis, FLAC, WMA, PCM) to AAC.
+- Screen cast to RB Room: 14.5 s to advancing from the TV's idle screen
+  with an unsaved grabber probe (2.54 s) in the path; 5.3 s with the receiver
+  app up and the saved grabber answer. The encoder choice (h264_mf, 0.76 s
+  to probe) is now warmed when a capture starts, under `_encoder_lock`.
+- Measured on RB Room, warm receiver, 25 s clips: MP4 (H.264 or HEVC), MKV,
+  MOV, WebM (VP8, VP9), MP3, M4A, FLAC, WAV, OGG, Opus all PLAYING in under
+  1 s and advancing by 3 s. TS through the relay started in 1.8-4.5 s.
+- Quit from the tray used to switch `minimise_to_tray` off for good; it now
+  uses `Close(force=True)`, as does installing an update.
+
 ## Editing traps
 
 - Working tree is LF, git autocrlf is on. Patch scripts must pass `newline=""` on read AND

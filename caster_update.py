@@ -215,7 +215,10 @@ foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {{
         }}
     }}
 }}
-Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir -WindowStyle Hidden
+# No -WindowStyle here: the hidden style is for this helper only. Handed to
+# Caster.exe it becomes the first ShowWindow command, and the updated app
+# opened with no visible window for a screen reader to reach.
+Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir
 Add-Content -LiteralPath $log -Value 'Caster update installed and restarted.'
 Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $helperDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -230,6 +233,19 @@ Remove-Item -LiteralPath $helperDir -Recurse -Force -ErrorAction SilentlyContinu
             }} else {{
                 Remove-Item -LiteralPath $entry.destination -Force -ErrorAction SilentlyContinue
             }}
+        }} catch {{ Add-Content -LiteralPath $log -Value ($_ | Out-String) }}
+    }}
+    # The previous files are back, so reopen them: a failed update must not
+    # leave the user with no Caster at all. The requesting instance may still
+    # be closing, so let it finish first; an instance that refused to exit is
+    # still running and needs no second copy.
+    $requester = Get-Process -Id $config.pid -ErrorAction SilentlyContinue
+    if ($requester) {{ $requester.WaitForExit(10000) | Out-Null }}
+    if (-not (Get-Process -Name 'Caster' -ErrorAction SilentlyContinue)) {{
+        $previous = Join-Path $appDir 'Caster.exe'
+        try {{
+            Start-Process -FilePath $previous -WorkingDirectory $appDir
+            Add-Content -LiteralPath $log -Value 'Previous Caster reopened.'
         }} catch {{ Add-Content -LiteralPath $log -Value ($_ | Out-String) }}
     }}
     exit 1

@@ -433,12 +433,26 @@ class FileServer:
     stays bit-exact and seeking works. Nothing runs when stopped.
     """
 
+    #: The Windows registry's answers for these are not types a receiver
+    #: accepts: measured here, .ts and .m2ts are video/vnd.dlna.mpeg-tts,
+    #: .m3u8 is audio/x-mpegurl, .m4a is audio/m4a and .aac is
+    #: audio/vnd.dlna.adts. The same trap HlsFileHandler._TYPES handles.
+    _TYPES = {
+        ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".mts": "video/mp2t",
+        ".m3u8": "application/vnd.apple.mpegurl",
+        ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+        ".avi": "video/x-msvideo",
+    }
+
     def __init__(self, path: str) -> None:
         self.path = os.path.abspath(path)
         if not os.path.isfile(self.path):
             raise FileNotFoundError(self.path)
         import mimetypes
-        self.mime = mimetypes.guess_type(self.path)[0] or "application/octet-stream"
+        ext = os.path.splitext(self.path)[1].lower()
+        self.mime = (self._TYPES.get(ext)
+                     or mimetypes.guess_type(self.path)[0]
+                     or "application/octet-stream")
         self._name = os.path.basename(self.path)
         self.httpd = None
         self.port = 0

@@ -379,36 +379,169 @@ def test_airplay_runner_only_kills_its_own_ffmpeg_process(frame):
     assert frame._air_ffmpeg_procs == {"Second (AirPlay)": second}
 
 
-@pytest.mark.parametrize(("url", "has_http_options"), [
-    ("C:/media/movie.mkv", False),
-    ("https://example.invalid/live.ts", True),
-])
-def test_raop_ffmpeg_uses_http_options_only_for_http_sources(
-        frame, monkeypatch, url, has_http_options):
-    """A local video must not be rejected before RAOP can receive its audio."""
-    commands = []
-    stream = object()
-    proc = types.SimpleNamespace(stdout=stream)
+def _wav_bytes(seconds=1.0, rate=44100, list_chunk=True):
+    """PCM WAV. With list_chunk, shaped like ffmpeg's: a LIST/INFO chunk
+    ahead of the data, which is what the RAOP pipe actually carries."""
+    import struct
+    pcm = struct.pack("<hh", 1000, -1000) * int(seconds * rate)
+    fmt = b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, rate, rate * 4, 4, 16)
+    extra = b""
+    if list_chunk:
+        info = b"INFOISFT" + struct.pack("<I", 14) + b"Lavf62.3.100\x00\x00"
+        extra = b"LIST" + struct.pack("<I", len(info)) + info
+    body = b"WAVE" + fmt + extra + b"data" + struct.pack("<I", len(pcm)) + pcm
+    return b"RIFF" + struct.pack("<I", len(body)) + body
 
-    async def spawn(*cmd, **_kwargs):
+
+class _ForwardOnly(io.BufferedIOBase):
+    """A pipe: bytes in order, no seeking."""
+
+    def __init__(self, data):
+        super().__init__()
+        self._data = io.BytesIO(data)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def read(self, size=-1):
+        return self._data.read(size if size is not None else -1)
+
+
+def test_pyatv_decodes_a_pipe_only_through_the_seekable_reader():
+    """pyatv 0.17 + miniaudio 1.61 cannot play a forward-only WAV stream.
+
+    Measured offline: ffmpeg's WAV shape (LIST chunk before data) raises
+    DecodeError -17, and a plain header opens but decodes zero bytes. That
+    broke AirPlay for video files, IPTV, audio URLs, YouTube and system
+    audio. The same bytes decode through SeekablePipeReader.
+    """
+    from pyatv.protocols.raop.audio_source import BufferedIOBaseSource
+    data = _wav_bytes()
+
+    async def frames(source):
+        opened = await asyncio.wait_for(
+            BufferedIOBaseSource.open(source, 44100, 2, 2), 10)
+        got = b""
+        for _ in range(50):
+            chunk = await opened.readframes(352)
+            if not chunk:
+                break
+            got += chunk
+        await opened.close()
+        return got
+
+    with pytest.raises(Exception):
+        asyncio.run(frames(_ForwardOnly(data)))
+    assert asyncio.run(frames(_ForwardOnly(_wav_bytes(list_chunk=False)))) == b""
+    plain = _ForwardOnly(data)
+    reader = caster.SeekablePipeReader(plain.read)
+    reader.prefill()
+    assert len(asyncio.run(frames(reader))) > 20000
+
+
+def test_a_pipe_wav_decodes_in_full_through_pyatv():
+    """ffmpeg writes a pipe WAV's sizes as 0xFFFFFFFF.
+
+    pyatv's metadata parse then walked the whole stream by seeking on sample
+    values; the reader trimmed behind it, and 25 s of audio played as 16 s
+    on R&B Room. Every byte must come out of the decoder.
+    """
+    import struct
+    from pyatv.protocols.raop.audio_source import BufferedIOBaseSource
+    data = bytearray(_wav_bytes(seconds=10))
+    data[4:8] = struct.pack("<I", 0xFFFFFFFF)
+    marker = data.find(b"data")
+    data[marker + 4:marker + 8] = struct.pack("<I", 0xFFFFFFFF)
+    pcm = len(data) - marker - 8
+    reader = caster.SeekablePipeReader(_ForwardOnly(bytes(data)).read)
+    reader.HEAD, reader.BEHIND = 64 << 10, 256 << 10   # force trimming
+
+    async def decode():
+        await asyncio.get_running_loop().run_in_executor(None, reader.prefill)
+        source = await BufferedIOBaseSource.open(reader, 44100, 2, 2)
+        total, idle = 0, 0
+        while idle < 100:
+            chunk = await source.readframes(352)
+            if chunk:
+                total, idle = total + len(chunk), 0
+            else:
+                idle += 1
+                await asyncio.sleep(0.01)
+        await source.close()
+        return total
+
+    assert asyncio.run(decode()) >= pcm * 0.98
+
+
+def test_a_far_seek_does_not_pull_the_stream():
+    pulled = []
+
+    def source(n):
+        pulled.append(n)
+        return bytes(n)
+    reader = caster.SeekablePipeReader(source)
+    reader.prefill()
+    before = len(pulled)
+    reader.seek(0xFFFFFFFF, io.SEEK_CUR)
+    assert reader.read(8) == b""
+    assert len(pulled) == before
+    assert reader.seek(0) == 0 and reader.read(4) == bytes(4)
+
+
+def test_seekable_pipe_reader_keeps_the_head_and_a_window():
+    data = bytes(range(256)) * 20000             # 5 MB
+    plain = _ForwardOnly(data)
+    reader = caster.SeekablePipeReader(plain.read)
+    reader.HEAD, reader.BEHIND = 1000, 5000
+    assert reader.read(10) == data[:10]
+    assert reader.seek(0, io.SEEK_END) == reader.tell()   # never pulls a live end
+    reader.seek(100_000)                 # far past what arrived: parked
+    assert reader.read(8) == b""
+    reader.seek(10)
+    while reader.tell() < 2_000_000:
+        assert reader.read(65536)
+    assert reader.seek(0) == 0 and reader.read(500) == data[:500]
+    reader.seek(900)
+    assert reader.read(100) == data[900:1000]
+
+
+@pytest.mark.parametrize(("url", "live", "timeout", "unseekable"), [
+    ("C:/media/movie.mkv", False, False, False),
+    ("https://example.invalid/live.ts", True, True, True),
+    # A finite .mov with its index at the end cannot open without seeking.
+    ("http://192.0.2.1:9000/clip.mov", False, True, False),
+])
+def test_raop_ffmpeg_uses_http_options_only_where_they_belong(
+        frame, monkeypatch, url, live, timeout, unseekable):
+    """A local video must not be rejected before RAOP can receive its audio,
+    and -seekable 0 is for live streams only."""
+    commands = []
+    stdout = io.BufferedReader(io.BytesIO(b"RIFF" + bytes(60)))
+    proc = types.SimpleNamespace(stdout=stdout)
+
+    def spawn(cmd, **_kwargs):
         commands.append(cmd)
         return proc
 
     frame._air_kind = "video"
+    frame._air_is_live = live
     frame._pending_seek = None
     frame._air_ffmpeg_procs = {}
     frame._ui = lambda *args, **kwargs: None
     frame.set_status = lambda *args, **kwargs: None
-    frame.loop_thread = types.SimpleNamespace(loop=None)
     monkeypatch.setattr(caster, "_find_ffmpeg", lambda: "ffmpeg")
-    monkeypatch.setattr(caster, "SyncStreamReader",
-                        lambda stdout, _loop: stdout)
-    monkeypatch.setattr(caster.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(caster.subprocess, "Popen", spawn)
 
-    assert asyncio.run(frame._raop_source(url, None, "Room (AirPlay)")) is stream
+    reader = asyncio.run(frame._raop_source(url, None, "Room (AirPlay)"))
+    assert isinstance(reader, caster.SeekablePipeReader)
+    assert frame._air_ffmpeg_procs == {"Room (AirPlay)": proc}
     cmd = commands[0]
-    assert ("-seekable" in cmd) is has_http_options
-    assert ("-rw_timeout" in cmd) is has_http_options
+    assert ("-seekable" in cmd) is unseekable
+    assert ("-rw_timeout" in cmd) is timeout
+    assert cmd[cmd.index("-ac") + 1] == "2"     # RAOP negotiates stereo
 
 
 def test_prime_promotes_after_the_first_long_copy_segment(tmp_path):
@@ -1161,6 +1294,28 @@ def test_ensure_receiver_launches_a_cold_receiver_once_and_waits(frame):
     MainFrame._ensure_receiver(frame, cast)
     assert cast.launches == [(MainFrame.CAST_APP_ID, True)]
     assert cast.app_id == MainFrame.CAST_APP_ID
+
+
+def test_ensure_receiver_waits_for_an_unknown_app_instead_of_relaunching(frame):
+    """app_id is None right after connect, before the first status arrives.
+
+    Treating that as "another app" force-launched a receiver already up.
+    """
+    class LateStatus(FakeCast):
+        reads = 0
+
+        @property
+        def app_id(self):
+            self.reads += 1
+            return MainFrame.CAST_APP_ID if self.reads > 3 else None
+
+        @app_id.setter
+        def app_id(self, value):
+            pass
+
+    cast = LateStatus(None)
+    MainFrame._ensure_receiver(frame, cast)
+    assert cast.launches == []
 
 
 def test_ensure_receiver_swallows_a_dead_connection(frame):
@@ -1973,6 +2128,30 @@ def _relay_with_playlist(tmp_path, durations, live=True):
     return relay
 
 
+def test_a_finished_file_keeps_its_endlist(tmp_path):
+    """Without ENDLIST the receiver waits forever at the last segment."""
+    relay = _relay_with_playlist(tmp_path, [2.0, 2.0, 2.0], live=False)
+    playlist = tmp_path / "live.m3u8"
+    playlist.write_text(playlist.read_text() + "#EXT-X-ENDLIST\n")
+    assert relay.trailing_playlist().rstrip().endswith(b"#EXT-X-ENDLIST")
+
+
+def test_a_finished_file_is_not_restarted(tmp_path, monkeypatch):
+    """A local .m2ts replayed from the start every two seconds on a real TV."""
+    relay = _relay_with_playlist(tmp_path, [2.0, 2.0], live=False)
+    relay.httpd = object()
+    relay.proc = types.SimpleNamespace(poll=lambda: 0, returncode=0)
+    spawned = []
+
+    def spawn():
+        spawned.append(True)
+        relay.httpd = None          # end the loop if the bug comes back
+    monkeypatch.setattr(relay, "_spawn_ffmpeg", spawn)
+    monkeypatch.setattr(caster.time, "sleep", lambda seconds: None)
+    relay._supervise()
+    assert spawned == []
+
+
 def test_a_gop_that_stretches_after_priming_is_promoted(tmp_path, monkeypatch):
     """Priming sees the first few seconds; the source is not bound by them.
 
@@ -2038,3 +2217,281 @@ def test_a_finite_asset_is_never_promoted(tmp_path, monkeypatch):
 
     assert not relay.force_keyframes
     assert spawned == []
+
+
+class _SyncThread:
+    """threading.Thread that runs its target inside start()."""
+
+    def __init__(self, target=None, args=(), kwargs=None, **_):
+        self._target, self._args, self._kwargs = target, args, kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        pass
+
+
+def test_status_timer_never_speaks_the_playback_clock(frame):
+    """The position changes every tick, so the repeat filter never caught it.
+
+    NVDA read "PLAYING — 12/300s." aloud every 1.5 seconds of a Cast file.
+    """
+    spoken = []
+    frame.set_status = lambda text, speak=True: spoken.append(speak)
+    frame.pos_slider = types.SimpleNamespace(
+        SetRange=lambda *a: None, SetValue=lambda *a: None, Max=300)
+    status = types.SimpleNamespace(player_state="PLAYING", duration=300,
+                                   current_time=12)
+    frame.cast = types.SimpleNamespace(
+        media_controller=types.SimpleNamespace(status=status))
+    frame._on_status_timer(None)
+    status.duration = 0
+    frame._on_status_timer(None)
+    assert spoken == [False, False]
+
+
+def test_status_timer_never_speaks_the_airplay_clock(frame):
+    spoken = []
+    frame.set_status = lambda text, speak=True: spoken.append(speak)
+    frame.pos_slider = types.SimpleNamespace(
+        SetRange=lambda *a: None, SetValue=lambda *a: None, Max=60)
+    frame.atv = object()
+    frame._air_state, frame._air_kind, frame._air_is_live = "playing", "video", False
+    frame._air_pos, frame._air_play_t0, frame._air_duration = 5.0, None, 60.0
+    frame._on_status_timer(None)
+    assert spoken == [False]
+
+
+def test_quitting_from_the_tray_keeps_the_close_to_tray_setting(frame,
+                                                               monkeypatch):
+    """Quit must exit without switching the user's preference off for good."""
+    closes = []
+    frame.settings = {"minimise_to_tray": True}
+    frame.Close = lambda force=False: closes.append(force)
+    monkeypatch.setattr(caster.wx, "CallAfter",
+                        lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    frame._quit_from_tray()
+    assert closes == [True]
+    assert frame.settings["minimise_to_tray"] is True
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("http://example.invalid/live/index.m3u8?token=1",
+     "application/vnd.apple.mpegurl"),
+    ("http://example.invalid/song.mp3", "audio/mpeg"),
+    ("http://example.invalid/movie.mp4", "video/mp4"),
+    ("http://example.invalid/stream", "video/mp4"),
+])
+def test_roku_is_told_what_a_plain_url_is(url, expected):
+    assert caster.roku_mime(url) == expected
+
+
+def test_a_url_cast_to_sonos_is_not_labelled_wav(frame, monkeypatch):
+    sent = []
+    monkeypatch.setattr(caster, "sonos_play",
+                        lambda ip, url, title, mime: sent.append(mime))
+    monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
+    frame._ui = lambda *args, **kwargs: None
+    frame.set_status = lambda *args, **kwargs: None
+    frame._play_sonos(Device("sonos", "Kitchen", {"ip": "192.0.2.10"}),
+                      "http://example.invalid/song.mp3")
+    assert sent == ["audio/mpeg"]
+
+
+def test_volume_reaches_every_cast_receiver_in_a_room_group(frame,
+                                                           monkeypatch):
+    """self.cast holds only the last receiver to connect."""
+    levels = {}
+
+    def receiver(name):
+        return types.SimpleNamespace(
+            set_volume=lambda value: levels.__setitem__(name, value))
+    frame._casts = {"A (Cast)": receiver("A"), "B (Cast)": receiver("B")}
+    frame.cast = frame._casts["B (Cast)"]
+    frame.settings = types.SimpleNamespace(set=lambda *args, **kwargs: None)
+    monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
+    frame.apply_volume(40)
+    assert levels == {"A": 0.4, "B": 0.4}
+
+
+@pytest.mark.parametrize("kind,key", [
+    ("chromecast", {"host": "192.0.2.73"}),
+    ("upnp", {"control_url": "http://192.0.2.101:9197/ctl"}),
+    ("airplay", None),
+])
+def test_cast_file_tells_every_path_the_file_is_not_live(frame, monkeypatch,
+                                                         kind, key):
+    """Over HTTP every MPEG-TS probes as live; a local file never is."""
+    dev = Device(kind, "Receiver", key)
+    seen = []
+    server = types.SimpleNamespace(
+        start=lambda: "http://192.0.2.1:9000/clip.m2ts", mime="video/mp2t")
+    monkeypatch.setattr(caster, "FileServer", lambda path: server)
+    frame.selected_device = lambda: dev
+    frame.stop_silent = lambda: None
+    frame.set_status = lambda *args, **kwargs: None
+    record = lambda dev, url, *args, **kwargs: seen.append(kwargs.get("is_live"))
+    frame._play_chromecast = frame._play_upnp = frame._play_airplay = record
+    frame.cast_file("C:/media/clip.m2ts")
+    assert seen == [False]
+
+
+def test_file_server_uses_types_a_receiver_accepts(tmp_path):
+    for name, expected in (("clip.ts", "video/mp2t"), ("clip.m2ts", "video/mp2t"),
+                           ("song.m4a", "audio/mp4"), ("song.flac", "audio/flac")):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        assert caster.FileServer(str(path)).mime == expected
+
+
+def test_cast_file_makes_the_receiver_a_volume_target(frame, monkeypatch):
+    """Without a target the volume slider reached nothing for a file cast."""
+    dev = Device("sonos", "Kitchen", {"ip": "192.0.2.10"})
+    server = types.SimpleNamespace(
+        start=lambda: "http://192.0.2.1:9000/song.mp3", mime="audio/mpeg")
+    monkeypatch.setattr(caster, "FileServer", lambda path: server)
+    frame.selected_device = lambda: dev
+    frame.stop_silent = lambda: None
+    frame.set_status = lambda *args, **kwargs: None
+    frame._play_sonos = lambda *args: None
+    frame.cast_file("C:/media/song.mp3")
+    assert frame._targets == [dev]
+
+
+@pytest.fixture
+def cast_worker(frame, monkeypatch):
+    """_play_chromecast run synchronously against a fake receiver."""
+    loads, messages, stopped = [], [], []
+    mc = types.SimpleNamespace(
+        status=None, play_media=lambda *args, **kwargs: loads.append(args))
+    receiver = types.SimpleNamespace(
+        wait=lambda *args: None, app_id=MainFrame.CAST_APP_ID,
+        media_controller=mc, status=None,
+        disconnect=lambda **kwargs: None)
+    monkeypatch.setattr(caster.pychromecast, "Chromecast",
+                        lambda *args, **kwargs: receiver)
+    monkeypatch.setattr(caster, "probe_media",
+                        lambda url: {"mime": "video/mp2t", "is_live": True})
+    monkeypatch.setattr(caster, "_native_hls_url", lambda url: None)
+    monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
+    frame._cast_zeroconf = lambda: None
+    frame._keep_relay = lambda relay: None
+    frame._stop_relay = lambda relay=None: stopped.append(relay)
+    frame._ui = lambda fn, *args, **kwargs: messages.append(args)
+    frame.set_status = lambda *args, **kwargs: None
+    dev = Device("chromecast", "RB Room",
+                 {"host": "192.0.2.73", "port": 8009,
+                  "uuid": "0123456789abcdef0123456789abcdef"})
+    return types.SimpleNamespace(dev=dev, loads=loads, messages=messages,
+                                 stopped=stopped)
+
+
+def test_a_file_the_receiver_refuses_is_converted_through_the_relay(
+        frame, cast_worker, monkeypatch):
+    """RB Room refused an MPEG-4 AVI outright; the relay can re-encode it."""
+    monkeypatch.setattr(caster, "probe_media",
+                        lambda url: {"mime": "video/x-msvideo", "is_live": False})
+    verdicts = iter([False, False, True])
+    frame._await_playing = lambda mc, before=None: next(verdicts)
+    built = []
+
+    def make_relay(url, **kwargs):
+        built.append(kwargs)
+        return types.SimpleNamespace(start=lambda: "http://192.0.2.1:9/live.m3u8")
+    frame._make_relay = make_relay
+    frame._play_chromecast(cast_worker.dev, "http://192.0.2.1:9000/clip.avi")
+    assert built == [{"live": False}]
+    assert cast_worker.loads[-1][:2] == ("http://192.0.2.1:9/live.m3u8",
+                                        "application/vnd.apple.mpegurl")
+
+
+@pytest.mark.parametrize("codecs,video,audio", [
+    (["h264", "aac"], None, None),                 # untouched: -c copy
+    (["h264", "opus"], "copy", "aac"),
+    (["wmv2", "wmav2"], "enc", "aac"),
+    (["mpeg4", "mp3"], "enc", "copy"),
+])
+def test_relay_converts_what_a_ts_or_receiver_cannot_carry(
+        tmp_path, monkeypatch, codecs, video, audio):
+    monkeypatch.setattr(caster, "_find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(caster, "pick_h264_encoder", lambda: "enc")
+    relay = HlsRelay("http://192.0.2.1:9000/clip", codecs=codecs, live=False)
+    relay.root = str(tmp_path)
+    cmd = relay._ffmpeg_cmd(str(tmp_path / "live.m3u8"))
+    if video is None:
+        assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "copy"
+        return
+    assert cmd[cmd.index("-c:v") + 1] == video
+    assert cmd[cmd.index("-c:a") + 1] == audio
+
+
+def test_stop_during_the_relay_prime_loads_nothing(frame, cast_worker):
+    """Stop pressed while the relay primes must not load its dead URL.
+
+    The worker carried on, put the torn-down relay's address on the TV and
+    announced a failure after "Stopped."
+    """
+    def start():
+        frame._stop_flag = True          # what stop_silent does meanwhile
+        frame._casts.clear()
+        return "http://192.0.2.1:9/live.m3u8"
+    relay = types.SimpleNamespace(start=start, hls_time=2, prime_segments=3,
+                                  trail_keep=8, video_transcoded=False)
+    frame._make_relay = lambda url, **kwargs: relay
+    frame._play_chromecast(cast_worker.dev, "http://example.invalid/1.ts")
+    assert cast_worker.loads == []
+    assert cast_worker.stopped == [relay]
+    assert not any("error" in str(m).lower() or "failed" in str(m).lower()
+                   for m in cast_worker.messages)
+
+
+def test_reconnecting_a_receiver_closes_the_connection_it_replaces(
+        frame, cast_worker, monkeypatch):
+    """The watchdog re-dispatch overwrote _casts[label] and leaked the old."""
+    closed = []
+    old = types.SimpleNamespace(
+        disconnect=lambda **kwargs: closed.append(kwargs))
+    frame._casts[cast_worker.dev.label] = old
+
+    def stop_now(url):
+        frame._stop_flag = True
+        return {"mime": "video/mp4", "is_live": False}
+    monkeypatch.setattr(caster, "probe_media", stop_now)
+    frame._play_chromecast(cast_worker.dev, "http://example.invalid/a.mp4")
+    assert closed == [{"timeout": 0}], "the replaced connection was never closed"
+
+
+class _Pychromecast14Cast:
+    """Only the methods pychromecast 14 really has.
+
+    Chromecast.stop_app() and disconnect(blocking=...) do not exist there,
+    and calling them inside a bare except silently did nothing on Stop.
+    """
+
+    def __init__(self, log):
+        self._log = log
+        self.media_controller = types.SimpleNamespace(
+            status=types.SimpleNamespace(media_session_id=7),
+            stop=lambda timeout=10.0: log.append(("stop", timeout)))
+
+    def disconnect(self, timeout=None):
+        self._log.append(("disconnect", timeout))
+
+
+def test_stop_ends_the_media_and_disconnects(frame, monkeypatch):
+    """The media session is stopped but the receiver app is kept.
+
+    Relaunching the app on the next cast measured 9.7 s on a real TV.
+    """
+    monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
+    log = []
+    frame.stream_task = None
+    frame._ffmpeg_proc = None
+    frame._relay_lock = threading.Lock()
+    frame._relays = []
+    frame._file_server = None
+    frame.current = None
+    frame._casts = {"RB Room (Cast)": _Pychromecast14Cast(log)}
+    frame.stop_silent()
+    assert log == [("stop", 3), ("disconnect", 3)]

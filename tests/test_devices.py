@@ -205,6 +205,33 @@ def test_yxc_features_refresh_asks_again(yxc, no_network):
     assert len(yxc["urls"]) == 2
 
 
+def test_yxc_features_does_not_cache_a_receiver_that_did_not_answer(
+        yxc, no_network):
+    """Guards against one missed reply disabling MusicCast for the session.
+
+    A receiver asleep or busy answers nothing. Caching that empty answer made
+    every yxc_can() False afterwards: no volume, mute, zones or input prep
+    for that unit until Caster was restarted.
+    """
+    yxc["fail"] = True
+    assert yxc_features(HOST) == {}
+    yxc["fail"] = False
+    assert yxc_can(HOST, "volume", "main")
+
+
+def test_kodi_error_reply_is_raised_not_reported_as_playing(monkeypatch,
+                                                            no_network):
+    """JSON-RPC puts its failures inside an HTTP 200 reply."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                       "error": {"code": -32602,
+                                 "message": "Invalid params."}}).encode()
+    monkeypatch.setattr(caster_devices._urlreq, "urlopen",
+                        lambda *args, **kwargs: _Response(body))
+    with pytest.raises(RuntimeError, match="Invalid params"):
+        caster_devices.kodi_play("http://192.0.2.12:8080",
+                                 "http://192.0.2.1:9000/movie.mp4")
+
+
 # ---------------------------------------------------------------------------
 # Per-zone capability gating
 # ---------------------------------------------------------------------------

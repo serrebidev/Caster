@@ -177,6 +177,23 @@ def guess_mime(url: str) -> str:
     return "audio/mpeg"
 
 
+def roku_mime(url: str) -> str:
+    """The media type to tell Roku Media Player for a plain URL.
+
+    Roku has to be told the format up front. Defaulting every URL to MP4 sent
+    HLS playlists and audio links to its video player labelled as MP4.
+    """
+    path = url_path(url).lower()
+    if path.endswith((".m3u8", ".m3u")):
+        return "application/vnd.apple.mpegurl"
+    mt, _ = mimetypes.guess_type(path)
+    if mt in ("audio/x-wav", "audio/wave"):
+        return "audio/wav"
+    if mt and mt.startswith("audio/"):
+        return mt
+    return "video/mp4"
+
+
 # Content-Type prefixes mapped to (mime, is_audio) for extension-less URLs
 # (IPTV portals, provider VOD links, etc.).
 _CT_VIDEO = {"video/mp4", "video/webm", "video/mp2t", "video/mpeg",
@@ -458,6 +475,7 @@ def _find_ffmpeg() -> str:
 
 _ENC_CANDIDATES = ("h264_qsv", "h264_amf", "h264_nvenc", "h264_mf", "libx264")
 _encoder_cache: Optional[str] = None
+_encoder_lock = threading.Lock()
 ENCODER_PROBE_TIMEOUT = 2.5
 ENCODER_PROBE_BUDGET = 8.0
 
@@ -471,6 +489,16 @@ def pick_h264_encoder() -> str:
     global _encoder_cache
     if _encoder_cache:
         return _encoder_cache
+    # A capture warms this while the receiver launches, and the stream's own
+    # connection may ask at the same moment: one probe, not two.
+    with _encoder_lock:
+        if _encoder_cache:
+            return _encoder_cache
+        return _pick_h264_encoder_locked()
+
+
+def _pick_h264_encoder_locked() -> str:
+    global _encoder_cache
     ff = _find_ffmpeg()
     results = {}
     deadline = time.monotonic() + ENCODER_PROBE_BUDGET
@@ -967,6 +995,9 @@ class HlsRelay:
             if self.proc is None:
                 raise RuntimeError("relay stopped while starting")
             if self.proc.poll() is not None:
+                if (not self.live and self.proc.returncode == 0
+                        and self._completed_segments()):
+                    return False    # a short file finished while priming
                 raise RuntimeError(
                     "ffmpeg exited early while starting relay")
             # The supervisor starts AFTER priming. A throttled connection
@@ -1157,6 +1188,12 @@ class HlsRelay:
                 # ffmpeg exited on its own: upstream dropped and reconnect
                 # flags gave up. Restart it unless we are shutting down.
                 if self.httpd is None:
+                    break
+                if not self.live and proc.returncode == 0:
+                    # A finite source simply ended. Restarting it replayed a
+                    # local .m2ts from the start every two seconds, and the
+                    # receiver sat in BUFFERING instead of finishing.
+                    trace("relay.finished", "source ended; playlist closed")
                     break
                 self._restarted += 1
                 trace("relay.restart",
@@ -1414,8 +1451,17 @@ class HlsRelay:
         codecs = self.codecs
         if codecs is None:
             codecs = _probe_codecs(self.url)
-        bad_video = {"hevc", "h265", "av1", "mpeg2video", "mpeg4", "vp9"}
+        bad_video = {"hevc", "h265", "av1", "mpeg2video", "mpeg4", "vp9",
+                     "vp8", "theora", "wmv1", "wmv2", "wmv3", "vc1",
+                     "msmpeg4v2", "msmpeg4v3", "mjpeg"}
         self.video_transcoded = any(c in bad_video for c in codecs)
+        # Audio the receiver will not decode from a TS, or that MPEG-TS cannot
+        # carry at all. Copied, it fails the whole relay; a local file's
+        # sound can be anything a container allows.
+        bad_audio = {"opus", "vorbis", "flac", "alac", "wmav1", "wmav2",
+                     "wmapro", "pcm_s16le", "pcm_s24le", "dts", "truehd"}
+        audio = (["-c:a", "aac", "-b:a", "192k"]
+                 if any(c in bad_audio for c in codecs) else ["-c:a", "copy"])
         # Re-encoding buys the right to place keyframes. Whether we are here
         # because the codec is unplayable or because the source's keyframes
         # are too sparse to cut on, put one at every segment boundary: it
@@ -1423,9 +1469,11 @@ class HlsRelay:
         # HLS muxer left waiting for the encoder's own GOP writes nothing.
         transcode = self.video_transcoded or self.force_keyframes
         if transcode:
-            cmd += ["-c:v", pick_h264_encoder(), "-c:a", "copy",
+            cmd += ["-c:v", pick_h264_encoder(), *audio,
                     "-force_key_frames",
                     f"expr:gte(t,n_forced*{self.hls_time})"]
+        elif audio[1] != "copy":
+            cmd += ["-c:v", "copy", *audio]
         else:
             cmd += ["-c", "copy"]   # remux only: bit-exact, no quality loss
         # Put the H.264 parameter sets in front of every keyframe. An HLS
@@ -1686,6 +1734,11 @@ class HlsRelay:
                 out.append("#EXT-X-DISCONTINUITY")
             out.extend(line for line in lines[block_start(uri_idx):uri_idx + 1]
                        if line != "#EXT-X-DISCONTINUITY")
+        # ffmpeg closes a finished source with ENDLIST after the last URI,
+        # outside every block copied above. Dropped, a receiver never learns
+        # the file ended and waits at the edge for a segment that never comes.
+        if "#EXT-X-ENDLIST" in lines[segs[-1]:]:
+            out.append("#EXT-X-ENDLIST")
         return ("\n".join(out) + "\n").encode("utf-8")
 
     @staticmethod
@@ -1728,52 +1781,122 @@ class HlsRelay:
         self.play_url = None
 
 
-class SyncStreamReader(io.BufferedIOBase):
-    """Adapts an asyncio StreamReader into a blocking io.BufferedIOBase so
-    pyatv's miniaudio wrapper (which runs in an executor thread) can read
-    from the ffmpeg pipe.
+class SeekablePipeReader(io.BufferedIOBase):
+    """A forward-only byte stream that pyatv can open.
+
+    pyatv 0.17 with miniaudio 1.61 cannot decode a stream it cannot seek.
+    Measured offline, the same WAV bytes decode from a BytesIO in 0.03 s and
+    fail with DecodeError -17 (MA_AT_END) from a non-seekable reader or an
+    asyncio.StreamReader. That was every AirPlay path except a local file:
+    the ffmpeg pipe for video and IPTV, audio URLs, YouTube and system audio.
+
+    So the start of the stream, which the decoder and pyatv's metadata parse
+    both rewind to, is kept for good, along with a window behind the read
+    position. A seek past what has arrived stops at what has arrived: pulling
+    a live source forward to answer a probe for its end would never return.
+
+    The source is read directly, never through the event loop. The old reader
+    bounced each read through run_coroutine_threadsafe, and pyatv parses
+    metadata ON the loop thread, so that read waited on itself for its whole
+    30 s timeout and the receiver never switched input.
     """
 
-    def __init__(self, reader: asyncio.StreamReader, loop: asyncio.AbstractEventLoop,
-                 chunk: int = 65536) -> None:
+    HEAD = 256 << 10        # kept for the life of the stream
+    BEHIND = 1 << 20        # kept behind the read position
+    CHUNK = 64 << 10
+
+    def __init__(self, read, close=None) -> None:
         super().__init__()
-        self._reader = reader
-        self._loop = loop
-        self._chunk = chunk
+        self._source_read = read      # blocking (n) -> bytes, b"" at the end
+        self._source_close = close
+        self._head = bytearray()
+        self._buf = bytearray()
+        self._base = 0                # absolute offset of _buf[0]
+        self._pos = 0
         self._eof = False
 
     def readable(self) -> bool:
         return True
 
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def _available(self) -> int:
+        return self._base + len(self._buf)
+
+    def _fill(self, upto: int) -> None:
+        while not self._eof and self._available() < upto:
+            chunk = self._source_read(self.CHUNK)
+            if not chunk:
+                self._eof = True
+                break
+            if len(self._head) < self.HEAD:
+                self._head += chunk[:self.HEAD - len(self._head)]
+            self._buf += chunk
+
+    def prefill(self, size: int = CHUNK) -> None:
+        """Pull the start of the stream in now, off the event loop."""
+        self._fill(size)
+
     def read(self, size: int = -1) -> bytes:
-        if self._eof:
-            return b""
-        want = self._chunk if size in (-1, None) else max(size, 1)
-        fut = asyncio.run_coroutine_threadsafe(
-            self._reader.read(want), self._loop)
-        try:
-            data = fut.result(timeout=30)
-        except concurrent.futures.TimeoutError:
-            fut.cancel()
-            data = b""
-        if not data:
-            self._eof = True
+        if size is None or size < 0:
+            size = self.CHUNK
+        if self._pos > self._available() + self.BEHIND:
+            return b""                # parked by a far seek; see seek()
+        if self._pos < self._base:
+            if self._pos < len(self._head):
+                end = min(len(self._head), self._pos + size)
+                data = bytes(self._head[self._pos:end])
+                self._pos = end
+                return data
+            self._pos = self._base    # that span is gone; resume at what is kept
+        self._fill(self._pos + size)
+        start = self._pos - self._base
+        data = bytes(self._buf[start:start + size])
+        self._pos += len(data)
+        drop = self._pos - self._base - self.BEHIND
+        if drop > 0:
+            del self._buf[:drop]
+            self._base += drop
         return data
 
-    def seekable(self) -> bool:
-        return False
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            target = self._pos + offset
+        elif whence == io.SEEK_END:
+            target = self._available()
+        else:
+            target = offset
+        if target - self._available() > self.BEHIND:
+            # Far past anything that has arrived. ffmpeg writes a pipe WAV's
+            # sizes as 0xFFFFFFFF, so pyatv's metadata parse skips the data
+            # chunk by that, then reads samples as chunk sizes and seeks by
+            # them. Clamping each seek and reading on walked the whole stream
+            # -- forever on a live one, on the event loop -- and the trimmed
+            # window then cost all but 1.31 MB of a 4.4 MB file. Park there
+            # without pulling; a read from here returns nothing, ending the
+            # walk, and the parse seeks back to where it began.
+            self._pos = target
+            return self._pos
+        if 0 < target - self._available() <= self.BEHIND:
+            self._fill(target)        # a short skip ahead, e.g. past a chunk
+        target = max(0, min(target, self._available()))
+        if len(self._head) <= target < self._base:
+            target = self._base
+        self._pos = target
+        return self._pos
 
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> bytes:
-        line = self.readline()
-        if not line:
-            raise StopIteration
-        return line
-
-    def next(self) -> bytes:
-        return self.__next__()
+    def close(self) -> None:
+        closer, self._source_close = self._source_close, None
+        if closer is not None:
+            try:
+                closer()
+            except Exception:
+                pass
+        super().close()
 
 
 class HlsFileHandler(http.server.SimpleHTTPRequestHandler):
@@ -2225,8 +2348,10 @@ class MainFrame(wx.Frame):
             return False
 
     def _quit_from_tray(self) -> None:
-        self.settings.set("minimise_to_tray", False)
-        wx.CallAfter(self.Close)
+        # A forced close cannot be vetoed, so it exits instead of hiding
+        # again. Switching the setting off to get past the veto meant one
+        # Quit permanently disabled closing to the notification area.
+        wx.CallAfter(self.Close, True)
 
     def _show_shortcuts(self) -> None:
         wx.MessageBox(
@@ -2305,7 +2430,9 @@ class MainFrame(wx.Frame):
             return
         self.set_status(f"Installing Caster {version}.")
         # The detached helper waits for this process to release Caster.exe.
-        self.Close()
+        # Forced, so "close to the notification area" cannot veto it: a hidden
+        # window was force-killed by the helper with every cast still running.
+        self.Close(force=True)
 
     def selected_devices(self) -> list:
         """Every ticked device, or just the highlighted one if none is ticked.
@@ -2980,8 +3107,10 @@ class MainFrame(wx.Frame):
                     title: str = APP_TITLE) -> None:
         def worker() -> None:
             try:
+                # A URL cast has no mime; tagging an MP3 or radio stream as
+                # WAV in its DIDL misdescribes it to the speaker.
                 sonos_play(dev.key["ip"], url,
-                           title, mime or "audio/wav")
+                           title, mime or guess_mime(url))
                 self._ui(self.set_status, f"Playing on {dev.name}.")
             except Exception as exc:
                 message = f"Sonos error: {exc}"
@@ -2995,7 +3124,7 @@ class MainFrame(wx.Frame):
                    title: str = APP_TITLE) -> None:
         def worker() -> None:
             try:
-                roku_play(dev.key["base"], url, mime or "video/mp4", title)
+                roku_play(dev.key["base"], url, mime or roku_mime(url), title)
                 self._ui(self.set_status, f"Playing on {dev.name}.")
             except Exception as exc:
                 message = f"Roku error: {exc}"
@@ -3027,7 +3156,8 @@ class MainFrame(wx.Frame):
     # ---- UPnP/DLNA ----
 
     def _play_upnp(self, dev: Device, url: str, mime: str = "",
-                   title: str = APP_TITLE) -> None:
+                   title: str = APP_TITLE,
+                   is_live: Optional[bool] = None) -> None:
         """Serve the URL through the local HLS relay when needed, then push
         it to the renderer via AVTransport.
 
@@ -3042,6 +3172,8 @@ class MainFrame(wx.Frame):
                     self._upnp_push(dev, url, mime, title)
                     return
                 probe = probe_media(url)
+                if is_live is not None:
+                    probe["is_live"] = is_live
                 if probe["mime"] == "video/mp2t":
                     relay = self._make_relay(url,
                                              live=bool(probe["is_live"]))
@@ -3114,9 +3246,21 @@ class MainFrame(wx.Frame):
         receiver is then waited on for as long as it needs and no longer.
         """
         try:
-            if cast.app_id == self.CAST_APP_ID:
+            app_id = cast.app_id
+            if app_id is None:
+                # Connected, but the receiver's status has not arrived yet --
+                # traced right after cast.wait() as app=None. Unknown is not
+                # "something else", and force-launching on it would tear down
+                # a media app that is already up.
+                deadline = time.monotonic() + 1.5
+                while app_id is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    app_id = cast.app_id
+            if app_id == self.CAST_APP_ID:
                 return
-            cast.start_app(self.CAST_APP_ID, force_launch=True)
+            # Still unknown: pychromecast asks for the status itself and
+            # launches only if another app is showing.
+            cast.start_app(self.CAST_APP_ID, force_launch=app_id is not None)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if cast.app_id == self.CAST_APP_ID:
@@ -3246,8 +3390,22 @@ class MainFrame(wx.Frame):
                     except Exception:
                         pass
                     return
+                previous = self._casts.get(dev.label)
                 self.cast = cast
                 self._casts[dev.label] = cast
+                if previous is not None and previous is not cast:
+                    # The watchdog re-dispatches to a receiver that dropped.
+                    # Overwriting its entry without closing it left the old
+                    # socket client thread running, once per reconnect.
+                    try:
+                        previous.disconnect(timeout=0)
+                    except Exception:
+                        pass
+
+                def abandoned() -> bool:
+                    # Stop, or a newer cast to this receiver, replaced this one.
+                    return (self._stop_flag
+                            or self._casts.get(dev.label) is not cast)
 
                 vid = youtube_id(url)
                 if vid:
@@ -3272,6 +3430,10 @@ class MainFrame(wx.Frame):
                         self._ui(self.set_status, "Probing...", speak=False)
                         _t = time.monotonic()
                         probe = probe_media(url)
+                        if is_live is not None:
+                            # The caller knows better than a probe of the URL:
+                            # any MPEG-TS over HTTP reads as a live channel.
+                            probe["is_live"] = is_live
                         trace("cast.probe",
                               f"{time.monotonic()-_t:.2f}s {probe['mime']} "
                               f"live={probe['is_live']}")
@@ -3312,6 +3474,12 @@ class MainFrame(wx.Frame):
                     warm.join(timeout=10)
                     self._ensure_receiver(cast)
                     trace("cast.receiver.ready", f"app={cast.app_id}")
+                    if abandoned():
+                        # Stop came during the probe or the relay prime.
+                        # Loading now puts a dead relay URL on the receiver
+                        # and announces a failure after "Stopped."
+                        self._stop_relay(relay)
+                        return
                     # Whatever session is showing now belongs to the last
                     # thing played; the new one has to be told apart from it.
                     before = getattr(mc.status, "media_session_id", None)
@@ -3329,6 +3497,9 @@ class MainFrame(wx.Frame):
                         relay = self._make_relay(url, live=True)
                         self._keep_relay(relay)
                         play_url = relay.start()
+                        if abandoned():
+                            self._stop_relay(relay)
+                            return
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime, stream_type=stream_type,
                                       **self._cast_load_options(play_url))
@@ -3343,6 +3514,26 @@ class MainFrame(wx.Frame):
                                       **self._cast_load_options(play_url))
                         trace("cast.retry", stream_type)
                         settled = self._await_playing(mc, before)
+                    if (not settled and relay is None and play_url == url
+                            and not probe["is_live"] and not abandoned()):
+                        # The receiver cannot play this container or codec:
+                        # an AVI with MPEG-4 video was refused in 0.6 s. The
+                        # relay re-encodes whatever ffmpeg reads into H.264
+                        # HLS, so the file plays instead of failing.
+                        trace("cast.relay.fallback", load_mime)
+                        self._ui(self.set_status, "Converting for this receiver...",
+                                 speak=False)
+                        relay = self._make_relay(url, live=False)
+                        self._keep_relay(relay)
+                        play_url = relay.start()
+                        if abandoned():
+                            self._stop_relay(relay)
+                            return
+                        load_mime = "application/vnd.apple.mpegurl"
+                        stream_type = "BUFFERED"
+                        before = getattr(mc.status, "media_session_id", None)
+                        mc.play_media(play_url, load_mime, stream_type=stream_type)
+                        settled = self._await_playing(mc, before)
                     if settled:
                         if (probe["is_live"] and not self._stop_flag
                                 and self._casts.get(dev.label) is cast):
@@ -3352,14 +3543,17 @@ class MainFrame(wx.Frame):
                         self._ui(self.set_status,
                                  f"Playing {kind} on {dev.name}.")
                     else:
-                        self._ui(self.set_status,
-                                 f"Load failed ({mc.status.idle_reason}).")
+                        reason = getattr(mc.status, "idle_reason", None)
+                        self._ui(self.set_status, f"Load failed ({reason}).")
                         self._stop_relay(relay)
-                vol = cast.status.volume_level
+                vol = getattr(cast.status, "volume_level", None)
                 self._ui(lambda: (self.vol_slider.SetValue(int(vol * 100)) if vol else None,
                                   self.btn_playpause.SetLabel("Pa&use")))
             except Exception as exc:
-                self._ui(self.set_status, f"Cast error: {exc}")
+                # A relay torn down by Stop raises here; that is not an error
+                # to announce over "Stopped."
+                if not self._stop_flag:
+                    self._ui(self.set_status, f"Cast error: {exc}")
                 # Playback never started; don't leave the relay running.
                 self._stop_relay(relay)
 
@@ -3368,7 +3562,8 @@ class MainFrame(wx.Frame):
 
     # ---- AirPlay ----
 
-    def _play_airplay(self, dev: Device, url: str, source=None) -> None:
+    def _play_airplay(self, dev: Device, url: str, source=None,
+                      is_live: Optional[bool] = None) -> None:
         """Stream `url` to an AirPlay receiver over RAOP.
 
         `source` is a live ScreenSource instead of a URL. RAOP carries audio
@@ -3424,6 +3619,8 @@ class MainFrame(wx.Frame):
 
                 if probe_job is not None:
                     probe = await probe_job
+                    if is_live is not None:
+                        probe["is_live"] = is_live
                     self._air_kind = ("audio" if probe["is_audio"]
                                       else "video")
                     self._air_is_live = (bool(probe["is_live"])
@@ -3433,8 +3630,15 @@ class MainFrame(wx.Frame):
                 # on `wake` while KEEPING the RAOP session alive; resume/seek
                 # sets `wake` and the loop reopens the source (with seek).
                 while not shutdown.is_set():
-                    stream = (source.open_wav_reader() if source is not None
-                              else await self._raop_source(url, vid, dev.label))
+                    if source is not None:
+                        # Seekable for the same reason as the ffmpeg pipe:
+                        # pyatv cannot open the capture's plain reader.
+                        live = source.open_wav_reader()
+                        stream = SeekablePipeReader(live.read, live.close)
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, stream.prefill)
+                    else:
+                        stream = await self._raop_source(url, vid, dev.label)
                     if self._air_play_t0 is None:
                         self._air_play_t0 = time.monotonic()
                     self._air_state = "playing"
@@ -3457,12 +3661,15 @@ class MainFrame(wx.Frame):
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         # Stop the stream task unless it already finished.
+                        stream_error = None
                         if not stream_task.done():
                             stream_task.cancel()
                         try:
                             await stream_task
-                        except (asyncio.CancelledError, Exception):
+                        except asyncio.CancelledError:
                             pass
+                        except Exception as exc:
+                            stream_error = exc
                         if self.stream_task is stream_task:
                             self.stream_task = None
                         stream_task = None
@@ -3488,7 +3695,25 @@ class MainFrame(wx.Frame):
                             # already-heard media in as skip-backs. Reopen
                             # at the live edge on the same RAOP session.
                             trace("air.stream.restart", "live pipe ended")
+                            # A source that fails at once would otherwise
+                            # respawn ffmpeg in a tight loop.
+                            await asyncio.sleep(1)
                             continue
+                        pipe = self._air_ffmpeg_procs.get(dev.label)
+                        exit_code = pipe.poll() if pipe is not None else None
+                        if stream_error is None and exit_code not in (None, 0):
+                            stream_error = RuntimeError(
+                                "ffmpeg could not read the source "
+                                f"(exit code {exit_code})")
+                        if stream_error is not None:
+                            # A source pyatv or ffmpeg could not open ends at
+                            # once. Announcing that as "Finished." hid every
+                            # AirPlay failure measured on R&B Room.
+                            trace("air.stream.error",
+                                  type(stream_error).__name__)
+                            self._ui(self.set_status,
+                                     f"AirPlay error: {stream_error}")
+                            break
                         # Stream ended naturally.
                         self._ui(lambda: self.set_status("Finished."))
                         break
@@ -3569,17 +3794,18 @@ class MainFrame(wx.Frame):
                 return info
 
             info = await loop.run_in_executor(None, extract)
-            if info is None:
+            if info is None or not info.get("url"):
                 raise RuntimeError("yt-dlp could not resolve the video")
             # A resolved CDN URL is valid briefly; fetch it fresh at open time
             # and use its real duration for the position slider.
             self._air_duration = float(info.get("duration") or 0.0)
-            return info.get("url")
+            url = info["url"]
 
-        if self._air_kind == "audio":
-            return url
-
-        # Video (IPTV TS channel or provider VOD): ffmpeg audio pipe.
+        # Everything goes through ffmpeg, audio URLs and YouTube included.
+        # Handed a URL, pyatv decodes it with miniaudio, which knows only WAV,
+        # FLAC, MP3 and Vorbis, and on this pyatv/miniaudio pair fails to open
+        # any HTTP source at all (DecodeError -17 on a plain WAV from
+        # FileServer, announced as "Finished." after 3.8 s).
         self._ui(self.set_status, "Extracting audio...")
         trace("air.ffmpeg.spawn")
         ffmpeg = _find_ffmpeg()
@@ -3588,17 +3814,20 @@ class MainFrame(wx.Frame):
         # local path before opening it, so a local movie's audio could never
         # reach an AirPlay speaker while this option was unconditional.
         if url.lower().startswith(("http://", "https://")):
-            cmd += [
-            # A live stream has no byte positions to come back to, and this
-            # source now IGNORES -seekable 0: on a drop it serves its buffer
-            # from an earlier point and ffmpeg splices that in -- the overlap
-            # is heard as the stream jumping back (measured 5.2x media per
-            # wall-second, 2026-09-05). So no reconnect flags at all: a drop
-            # ends the pipe and the RAOP runner's restart loop reopens at
-            # the live edge. Only meaningful for http(s).
-            "-seekable", "0",
-            "-rw_timeout", "5000000",
-            ]
+            if self._air_is_live:
+                # A live stream has no byte positions to come back to, and
+                # this source now IGNORES -seekable 0: on a drop it serves its
+                # buffer from an earlier point and ffmpeg splices that in --
+                # the overlap is heard as the stream jumping back (measured
+                # 5.2x media per wall-second, 2026-09-05). So no reconnect
+                # flags at all: a drop ends the pipe and the RAOP runner's
+                # restart loop reopens at the live edge.
+                #
+                # Live only. A finite MP4 or MOV whose index sits at the end
+                # needs seeking to open at all: with this flag a .mov served
+                # to R&B Room ended as "Finished." after 2.1 s, silent.
+                cmd += ["-seekable", "0"]
+            cmd += ["-rw_timeout", "5000000"]
         # Look at as little of the stream as it takes to find the audio.
         # The defaults inspect five seconds before emitting a byte, and
         # every one of those is silence at the start of a channel.
@@ -3625,17 +3854,17 @@ class MainFrame(wx.Frame):
             # pins the start so the first packet's timestamp, whatever the
             # channel says it is, does not lurch the stream on its way in.
             "-af", "aresample=44100:async=1000:first_pts=0",
+            # RAOP negotiates 44.1 kHz stereo; hand it exactly that.
+            "-ac", "2",
             "-f", "wav", "-c:a", "pcm_s16le",
             "-flush_packets", "1",
             "-",                             # pipe to stdout
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            stdin=asyncio.subprocess.DEVNULL,
-            **_no_window_kwargs(),
-        )
+        # A plain pipe, read directly: see SeekablePipeReader for why the
+        # event loop must not sit between pyatv and this process.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, **_no_window_kwargs())
         if owner is None:
             self._ffmpeg_proc = proc
         else:
@@ -3643,9 +3872,11 @@ class MainFrame(wx.Frame):
         if self._pending_seek:
             self._air_pos = self._pending_seek
             self._pending_seek = None
-        # Wrap the async pipe in a blocking reader for pyatv's miniaudio
-        # wrapper (it decodes the WAV stream itself, header included).
-        return SyncStreamReader(proc.stdout, self.loop_thread.loop)
+        reader = SeekablePipeReader(proc.stdout.read1, proc.stdout.close)
+        # pyatv parses the header on the event loop thread; have it waiting
+        # in memory so that parse never blocks the loop on ffmpeg.
+        await loop.run_in_executor(None, reader.prefill)
+        return reader
 
     async def _resolve_for_raop(self, url: str) -> tuple[Any, str]:
         """Compatibility shim retained for tests; the runner calls
@@ -3786,6 +4017,13 @@ class MainFrame(wx.Frame):
         started: list = []
         self._sources = started
 
+        if any(container != "wav" for container in by_container):
+            # The encoder is chosen by timing real encodes (0.76 s here), and
+            # otherwise only once the receiver connects -- after its app has
+            # launched. Choosing it now overlaps that launch instead.
+            threading.Thread(target=pick_h264_encoder, daemon=True,
+                             name="caster-encoder-warm").start()
+
         def worker() -> None:
             # Same reason as play(): this talks to the receiver over HTTP, so
             # it belongs on the worker and not on the UI thread.
@@ -3857,6 +4095,11 @@ class MainFrame(wx.Frame):
             self.set_status("Pick a device first.")
             return
         self.stop_silent()
+        if dev.kind == "musiccast":
+            # MusicCast zones are control-only followers, not transports.
+            self.set_status(
+                "Select a playback device; a MusicCast zone follows it.")
+            return
         self.current = dev
         try:
             server = FileServer(path)
@@ -3865,26 +4108,45 @@ class MainFrame(wx.Frame):
             self.set_status(f"File error: {exc}")
             return
         self._file_server = server
+        # Without a target, volume changes reached nothing but a Cast or
+        # AirPlay session, and MusicCast input/volume handling never ran.
+        self._targets = [dev]
         self._stop_flag = False
         self._cast_started = time.monotonic()
         name = os.path.basename(path)
         self.set_status(f"Serving {name}...")
-        if dev.kind == "chromecast":
-            self._play_chromecast(dev, url)
-        elif dev.kind == "upnp":
-            self._play_upnp(dev, url)
-        elif dev.kind == "sonos":
-            self._play_sonos(dev, url, server.mime, name)
-        elif dev.kind == "roku":
-            self._play_roku(dev, url, server.mime, name)
-        elif dev.kind == "kodi":
-            self._play_kodi(dev, url)
-        elif dev.kind == "airplay":
-            self._play_airplay(dev, url)
+
+        # A local file is finite, and saying so matters: probed over HTTP any
+        # MPEG-TS reads as a live channel, and the live reader then fetched a
+        # 2.8 MB .m2ts, reconnected every 0.2 s, discarded each full copy as
+        # a replay, and the Cast never started.
+        def route() -> None:
+            if self._stop_flag:
+                return
+            if dev.kind == "chromecast":
+                self._play_chromecast(dev, url, is_live=False)
+            elif dev.kind == "upnp":
+                self._play_upnp(dev, url, is_live=False)
+            elif dev.kind == "sonos":
+                self._play_sonos(dev, url, server.mime, name)
+            elif dev.kind == "roku":
+                self._play_roku(dev, url, server.mime, name)
+            elif dev.kind == "kodi":
+                self._play_kodi(dev, url)
+            else:
+                # ffmpeg reads the audio for RAOP on this machine, so it gets
+                # the file itself: seekable, and no HTTP hop to the server.
+                self._play_airplay(dev, path, is_live=False)
+
+        if dev.musiccast:
+            # Wake the receiver and select its network input before the push,
+            # exactly as play() does, and off the UI thread for the same reason.
+            def prepare() -> None:
+                self._musiccast_prepare([dev])
+                self._ui(route)
+            threading.Thread(target=prepare, daemon=True, name="play").start()
         else:
-            # MusicCast zones are control-only followers, not transports.
-            self.set_status(
-                "Select a playback device; a MusicCast zone follows it.")
+            route()
 
     # ---- teardown ----
 
@@ -3938,28 +4200,41 @@ class MainFrame(wx.Frame):
         self._cast_progress = {}
         self._cast_retry_at = {}
         for cast in casts.values():
-            try:
-                cast.stop_app()
-            except Exception:
-                pass
-            try:
-                # Without this the socket client thread outlives the play and
-                # keeps the connection open, once per device cast to.
-                cast.disconnect(blocking=False)
-            except Exception:
-                pass
+            self._release_cast(cast)
         # Also handle self.cast for code that still writes to it directly.
         cast, self.cast = self.cast, None
         if cast and cast not in list(casts.values()):
-            try:
-                cast.stop_app()
-            except Exception:
-                pass
-            try:
-                cast.disconnect(blocking=False)
-            except Exception:
-                pass
+            self._release_cast(cast)
         self._atvs.clear()
+
+    @staticmethod
+    def _release_cast(cast) -> None:
+        """Stop the receiver's media and close the connection, off the UI thread.
+
+        pychromecast 14 has neither Chromecast.stop_app() nor
+        disconnect(blocking=...). Both raised inside a bare except, so Stop
+        never reached the receiver and every connection's socket thread
+        stayed alive, once per device cast to.
+
+        The media session is stopped, not the app. Quitting the Default Media
+        Receiver makes the next cast launch it again, measured at 9.7 s on RB
+        Room -- most of a 15 s start budget spent before a byte is loaded.
+        Both calls wait for the receiver's reply, so they run on a thread.
+        """
+        def release() -> None:
+            try:
+                mc = cast.media_controller
+                status = mc.status
+                if status is not None and status.media_session_id is not None:
+                    mc.stop(timeout=3)
+            except Exception:
+                pass
+            try:
+                cast.disconnect(timeout=3)
+            except Exception:
+                pass
+        threading.Thread(target=release, daemon=True,
+                         name="cast-release").start()
 
     async def _cancel_stream(self, task: asyncio.Task) -> None:
         task.cancel()
@@ -4170,15 +4445,28 @@ class MainFrame(wx.Frame):
         level = max(0, min(100, int(level)))
         if remember:
             self.settings.set("volume", level)
-        try:
-            if self.cast:
-                self.cast.set_volume(level / 100.0)
-            if self.atv:
-                self.loop_thread.submit(_set_atv_volume(self.atv, float(level)))
-        except Exception:
-            pass
+        # Every connected receiver, not only the last one to connect: self.cast
+        # and self.atv hold one each, so a multi-room cast changed one room.
+        casts = list(self._casts.values())
+        if self.cast is not None and self.cast not in casts:
+            casts.append(self.cast)
+        atvs = list(self._atvs.values())
+        if self.atv is not None and self.atv not in atvs:
+            atvs.append(self.atv)
+        for atv in atvs:
+            try:
+                self.loop_thread.submit(_set_atv_volume(atv, float(level)))
+            except Exception:
+                pass
 
         def worker() -> None:
+            for cast in casts:
+                try:
+                    # Blocks until the receiver acknowledges (up to ten
+                    # seconds), so never on the UI thread a slider drives.
+                    cast.set_volume(level / 100.0)
+                except Exception:
+                    pass
             for dev in list(self._targets):
                 try:
                     # MusicCast first: it is the receiver's own volume, on the
@@ -4323,9 +4611,12 @@ class MainFrame(wx.Frame):
                 self.pos_slider.SetValue(min(cur, self.pos_slider.Max))
                 self._updating_slider = False
                 state = "Playing" if self._air_state == "playing" else "Paused"
+                # Never spoken: the position changes every tick, so the
+                # repeat filter in set_status cannot catch it and NVDA would
+                # read the clock aloud every 1.5 seconds.
                 self.set_status(
                     f"{state} — {cur}/{dur}s." if dur
-                    else f"{state} — {cur}s.")
+                    else f"{state} — {cur}s.", speak=False)
             return
         if not self.cast:
             return
@@ -4340,9 +4631,9 @@ class MainFrame(wx.Frame):
                 self.pos_slider.SetRange(0, dur)
                 self.pos_slider.SetValue(cur)
                 self._updating_slider = False
-                self.set_status(f"{state} — {cur}/{dur}s.")
+                self.set_status(f"{state} — {cur}/{dur}s.", speak=False)
             else:
-                self.set_status(f"{state}.")
+                self.set_status(f"{state}.", speak=False)
         except Exception:
             pass
 

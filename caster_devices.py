@@ -407,7 +407,14 @@ def _kodi_rpc(base: str, method: str, params: dict | None = None,
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
     with _urlreq.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+        reply = json.loads(r.read().decode("utf-8", "replace"))
+    # JSON-RPC reports failure inside an HTTP 200. Returned as a result, a
+    # refused Player.Open was announced as "Playing".
+    if isinstance(reply, dict) and reply.get("error"):
+        error = reply["error"]
+        detail = error.get("message") if isinstance(error, dict) else ""
+        raise RuntimeError(f"Kodi refused {method}: {detail or error}")
+    return reply
 
 
 def kodi_play(base: str, url: str, auth: tuple = ("", "")) -> None:
@@ -557,8 +564,12 @@ def yxc_features(host: str, refresh: bool = False) -> dict:
         if not refresh and host in _yxc_features_cache:
             return _yxc_features_cache[host]
     data = yxc_try(host, "system/getFeatures", timeout=8.0)
-    with _yxc_cache_lock:
-        _yxc_features_cache[host] = data
+    # Only a real answer is static. Caching the empty reply of a receiver
+    # that was asleep or busy disabled volume, mute, zones and input prep
+    # for that unit until Caster was restarted.
+    if data:
+        with _yxc_cache_lock:
+            _yxc_features_cache[host] = data
     return data
 
 

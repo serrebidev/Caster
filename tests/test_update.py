@@ -112,6 +112,11 @@ def test_installer_is_hidden_and_noninteractive(tmp_path, monkeypatch):
     text = open(script, encoding="utf-8").read()
     assert "Copy-Item -LiteralPath $file.FullName" in text
     assert "Start-Process -FilePath" in text
+    # The helper is hidden; the relaunched app must not inherit that, or it
+    # opens with no visible window.
+    for line in text.splitlines():
+        if line.startswith("Start-Process") or "Start-Process -FilePath $previous" in line:
+            assert "Hidden" not in line, line
 
 
 def test_update_check_reports_network_failure(monkeypatch):
@@ -155,9 +160,12 @@ def test_real_powershell_installs_nested_payload_with_literal_paths(tmp_path, mo
                 for _ in range(2)]
     content = content.replace("-Name 'Caster'", "-Name '" + process_name + "'")
     content = content.replace(
-        "Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir -WindowStyle Hidden",
+        "Start-Process -FilePath (Join-Path $appDir 'Caster.exe') -WorkingDirectory $appDir",
         "throw 'Simulated restart failure'" if fail_restart else
         "Set-Content -LiteralPath (Join-Path $appDir 'restarted.txt') -Value 'yes'")
+    content = content.replace(
+        "Start-Process -FilePath $previous -WorkingDirectory $appDir",
+        "Set-Content -LiteralPath (Join-Path $appDir 'reopened.txt') -Value 'yes'")
     script.write_text(content, encoding="utf-8")
     try:
         assert all(child.poll() is None for child in children)
@@ -178,6 +186,8 @@ def test_real_powershell_installs_nested_payload_with_literal_paths(tmp_path, mo
         assert not (app / "_internal" / "new" / "data.txt").exists()
         assert (app / "personal.txt").read_text() == "keep me"
         assert archive.exists()
+        # Rolled back and reopened: a failed update must not leave no app.
+        assert (app / "reopened.txt").exists()
         return
     assert result.returncode == 0, (result.stderr, log)
     assert (app / "Caster.exe").read_bytes() == b"placeholder"
