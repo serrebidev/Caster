@@ -9,6 +9,7 @@ play".
 """
 from __future__ import annotations
 
+import ctypes
 import io
 import queue
 import socket
@@ -993,6 +994,100 @@ def test_unsubscribe_stops_delivery_and_wakes_a_blocked_reader():
     tap._publish(b"after")
     with pytest.raises(queue.Empty):
         q.get_nowait()
+
+
+# ---------------------------------------------------------------------------
+# Per-application audio capture (Process Loopback)
+# ---------------------------------------------------------------------------
+
+def test_a_window_cast_captures_the_window_process_not_the_whole_pc():
+    """Guards against Cast Window broadcasting every sound the PC makes.
+
+    A per-process id must route the capture through the process loopback tap;
+    an empty one keeps the whole-endpoint tap. Getting this wrong is exactly
+    the bug being fixed -- the one window's audio, not the desktop's.
+    """
+    windowed = ScreenSource(hwnd=99, container="wav", capture_pid=4242)
+    assert isinstance(windowed.tap, caster_extras.ProcessLoopbackTap)
+    assert windowed.tap.pid == 4242
+    whole_pc = ScreenSource(hwnd=99, container="wav")
+    assert isinstance(whole_pc.tap, AudioTap)
+    assert not isinstance(whole_pc.tap, caster_extras.ProcessLoopbackTap)
+
+
+def test_the_process_tap_is_a_drop_in_for_the_endpoint_tap():
+    """Guards against ScreenSource needing to know which tap it holds.
+
+    Every downstream path reads .rate/.channels and subscribe()/unsubscribe()
+    off the tap. The process tap must present the same 16-bit stereo contract
+    so the WAV header, ffmpeg command and direct-PCM path all stay valid.
+    """
+    from caster_extras import ProcessLoopbackTap
+    tap = ProcessLoopbackTap(1234)
+    assert isinstance(tap, AudioTap)
+    assert tap.rate == 48000 and tap.channels == 2
+    # The inherited fan-out still works without a capture ever starting.
+    q = tap.subscribe()
+    tap._publish(b"pcm")
+    assert q.get_nowait() == b"pcm"
+
+
+def test_window_pid_of_no_window_is_zero():
+    """A missing handle must not be mistaken for a real process to capture."""
+    from caster_extras import window_pid
+    assert window_pid(0) == 0
+
+
+def test_the_activation_guid_serialises_to_sixteen_bytes():
+    """Guards against a malformed IID being handed to the audio activation.
+
+    ActivateAudioInterfaceAsync reads the interface id straight from these
+    bytes; a wrong length or byte order asks for the wrong interface and the
+    per-app capture fails to open at all.
+    """
+    guid = caster_extras._GUID(caster_extras._IID_IAUDIOCLIENT)
+    raw = bytes(guid)
+    assert len(raw) == 16
+    # Data1 is little-endian: 0x1CB9AD4C -> 4C AD B9 1C.
+    assert raw[:4] == bytes((0x4C, 0xAD, 0xB9, 0x1C))
+
+
+def test_the_completion_handler_answers_the_interfaces_it_must():
+    """Guards against the hand-built COM callback the activation depends on.
+
+    ctypes cannot subclass a COM interface, so the completion handler is a
+    vtable assembled by hand. If QueryInterface does not answer IUnknown, the
+    handler IID and IAgileObject, ActivateAudioInterfaceAsync refuses it and
+    per-app capture never starts; if it answers everything, marshalling breaks
+    elsewhere. This exercises the real vtable, the riskiest code in the path.
+    """
+    handler = caster_extras._CompletionHandler()
+    c_void_p, c_long, c_ulong = (ctypes.c_void_p, ctypes.c_long, ctypes.c_ulong)
+    POINTER, byref = ctypes.POINTER, ctypes.byref
+
+    def query(iid_text):
+        iid = caster_extras._GUID(iid_text)
+        out = c_void_p()
+        hr = caster_extras._com_call(
+            handler.ptr, 0, c_long,
+            [POINTER(caster_extras._GUID), POINTER(c_void_p)],
+            [byref(iid), byref(out)])
+        return hr, out.value
+
+    for iid in (caster_extras._IID_IUNKNOWN,
+                caster_extras._IID_ICOMPLETION_HANDLER,
+                caster_extras._IID_IAGILEOBJECT):
+        hr, ptr = query(iid)
+        assert hr == 0 and ptr == handler.ptr.value, iid
+
+    # An interface it does not implement must be refused, not accepted.
+    hr, ptr = query(caster_extras._IID_IAUDIOCLIENT)
+    assert (hr & 0xFFFFFFFF) == 0x80004002        # E_NOINTERFACE
+    assert not ptr
+
+    # AddRef then Release round-trips the count.
+    n = caster_extras._com_call(handler.ptr, 1, c_ulong, [], [])
+    assert caster_extras._com_call(handler.ptr, 2, c_ulong, [], []) == n - 1
 
 
 # ---------------------------------------------------------------------------

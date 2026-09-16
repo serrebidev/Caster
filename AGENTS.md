@@ -177,6 +177,18 @@ wav + `pcm_is_directly_usable()` = no ffmpeg in the path at all. Lowest latency 
 AudioTap = one WASAPI loopback, many subscribers, bounded queue, drop oldest chunk. Never
 let a queue build a backlog — backlog is heard as lag.
 
+Cast Window (Ctrl+W) captures only the selected window's process tree, not the whole
+endpoint: `window_pid(hwnd)` -> `ScreenSource(capture_pid=...)` -> `ProcessLoopbackTap`, a
+drop-in for AudioTap. It drives the Windows Process Loopback API
+(`ActivateAudioInterfaceAsync` on `VAD\Process_Loopback`, needs build 20348+) by hand in
+ctypes — no pyaudiowpatch/PortAudio path exists for it, and the completion handler is a
+vtable built by hand, so keep every trampoline referenced or the callback dangles. Silence
+is synthesised in real time when the app is quiet, exactly as endpoint loopback delivers
+silence, to keep the receiver's clock running. A failure raises `ProcessAudioError`, which
+`_cast_capture` turns into a yes/no fallback to whole-system audio — never silently widen
+the capture. Include the process TREE (mode 0): browsers, Electron and games render audio
+from child processes and are otherwise silent.
+
 `cast_file()` must route each receiver explicitly. Chromecast and UPnP probe
 the FileServer URL; Sonos and Roku need the served MIME and title; Kodi gets
 its own play call; only an AirPlay device uses `_play_airplay`. Do not let all

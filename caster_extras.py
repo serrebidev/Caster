@@ -14,6 +14,7 @@ import functools
 import http.server
 import ipaddress
 import io
+import ctypes
 import os
 import queue
 import re
@@ -534,6 +535,15 @@ class FileServer:
 # Live system-audio tap: one WASAPI loopback capture, many live consumers
 # ---------------------------------------------------------------------------
 
+class ProcessAudioError(RuntimeError):
+    """Per-application audio capture could not be started.
+
+    Raised by ProcessLoopbackTap so the caller can tell a per-app capture
+    failure apart from an ordinary system-audio one and offer to fall back to
+    capturing the whole output instead of silently doing so.
+    """
+
+
 class AudioTap:
     """WASAPI loopback capture of everything this PC is playing.
 
@@ -579,6 +589,11 @@ class AudioTap:
             if not self._ready.wait(10):
                 raise RuntimeError("system audio capture did not start")
             if self._error:
+                # A per-app failure keeps its own type so the caller can offer
+                # a fallback; an ordinary loopback failure is wrapped for a
+                # readable status line.
+                if isinstance(self._error, ProcessAudioError):
+                    raise self._error
                 raise RuntimeError(
                     f"system audio capture failed: {self._error}")
         except BaseException:
@@ -663,6 +678,405 @@ class AudioTap:
                 q.put_nowait(None)
             except queue.Full:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Per-application audio capture (Windows Process Loopback API)
+# ---------------------------------------------------------------------------
+#
+# AudioTap records the whole output endpoint: every sound the PC makes.
+# Casting one app's window should send only that app's sound, which needs the
+# process loopback API added in Windows build 20348 -- ActivateAudioInterfaceAsync
+# on the virtual "VAD\Process_Loopback" device, given a target process id.
+# There is no Python binding and PortAudio/pyaudiowpatch cannot express it, so
+# the WASAPI COM is driven here directly through ctypes.
+#
+# The structures use only cross-platform ctypes types so this module still
+# imports on a non-Windows box; every reference to a Windows-only ctypes
+# facility (windll, WINFUNCTYPE, HRESULT) lives inside a method that only runs
+# on Windows. The layout assumes a 64-bit build, which is what Caster ships.
+
+#: Windows 10/11 build that first exposes process loopback capture.
+_PROCESS_LOOPBACK_MIN_BUILD = 20348
+
+#: The virtual device that ActivateAudioInterfaceAsync opens for a per-process
+#: capture, rather than a real endpoint.
+_VAD_PROCESS_LOOPBACK = "VAD\\Process_Loopback"
+
+_IID_IUNKNOWN = "{00000000-0000-0000-C000-000000000046}"
+_IID_IAUDIOCLIENT = "{1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}"
+_IID_IAUDIOCAPTURECLIENT = "{C8ADBD64-E71E-48A0-A4DE-185C395CD317}"
+_IID_ICOMPLETION_HANDLER = "{41D949AB-9862-444A-80F6-C261334DA5EB}"
+_IID_IAGILEOBJECT = "{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}"
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        if not text:
+            return
+        body = text.strip("{}")
+        p = body.split("-")
+        self.Data1 = int(p[0], 16)
+        self.Data2 = int(p[1], 16)
+        self.Data3 = int(p[2], 16)
+        rest = p[3] + p[4]
+        for i in range(8):
+            self.Data4[i] = int(rest[i * 2:i * 2 + 2], 16)
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [("wFormatTag", ctypes.c_ushort),
+                ("nChannels", ctypes.c_ushort),
+                ("nSamplesPerSec", ctypes.c_uint32),
+                ("nAvgBytesPerSec", ctypes.c_uint32),
+                ("nBlockAlign", ctypes.c_ushort),
+                ("wBitsPerSample", ctypes.c_ushort),
+                ("cbSize", ctypes.c_ushort)]
+
+
+class _PROCESS_LOOPBACK_PARAMS(ctypes.Structure):
+    _fields_ = [("TargetProcessId", ctypes.c_uint32),
+                ("ProcessLoopbackMode", ctypes.c_int)]
+
+
+class _ACTIVATION_UNION(ctypes.Union):
+    _fields_ = [("ProcessLoopbackParams", _PROCESS_LOOPBACK_PARAMS)]
+
+
+class _AUDIOCLIENT_ACTIVATION_PARAMS(ctypes.Structure):
+    _fields_ = [("ActivationType", ctypes.c_int),
+                ("u", _ACTIVATION_UNION)]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    # 64-bit layout: an 8-byte header, then the BLOB {DWORD cbSize; PVOID p},
+    # whose pointer is 8-byte aligned, leaving four bytes of padding after
+    # cbSize.
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("cbSize", ctypes.c_uint32), ("_pad", ctypes.c_uint32),
+                ("pBlobData", ctypes.c_void_p)]
+
+
+def _com_call(ptr, index, restype, argtypes, args):
+    """Invoke method `index` on a raw COM interface pointer.
+
+    `ptr` is a c_void_p to the interface -- a pointer to its vtable pointer.
+    The first vtable slots are always IUnknown's QueryInterface/AddRef/Release,
+    so index 2 is Release on every interface here.
+    """
+    vtable = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+    fn = ctypes.cast(vtable, ctypes.POINTER(ctypes.c_void_p))[index]
+    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+    return proto(fn)(ptr, *args)
+
+
+def _com_release(ptr) -> None:
+    if ptr and getattr(ptr, "value", ptr):
+        try:
+            _com_call(ptr, 2, ctypes.c_ulong, [], [])
+        except Exception:
+            pass
+
+
+class _CompletionHandler:
+    """A hand-built COM object implementing IActivateAudioInterfaceCompletion-
+    Handler, the callback ActivateAudioInterfaceAsync signals when the device
+    is ready.
+
+    ctypes has no way to subclass a COM interface, so the object is assembled
+    by hand: a block of memory whose first word points at a vtable of four
+    function pointers (QueryInterface, AddRef, Release, ActivateCompleted).
+    Every trampoline and buffer is kept referenced on the instance, because
+    the moment Python collects them the vtable dangles and the callback
+    crashes the process.
+    """
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.operation = 0
+        self._refs = 1
+        c_void_p = ctypes.c_void_p
+        c_long = ctypes.c_long
+        c_ulong = ctypes.c_ulong
+
+        wanted = {bytes(_GUID(iid)) for iid in
+                  (_IID_IUNKNOWN, _IID_ICOMPLETION_HANDLER, _IID_IAGILEOBJECT)}
+
+        QI = ctypes.WINFUNCTYPE(c_long, c_void_p, c_void_p,
+                                ctypes.POINTER(c_void_p))
+        REF = ctypes.WINFUNCTYPE(c_ulong, c_void_p)
+        ACT = ctypes.WINFUNCTYPE(c_long, c_void_p, c_void_p)
+
+        def query(this, riid, ppv):
+            if riid and ctypes.string_at(riid, 16) in wanted:
+                ppv[0] = this
+                self._refs += 1
+                return 0                        # S_OK
+            if ppv:
+                ppv[0] = None
+            return -2147467262                  # E_NOINTERFACE
+
+        def add_ref(this):
+            self._refs += 1
+            return self._refs
+
+        def release(this):
+            self._refs -= 1
+            return max(self._refs, 0)
+
+        def completed(this, operation):
+            # AddRef the operation so it outlives the callback; the waiter
+            # reads its result and releases it.
+            if operation:
+                _com_call(ctypes.c_void_p(operation), 1, c_ulong, [], [])
+                self.operation = operation
+            self.event.set()
+            return 0                            # S_OK
+
+        # Keep the trampolines alive for the object's whole life.
+        self._trampolines = (QI(query), REF(add_ref), REF(release),
+                             ACT(completed))
+        Vtable = c_void_p * 4
+        self._vtable = Vtable(*[ctypes.cast(t, c_void_p)
+                                for t in self._trampolines])
+        # The object itself: one word pointing at the vtable.
+        self._object = c_void_p(ctypes.addressof(self._vtable))
+        #: The interface pointer to hand to ActivateAudioInterfaceAsync.
+        self.ptr = ctypes.c_void_p(ctypes.addressof(self._object))
+
+
+def window_pid(hwnd: int) -> int:
+    """The process id that owns a top-level window, or 0."""
+    if not hwnd:
+        return 0
+    pid = ctypes.c_uint32()
+    ctypes.windll.user32.GetWindowThreadProcessId(
+        ctypes.c_void_p(int(hwnd)), ctypes.byref(pid))
+    return int(pid.value)
+
+
+class ProcessLoopbackTap(AudioTap):
+    """Loopback capture of just one process tree, not the whole endpoint.
+
+    A drop-in for AudioTap -- same subscribe/stop and the same steady 16-bit
+    PCM at a known rate -- so ScreenSource neither knows nor cares which tap
+    is feeding it. Only ``_run`` differs: instead of PortAudio it drives the
+    WASAPI process loopback client for the target pid.
+    """
+
+    #: Capture the target and its children (a browser tab, a game's audio
+    #: helper, an Electron renderer) rather than only the exact process, which
+    #: on its own would leave most real apps silent.
+    _INCLUDE_PROCESS_TREE = 0
+    _EXCLUDE_PROCESS_TREE = 1
+
+    def __init__(self, pid: int, include_tree: bool = True) -> None:
+        super().__init__(device_name="")
+        self.pid = int(pid)
+        self.include_tree = include_tree
+        # Fixed wire format: 48 kHz 16-bit stereo, which every downstream path
+        # (direct WAV, ffmpeg stdin) already expects.
+        self.rate = 48000
+        self.channels = 2
+
+    def _run(self) -> None:
+        c_void_p = ctypes.c_void_p
+        c_long = ctypes.c_long
+        c_ulong = ctypes.c_ulong
+        c_uint32 = ctypes.c_uint32
+        POINTER = ctypes.POINTER
+        byref = ctypes.byref
+        import sys as _sys
+
+        ole32 = ctypes.windll.ole32
+        kernel32 = ctypes.windll.kernel32
+        mmdevapi = ctypes.windll.mmdevapi
+
+        audio_client = None
+        capture = None
+        h_event = None
+        started = False
+        com_ready = False
+        try:
+            if self.pid <= 0:
+                raise ProcessAudioError(
+                    "could not identify the window's process")
+            if _sys.getwindowsversion().build < _PROCESS_LOOPBACK_MIN_BUILD:
+                raise ProcessAudioError(
+                    "per-app audio needs Windows 10 build 20348 or newer")
+
+            # MTA on this thread: the activation callback is invoked on a COM
+            # worker thread and this thread waits on it, which needs the
+            # multithreaded apartment.
+            hr = ole32.CoInitializeEx(None, 0)      # COINIT_MULTITHREADED
+            com_ready = hr >= 0
+
+            params = _AUDIOCLIENT_ACTIVATION_PARAMS()
+            params.ActivationType = 1               # PROCESS_LOOPBACK
+            loop = params.u.ProcessLoopbackParams
+            loop.TargetProcessId = self.pid
+            loop.ProcessLoopbackMode = (self._INCLUDE_PROCESS_TREE
+                                        if self.include_tree
+                                        else self._EXCLUDE_PROCESS_TREE)
+            prop = _PROPVARIANT()
+            prop.vt = 65                            # VT_BLOB
+            prop.cbSize = ctypes.sizeof(params)
+            prop.pBlobData = ctypes.cast(byref(params), c_void_p)
+
+            handler = _CompletionHandler()
+            iid_client = _GUID(_IID_IAUDIOCLIENT)
+            operation = c_void_p()
+            activate = mmdevapi.ActivateAudioInterfaceAsync
+            activate.restype = c_long
+            activate.argtypes = [ctypes.c_wchar_p, POINTER(_GUID),
+                                 POINTER(_PROPVARIANT), c_void_p,
+                                 POINTER(c_void_p)]
+            hr = activate(_VAD_PROCESS_LOOPBACK, byref(iid_client),
+                          byref(prop), handler.ptr, byref(operation))
+            if hr < 0:
+                raise ProcessAudioError(
+                    f"could not start per-app capture (0x{hr & 0xFFFFFFFF:08X})")
+            if not handler.event.wait(5):
+                raise ProcessAudioError("per-app audio activation timed out")
+            op = handler.operation
+            if not op:
+                raise ProcessAudioError("per-app audio activation returned nothing")
+
+            activate_hr = c_long()
+            iface = c_void_p()
+            hr = _com_call(c_void_p(op), 3, c_long,
+                           [POINTER(c_long), POINTER(c_void_p)],
+                           [byref(activate_hr), byref(iface)])
+            _com_release(c_void_p(op))
+            if hr < 0 or activate_hr.value < 0 or not iface.value:
+                code = activate_hr.value if activate_hr.value < 0 else hr
+                raise ProcessAudioError(
+                    "the app has no audio to capture, or it is protected "
+                    f"(0x{code & 0xFFFFFFFF:08X})")
+            audio_client = iface
+
+            fmt = _WAVEFORMATEX()
+            fmt.wFormatTag = 1                      # WAVE_FORMAT_PCM
+            fmt.nChannels = self.channels
+            fmt.nSamplesPerSec = self.rate
+            fmt.wBitsPerSample = 16
+            fmt.nBlockAlign = fmt.nChannels * fmt.wBitsPerSample // 8
+            fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign
+            fmt.cbSize = 0
+            block = fmt.nBlockAlign
+
+            loopback = 0x00020000
+            eventcallback = 0x00040000
+            autoconvert = 0x80000000
+            src_quality = 0x08000000
+            flags = loopback | eventcallback | autoconvert | src_quality
+            # Initialize (vtable slot 3). Shared mode; a 200 ms buffer in
+            # 100-ns units; our own format because the virtual device has no
+            # mix format to query.
+            hr = _com_call(audio_client, 3, c_long,
+                           [ctypes.c_int, c_uint32, ctypes.c_longlong,
+                            ctypes.c_longlong, POINTER(_WAVEFORMATEX),
+                            c_void_p],
+                           [0, flags, 2000000, 0, byref(fmt), None])
+            if hr < 0:
+                raise ProcessAudioError(
+                    f"per-app audio client init failed (0x{hr & 0xFFFFFFFF:08X})")
+
+            h_event = kernel32.CreateEventW(None, False, False, None)
+            if not h_event:
+                raise ProcessAudioError("could not create the audio event")
+            hr = _com_call(audio_client, 13, c_long, [c_void_p], [h_event])
+            if hr < 0:
+                raise ProcessAudioError(
+                    f"SetEventHandle failed (0x{hr & 0xFFFFFFFF:08X})")
+
+            iid_capture = _GUID(_IID_IAUDIOCAPTURECLIENT)
+            cap_ptr = c_void_p()
+            hr = _com_call(audio_client, 14, c_long,
+                           [POINTER(_GUID), POINTER(c_void_p)],
+                           [byref(iid_capture), byref(cap_ptr)])
+            if hr < 0 or not cap_ptr.value:
+                raise ProcessAudioError(
+                    f"could not get capture service (0x{hr & 0xFFFFFFFF:08X})")
+            capture = cap_ptr
+
+            hr = _com_call(audio_client, 10, c_long, [], [])    # Start
+            if hr < 0:
+                raise ProcessAudioError(
+                    f"per-app audio start failed (0x{hr & 0xFFFFFFFF:08X})")
+            started = True
+            self._ready.set()
+
+            silent_flag = 0x2
+            last = time.monotonic()
+            while not self._stop.is_set():
+                kernel32.WaitForSingleObject(h_event, 100)
+                delivered = 0
+                while not self._stop.is_set():
+                    npkt = c_uint32()
+                    hr = _com_call(capture, 5, c_long, [POINTER(c_uint32)],
+                                   [byref(npkt)])           # GetNextPacketSize
+                    if hr < 0 or npkt.value == 0:
+                        break
+                    pdata = c_void_p()
+                    nframes = c_uint32()
+                    dwflags = c_uint32()
+                    hr = _com_call(
+                        capture, 3, c_long,
+                        [POINTER(c_void_p), POINTER(c_uint32),
+                         POINTER(c_uint32), POINTER(ctypes.c_uint64),
+                         POINTER(ctypes.c_uint64)],
+                        [byref(pdata), byref(nframes), byref(dwflags),
+                         None, None])                       # GetBuffer
+                    if hr < 0:
+                        break
+                    n = nframes.value
+                    nbytes = n * block
+                    if (dwflags.value & silent_flag) or not pdata.value:
+                        data = b"\x00" * nbytes
+                    else:
+                        data = ctypes.string_at(pdata, nbytes)
+                    _com_call(capture, 4, c_long, [c_uint32], [n])  # Release
+                    if nbytes:
+                        self._publish(data)
+                        delivered += n
+                now = time.monotonic()
+                if delivered == 0 and not self._stop.is_set():
+                    # No packets this round: the app is quiet. Feed real-time
+                    # silence so the receiver's clock keeps running, exactly as
+                    # endpoint loopback does.
+                    fill = int((now - last) * self.rate)
+                    if fill > 0:
+                        self._publish(b"\x00" * (fill * block))
+                last = now
+        except Exception as exc:                    # surfaced by start()
+            if not isinstance(exc, ProcessAudioError):
+                exc = ProcessAudioError(str(exc))
+            self._error = exc
+            self._ready.set()
+        finally:
+            if started and audio_client:
+                try:
+                    _com_call(audio_client, 11, c_long, [], [])    # Stop
+                except Exception:
+                    pass
+            _com_release(capture)
+            _com_release(audio_client)
+            if h_event:
+                try:
+                    kernel32.CloseHandle(h_event)
+                except Exception:
+                    pass
+            if com_ready:
+                try:
+                    ole32.CoUninitialize()
+                except Exception:
+                    pass
 
 
 def _pick_loopback_device(pa, pw, wanted: str = ""):
@@ -974,10 +1388,13 @@ class ScreenSource:
                  max_width: int = 1920, max_height: int = 1080,
                  keyframe_seconds: float = 0.5,
                  audio_device: str = "", mic_device: str = "",
-                 av_offset_ms: int = 0) -> None:
+                 av_offset_ms: int = 0, capture_pid: int = 0) -> None:
         if container not in CONTAINERS:
             raise ValueError(f"unknown container {container!r}")
         self.hwnd = hwnd
+        #: When set, capture only this process (and its children) rather than
+        #: the whole output endpoint -- the sound of the one window being cast.
+        self.capture_pid = capture_pid
         self.container = container
         self.fps = fps
         self.bitrate = bitrate
@@ -994,7 +1411,8 @@ class ScreenSource:
         #: runs audio early. Negative delays the picture instead.
         self.av_offset_ms = av_offset_ms
         self.path, self.mime, self.audio_only = CONTAINERS[container]
-        self.tap = AudioTap(audio_device)
+        self.tap = (ProcessLoopbackTap(capture_pid) if capture_pid
+                    else AudioTap(audio_device))
         self.url = ""
         self.httpd = None
         self._procs: set = set()
