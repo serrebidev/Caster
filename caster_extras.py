@@ -1023,8 +1023,15 @@ class ScreenSource:
         start an encoder, throw it away, and leave the receiver waiting
         through a second cold start. wait_for_media() reports that failure
         from the receiver's own connection instead, after the URL is out.
+
+        The window probe is skipped for an audio-only source. Casting a
+        window to a speaker (Sonos, a UPnP amplifier) sends its sound as WAV
+        and never captures the picture, so probing whether gdigrab can grab
+        that window is both wasted work and a false failure: a window gdigrab
+        cannot capture -- a DirectX game, a UWP app, a minimised window --
+        would otherwise abort the whole cast and leave the speaker silent.
         """
-        if verify and self.hwnd:
+        if verify and self.hwnd and not self.audio_only:
             self._pick_window_spec()
         self._open()
         return self.url

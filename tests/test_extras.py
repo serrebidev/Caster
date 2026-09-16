@@ -750,6 +750,41 @@ def test_a_window_capture_uses_the_handle_not_the_title(ffmpeg):
     assert src._window_specs()[0] == "hwnd=12345"
 
 
+def test_casting_a_window_to_a_speaker_skips_the_window_probe(monkeypatch):
+    """Guards against a silent speaker when the window cannot be grabbed.
+
+    Casting a window to a Sonos or UPnP amplifier sends only its sound, as
+    WAV, and never captures the picture. Probing whether gdigrab can grab the
+    window is then pointless -- and worse, a window gdigrab cannot capture (a
+    DirectX game, a UWP app, a minimised window) would abort the whole cast
+    and leave the speaker with nothing. So start() must not probe an
+    audio-only source even when a window handle is set.
+    """
+    def boom() -> None:
+        raise RuntimeError("cannot capture that window: it may have closed")
+
+    src = ScreenSource(hwnd=12345, container="wav")
+    monkeypatch.setattr(src, "_pick_window_spec", boom)
+    monkeypatch.setattr(src, "_open", lambda: None)
+    src.start(verify=True)          # must not raise
+
+
+def test_casting_a_window_to_a_screen_still_probes_the_window(monkeypatch):
+    """The video path still needs to settle how gdigrab names the window.
+
+    The audio-only skip must not swallow the probe for a real video capture,
+    where which of gdigrab's two window specs works is exactly what start()
+    exists to settle before the receiver connects.
+    """
+    calls: list = []
+    src = ScreenSource(hwnd=12345, container="mp4")
+    monkeypatch.setattr(src, "_pick_window_spec",
+                        lambda: calls.append(True))
+    monkeypatch.setattr(src, "_open", lambda: None)
+    src.start(verify=True)
+    assert calls == [True]
+
+
 def test_keyframes_are_pinned_to_the_clock_not_the_frame_count(ffmpeg):
     """Guards against a long wait before the first picture.
 
