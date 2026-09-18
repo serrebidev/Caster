@@ -48,6 +48,15 @@ a = Analysis(
         "PIL",
         "test",
         "unittest",
+        # Developer tools installed beside the runtime deps. Nothing imports
+        # them at run time, but PyInstaller's hooks follow them in: jedi alone
+        # added 5,536 files and 10 MB to the v0.5.23 zip.
+        "jedi",
+        "parso",
+        "mypy",
+        "black",
+        "IPython",
+        "pytest",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
