@@ -117,3 +117,10 @@ def status_sequence(fake_status):
             self.calls += 1
             return state
     return MC
+
+
+@pytest.fixture(autouse=True)
+def _fresh_keyframe_memory(monkeypatch):
+    """HlsRelay remembers long-GOP channels per session; tests must not share it."""
+    import caster
+    monkeypatch.setattr(caster.HlsRelay, "_keyframe_urls", set())

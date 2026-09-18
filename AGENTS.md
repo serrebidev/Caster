@@ -918,3 +918,28 @@ core. Big Bang's GOP reached 9.8s during priming, so it is always re-encoded.
 - Bash heredocs eat backslashes: `\n` inside one becomes a real newline. Use the Write tool
   or `chr(92)` for anything with backslashes.
 Update this with new important information like what is in this file if you notice changes, or something new that should be added here.
+
+## Cast position is not pushed while playing (2026-09-17)
+
+A receiver sends media status on state changes, not on a clock. During
+steady PLAYING, `mc.status.current_time` stays at the last report, so the
+watchdog read healthy playback as frozen and reloaded it ~95 s in: heard
+as "it buffers in the app". Test scripts never showed it because they call
+`mc.update_status()` every loop. `_recover_live_casts` now asks for status
+each tick and judges a stall only from a report newer than the recorded
+position (`last_updated`). Silence is not a stall.
+
+## Startup: re-prime from memory, not from the provider (2026-09-17)
+
+A long-GOP channel primed twice: copy, detect GOP > 5s, discard, re-encode,
+then wait real time again for the 16s cushion. Measured 31.3s to ready.
+Now the replacement encoder is fed `TsSource`'s tail first
+(`attach_with_replay`, `PRIME_REPLAY_BYTES`), under the same lock as
+`_forward`, so no byte is lost or doubled at the join. Only for the discard
+path in `start()`: replaying into an encoder whose segments were served
+plays them twice. `HlsRelay._keyframe_urls` remembers such channels for the
+session so the next cast starts re-encoding. `_probe_codecs` runs beside
+`probe_media` in `_play_chromecast`. Measured same channel, alternating:
+old 31.3s, new 12.4-16.4s to ready; codec wait 2.3s -> 0.6s.
+What is left is the startup cushion itself (`hls_start_seconds`), which is
+real time by nature: a live source cannot be buffered faster than it airs.

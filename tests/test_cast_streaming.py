@@ -140,8 +140,15 @@ def test_long_gop_is_promoted_before_waiting_for_startup_cushion(tmp_path, monke
 def watchdog(frame, monkeypatch):
     clock = [100.0]
     calls = []
-    status = types.SimpleNamespace(player_state="BUFFERING", current_time=16.0, media_session_id=7)
-    mc = types.SimpleNamespace(status=status, play_media=lambda *a, **kw: calls.append((a, kw)))
+    status = types.SimpleNamespace(player_state="BUFFERING", current_time=16.0,
+                                   media_session_id=7, last_updated=0)
+
+    def update_status():
+        # A receiver that answers: every request brings a newer report.
+        status.last_updated += 1
+
+    mc = types.SimpleNamespace(status=status, update_status=update_status,
+                               play_media=lambda *a, **kw: calls.append((a, kw)))
     cast = types.SimpleNamespace(media_controller=mc)
     frame._cast_live_loads["TV"] = (cast, "http://example.invalid/live.m3u8",
                                      "application/vnd.apple.mpegurl", "LIVE")
@@ -169,6 +176,20 @@ def test_frozen_receiver_reloads_existing_media_with_cooldown(watchdog, state):
     clock[0] += 1
     frame._recover_live_casts()
     assert len(calls) == 1
+
+
+def test_an_unrefreshed_position_is_not_a_stall(watchdog):
+    """Steady playback sends no updates; silence must not trigger a reload."""
+    frame, status, clock, calls = watchdog
+    status.player_state = "PLAYING"
+    requests = []
+    frame._cast_live_loads["TV"][0].media_controller.update_status = (
+        lambda: requests.append(1))
+    for _ in range(6):
+        frame._recover_live_casts()
+        clock[0] += 15
+    assert requests
+    assert not calls
 
 
 def test_progress_pause_and_new_session_reset_freeze_detection(watchdog):
@@ -268,3 +289,40 @@ def test_prime_can_be_cancelled_before_any_media(tmp_path):
     relay.root = str(tmp_path)
     with pytest.raises(RuntimeError, match="relay stopped while starting"):
         relay._prime(str(tmp_path / "live.m3u8"), 3)
+
+
+class _Collect:
+    def __init__(self):
+        self.data = b""
+
+    def write(self, data):
+        self.data += data
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_replayed_encoder_gets_the_tail_then_the_live_stream():
+    """A re-primed encoder starts on history with no byte lost or doubled."""
+    sink = caster._Sink()
+    source = caster.TsSource("http://example.invalid/live.ts", sink)
+    first = _Collect()
+    sink.attach(first)
+    source._forward(b"abcdef")
+    second = _Collect()
+    source.attach_with_replay(second, limit=4)
+    source._forward(b"ghi")
+    assert first.data == b"abcdef"
+    assert second.data == b"cdefghi"
+
+
+def test_a_channel_needing_keyframes_starts_that_way_next_time(monkeypatch):
+    url = "http://example.invalid/needs-keyframes.ts"
+    monkeypatch.setattr(caster.HlsRelay, "_keyframe_urls", set())
+    assert not caster.HlsRelay(url, live=True).force_keyframes
+    caster.HlsRelay._keyframe_urls.add(url)
+    assert caster.HlsRelay(url, live=True).force_keyframes
+    assert not caster.HlsRelay(url, live=False).force_keyframes

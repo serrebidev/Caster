@@ -645,6 +645,10 @@ class TsSource(threading.Thread):
         self.sink = sink
         self._stop = threading.Event()
         self._tail = b""
+        #: Held across forward-and-remember, so attach_with_replay() can hand
+        #: a new encoder the tail and then the live stream with no byte
+        #: missing or doubled at the join.
+        self._forward_lock = threading.Lock()
         self._response = None
         self.reconnects = 0     # diagnostics
         self.deduped = 0        # bytes of replay dropped (diagnostics)
@@ -724,8 +728,24 @@ class TsSource(threading.Thread):
         return len(self._tail) - index
 
     def _forward(self, data: bytes) -> None:
-        self.sink.write(data)
-        self._tail = (self._tail + data)[-self.OVERLAP_KEEP:]
+        with self._forward_lock:
+            self.sink.write(data)
+            self._tail = (self._tail + data)[-self.OVERLAP_KEEP:]
+
+    def attach_with_replay(self, file, limit: int) -> None:
+        """Point the sink at a new encoder, starting it on recent history.
+
+        Only for an encoder that replaces one whose output was thrown away
+        before anything was served. Its media then arrives at network speed
+        from memory instead of real time from the provider: re-priming
+        after the keyframe switch waited ~24s for media this reader had
+        already received. Replaying into an encoder whose predecessor's
+        segments were served would play them twice.
+        """
+        with self._forward_lock:
+            self.sink.attach(file)
+            if self._tail:
+                self.sink.write(self._tail[-limit:])
 
 
 class HlsRelay:
@@ -819,6 +839,12 @@ class HlsRelay:
     #: limit is set above them: only a source a copy cannot serve is
     #: re-encoded.
     GOP_COPY_LIMIT = 5.0
+    #: Live URLs whose GOP needed keyframes placed, for this session.
+    _keyframe_urls: set = set()
+    #: Recent source bytes handed to an encoder that replaces a discarded
+    #: prime. 8 MiB is ~18s at the 3.58 Mb/s channel measured here; ffmpeg
+    #: resyncs on the packet boundary and waits for the first keyframe.
+    PRIME_REPLAY_BYTES = 8 << 20
     #: Lines of ffmpeg diagnostics kept for the last exit. A stuck encoder
     #: can print one warning per frame, so this is a ring, not a log.
     STDERR_KEEP = 40
@@ -849,8 +875,10 @@ class HlsRelay:
         self.root = None
         self.video_transcoded = False  # True: source video not H.264
         #: True: re-encode H.264 video purely to place keyframes, because the
-        #: source's own are too far apart to cut regular segments on.
-        self.force_keyframes = False
+        #: source's own are too far apart to cut regular segments on. A live
+        #: channel already found to need it this session starts that way:
+        #: finding out again costs a copy prime that is thrown away.
+        self.force_keyframes = bool(live) and url in HlsRelay._keyframe_urls
         self._trail_drop = None   # segments hidden from the served playlist
         self._last_good = None    # last known-good playlist bytes
         #: Highest EXT-X-MEDIA-SEQUENCE ever served. An HLS client treats a
@@ -940,8 +968,12 @@ class HlsRelay:
                       f"{self.GOP_COPY_LIMIT:.0f}s); re-encoding video to "
                       f"place keyframes every {self.hls_time}s")
                 self.force_keyframes = True
+                if self.live:
+                    HlsRelay._keyframe_urls.add(self.url)
                 self._discard_primed_segments()
-                self._spawn_ffmpeg()
+                # Nothing primed has been served, so the new encoder may
+                # start on what the source already delivered.
+                self._spawn_ffmpeg(replay=True)
                 self._prime(m3u8, want)
         except BaseException:
             # Every exit from here leaks a server, its thread, an ffmpeg and
@@ -1108,8 +1140,11 @@ class HlsRelay:
         """
         return self._newest_seg_number() + 1
 
-    def _spawn_ffmpeg(self) -> None:
+    def _spawn_ffmpeg(self, replay: bool = False) -> None:
         """(Re)start the ffmpeg encoder process for this relay.
+
+        `replay` starts a piped encoder on the source's recent bytes; see
+        TsSource.attach_with_replay for when that is safe.
 
         Kills any still-running previous encoder FIRST, so there is always
         exactly one ffmpeg per relay. Without this, _supervise's two-step
@@ -1153,7 +1188,11 @@ class HlsRelay:
             # worth of the channel every time ffmpeg was replaced.
             if self._sink is None:
                 self._sink = _Sink()
-            self._sink.attach(self.proc.stdin)
+            if replay and self.ts_source is not None:
+                self.ts_source.attach_with_replay(self.proc.stdin,
+                                                  self.PRIME_REPLAY_BYTES)
+            else:
+                self._sink.attach(self.proc.stdin)
             if self.ts_source is None:
                 self.ts_source = TsSource(self.url, self._sink)
                 self.ts_source.start()
@@ -1283,6 +1322,7 @@ class HlsRelay:
               f"{self.GOP_COPY_LIMIT:.0f}s); re-encoding to place keyframes "
               f"every {self.hls_time}s")
         self.force_keyframes = True
+        HlsRelay._keyframe_urls.add(self.url)
         self._spawn_ffmpeg()    # picks the new flag up from _ffmpeg_cmd
 
     def _check_underfeed(self, now: float) -> None:
@@ -3455,6 +3495,25 @@ class MainFrame(wx.Frame):
                         target=self._ensure_receiver, args=(cast,),
                         daemon=True, name="cast-warm")
                     warm.start()
+                    # The relay needs the codecs and they cost a connection of
+                    # their own (~4.6s on an IPTV source). Ask alongside the
+                    # probe, not after it; a URL that turns out not to need
+                    # the relay simply never reads the answer.
+                    codecs_box: list = []
+                    codecs_thread = None
+                    if (not mime and url.lower().startswith(("http://", "https://"))
+                            and not url.lower().split("?")[0].endswith(".m3u8")):
+                        codecs_thread = threading.Thread(
+                            target=lambda: codecs_box.append(_probe_codecs(url)),
+                            daemon=True, name="cast-codecs")
+                        codecs_thread.start()
+
+                    def codecs() -> Optional[list]:
+                        if codecs_thread is None:
+                            return None
+                        codecs_thread.join()
+                        return codecs_box[0] if codecs_box else None
+
                     if mime:
                         probe = {"mime": mime, "is_live": bool(is_live)}
                     else:
@@ -3482,7 +3541,7 @@ class MainFrame(wx.Frame):
                         self._ui(self.set_status, "Relay starting...",
                                  speak=False)
                         relay = self._make_relay(
-                            url, live=bool(probe["is_live"]))
+                            url, codecs=codecs(), live=bool(probe["is_live"]))
                         HlsFileHandler.relay_requests.clear()
                         self._keep_relay(relay)
                         trace("cast.relay.start",
@@ -3525,7 +3584,7 @@ class MainFrame(wx.Frame):
                         # A valid provider playlist can still be incompatible
                         # with this receiver. Retain the original TS route.
                         trace("cast.native_hls.fallback", "receiver did not start")
-                        relay = self._make_relay(url, live=True)
+                        relay = self._make_relay(url, codecs=codecs(), live=True)
                         self._keep_relay(relay)
                         play_url = relay.start()
                         if abandoned():
@@ -4725,14 +4784,32 @@ class MainFrame(wx.Frame):
                     continue
                 state = status.player_state
                 if state in ("PLAYING", "BUFFERING"):
+                    # The receiver does not push its position while playing
+                    # steadily, so current_time is only as new as the last
+                    # report. Unrefreshed, it reads as frozen after twenty
+                    # seconds of perfectly good playback and the reload below
+                    # empties the receiver's buffer: measured 2026-09-17, a
+                    # healthy cast reloaded 95 s in. Ask for a fresh report
+                    # every tick; the reply lands before the next one.
+                    try:
+                        cast.media_controller.update_status()
+                    except Exception:
+                        pass
                     position = getattr(status, "current_time", None)
                     session = getattr(status, "media_session_id", None)
+                    updated = getattr(status, "last_updated", None)
                     if position is None:
                         continue
                     previous = self._cast_progress.get(label)
                     if (previous is None or previous[0] is not load
                             or previous[1:3] != (session, position)):
-                        self._cast_progress[label] = (load, session, position, now)
+                        self._cast_progress[label] = (
+                            load, session, position, now, updated)
+                        continue
+                    if updated is None or updated == previous[4]:
+                        # No report since the position was recorded. That is
+                        # silence, not a stall; only a newer report of the
+                        # same position proves the receiver is stuck.
                         continue
                     if now - previous[3] < self.CAST_STALL_TIMEOUT:
                         continue

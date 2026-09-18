@@ -224,6 +224,7 @@ def test_cast_prefers_native_hls_with_receiver_fallback(frame, monkeypatch, reje
                                  wait=lambda timeout: None)
     monkeypatch.setattr(caster.pychromecast, 'Chromecast', lambda *a, **kw: cast)
     monkeypatch.setattr(caster, '_native_hls_url', lambda url: native)
+    monkeypatch.setattr(caster, '_probe_codecs', lambda url: ['h264', 'aac'])
     monkeypatch.setattr(caster, 'probe_media',
                         lambda url: {'mime': 'video/mp2t', 'is_live': True})
     monkeypatch.setattr(caster.threading, 'Thread', lambda target, args=(), **kw:
@@ -2401,6 +2402,7 @@ def cast_worker(frame, monkeypatch):
     monkeypatch.setattr(caster, "probe_media",
                         lambda url: {"mime": "video/mp2t", "is_live": True})
     monkeypatch.setattr(caster, "_native_hls_url", lambda url: None)
+    monkeypatch.setattr(caster, "_probe_codecs", lambda url: ["h264", "aac"])
     monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
     frame._cast_zeroconf = lambda: None
     frame._keep_relay = lambda relay: None
