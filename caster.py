@@ -53,6 +53,8 @@ except ImportError:
 import caster_extras as ce
 from caster_extras import (
     list_windows,
+    window_pid,
+    ProcessAudioError,
     list_output_devices,
     list_input_devices,
     ScreenSource,
@@ -3989,7 +3991,12 @@ class MainFrame(wx.Frame):
         self._cast_capture("System audio", audio_only=True)
 
     def cast_window(self) -> None:
-        """Pick a visible top-level window and cast it with system audio."""
+        """Pick a visible top-level window and cast just that app's audio.
+
+        The sound is the selected window's own process (and its children),
+        not the whole PC's output, so casting one app does not broadcast
+        every notification and other app playing at the same time.
+        """
         picks = list_windows()
         if not picks:
             self.set_status("No windows found.")
@@ -4001,7 +4008,27 @@ class MainFrame(wx.Frame):
             return
         hwnd, title = picks[dlg.GetSelection()]
         dlg.Destroy()
-        self._cast_capture(title, hwnd=hwnd)
+        self._cast_capture(title, hwnd=hwnd, capture_pid=window_pid(hwnd))
+
+    def _offer_audio_fallback(self, label: str, hwnd: int,
+                              reason: str) -> None:
+        """Ask whether to cast the whole PC's sound after per-app capture fails.
+
+        Runs on the UI thread. Some apps render their audio through a process
+        Caster cannot single out (a few browsers, anything played by a shared
+        audio host), and older Windows lacks the API entirely. Rather than
+        silently broadcasting everything, the choice is put to the person.
+        """
+        answer = wx.MessageBox(
+            f"Could not capture audio from {label!r}:\n{reason}\n\n"
+            "Cast this PC's full system audio instead?",
+            APP_TITLE, wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING, self)
+        if answer != wx.YES:
+            self.set_status("Cast cancelled.")
+            return
+        # Same window (its picture, if the receiver takes video), but the
+        # whole output for sound.
+        self._cast_capture(label, hwnd=hwnd, capture_pid=0)
 
     def _install_grabber_cache(self) -> None:
         """Let the screen-grabber probe remember its answer between launches.
@@ -4045,8 +4072,14 @@ class MainFrame(wx.Frame):
             return "mp4"
         return "mpegts"         # DLNA renderers, TVs and Kodi
 
-    def _capture_source(self, container: str, hwnd: int) -> ScreenSource:
-        """A capture configured from the saved quality and audio settings."""
+    def _capture_source(self, container: str, hwnd: int,
+                        capture_pid: int = 0) -> ScreenSource:
+        """A capture configured from the saved quality and audio settings.
+
+        With ``capture_pid`` the audio is taken from that one process tree
+        instead of the whole output; ``capture_audio_device`` is then unused,
+        as a chosen output endpoint has no bearing on a per-app capture.
+        """
         chosen = preset(self.settings["capture_quality"])
         return ScreenSource(
             hwnd=hwnd, container=container,
@@ -4055,11 +4088,17 @@ class MainFrame(wx.Frame):
             keyframe_seconds=chosen["keyframe_seconds"],
             audio_device=self.settings["capture_audio_device"],
             mic_device=self.settings["capture_mic_device"],
-            av_offset_ms=int(self.settings["av_offset_ms"]))
+            av_offset_ms=int(self.settings["av_offset_ms"]),
+            capture_pid=capture_pid)
 
     def _cast_capture(self, label: str, hwnd: int = 0,
-                      audio_only: bool = False) -> None:
+                      audio_only: bool = False, capture_pid: int = 0) -> None:
         """Start a live capture and hand it to every selected device.
+
+        With ``capture_pid`` the audio is only that process tree's, not the
+        whole PC's output; a failure to open it is offered as a fallback to
+        whole-system audio rather than either aborting or silently widening
+        the capture.
 
         Receivers disagree about wire formats, so a selection spanning a
         Chromecast and a DLNA amplifier needs two encodes of the same
@@ -4121,10 +4160,18 @@ class MainFrame(wx.Frame):
             watched = []
             for container, group in by_container.items():
                 try:
-                    src = self._capture_source(container, hwnd)
+                    src = self._capture_source(container, hwnd, capture_pid)
                     # Nothing will connect to a source that only exists to
                     # feed AirPlay, so there is nothing to verify.
                     src.start(verify=bool(group))
+                except ProcessAudioError as exc:
+                    # Per-app audio could not be opened. Do not quietly cast
+                    # the whole PC's sound instead: stop, and let the user
+                    # choose to widen it.
+                    for done in started:
+                        done.stop()
+                    self._ui(self._offer_audio_fallback, label, hwnd, str(exc))
+                    return
                 except Exception as exc:
                     for done in started:
                         done.stop()
