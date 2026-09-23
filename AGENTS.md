@@ -35,6 +35,21 @@ to fail with a locked executable. Allow bounded graceful shutdown, then force
 termination and verify exit. Tests substitute unique process names and must
 never terminate a user's running Caster processes.
 
+Local releases (this Windows host) stay Windows-only: `py release.py patch`.
+Cloud agents ONLY: `.github/workflows/cloud-release.yml` builds every platform on
+GitHub runners. Windows runs the same `release.py` (bump input: patch/minor/major;
+real ffmpeg.exe from Chocolatey put first on PATH, never the choco shim). macOS
+(`Caster-macos.zip`) and Linux (`Caster-linux-x86_64.tar.gz`) then build the tag with
+`build.sh` and attach. `gh workflow run cloud-release.yml -f dry_run=true` builds all
+three as artifacts, publishes nothing; `-f dry_run=false -f bump=patch` is real.
+Watch: `gh run watch <id> --exit-status`. Never run it while a local release runs.
+macOS/Linux: URL, file and device casting work; screen, window and system-audio
+capture are Windows-only (`_capture_supported` guards menu, tray and hotkeys);
+updater opens the release page; ffmpeg comes from the system. wx.Accessible is
+MSAA/Windows-only: `labelled()` attaches it only on `__WXMSW__` (GTK raised
+NotImplementedError at startup). Test Linux over `ssh root@serrebiradio.com`
+(Debian 13, distro `python3-wxgtk4.0` in a `--system-site-packages` venv, xvfb-run).
+
 release.py refuses dirty tree. Deps in requirements.txt. soco optional — without it every
 other protocol still works, Sonos just never appears.
 

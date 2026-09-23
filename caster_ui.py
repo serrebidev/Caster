@@ -136,8 +136,11 @@ def labelled(parent, sizer, text: str, build, proportion: int = 0,
     control.SetName(name)
     # Held on the control as well: the window owns the accessible, and a
     # Python-side reference keeps it from being collected under it.
-    control._accessible = _NamedAccessible(name)
-    control.SetAccessible(control._accessible)
+    # wx.Accessible is MSAA, Windows only; GTK/macOS raise NotImplementedError
+    # and take the name from the label and SetName natively.
+    if wx.Platform == "__WXMSW__":
+        control._accessible = _NamedAccessible(name)
+        control.SetAccessible(control._accessible)
     sizer.Add(control, proportion,
               wx.LEFT | wx.RIGHT | wx.EXPAND | (wx.TOP if not text else 0),
               border)

@@ -93,3 +93,16 @@ coll = COLLECT(
     upx=False,
     name="Caster",
 )
+
+# macOS: app bundle (build.sh zips it). ffmpeg comes from the system (Homebrew).
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Caster.app",
+        bundle_identifier="com.serrebidev.caster",
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "NSLocalNetworkUsageDescription": "Caster finds and casts to devices on your network.",
+            "NSBonjourServices": ["_googlecast._tcp", "_airplay._tcp", "_raop._tcp"],
+        },
+    )

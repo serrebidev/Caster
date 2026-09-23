@@ -32,7 +32,8 @@ import urllib.request as _urlreq
 def _find_ffmpeg() -> str:
     if getattr(__import__("sys"), "frozen", False):
         bundled = os.path.join(
-            os.path.dirname(__import__("sys").executable), "ffmpeg.exe")
+            os.path.dirname(__import__("sys").executable),
+            "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
         if os.path.exists(bundled):
             return bundled
     found = shutil.which("ffmpeg")
@@ -45,7 +46,7 @@ def _find_ffmpeg() -> str:
     ):
         for hit in glob.glob(pattern, recursive=True):
             return hit
-    raise FileNotFoundError("ffmpeg.exe not found")
+    raise FileNotFoundError("ffmpeg not found")
 
 
 def _no_window_kwargs() -> dict:

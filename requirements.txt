@@ -4,7 +4,8 @@ pychromecast
 pyatv
 zeroconf
 yt-dlp
-pyaudiowpatch
+# WASAPI loopback: Windows only.
+pyaudiowpatch; sys_platform == "win32"
 # Sonos. Optional: without it every other protocol still works and Sonos
 # speakers simply do not appear in the device list.
 soco

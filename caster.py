@@ -26,6 +26,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -109,6 +110,7 @@ from caster_ui import (
 import caster_update
 
 APP_TITLE = "Caster"
+CAPTURE_WINDOWS_ONLY = "Screen, window and system audio casting need Windows."
 APP_VERSION = "0.5.24"
 
 #: Diagnostic timeline, off unless CASTER_TRACE names a file. Buffering is a
@@ -2302,6 +2304,10 @@ class MainFrame(wx.Frame):
             wx.ID_ANY, "Cast system &audio\tCtrl+Shift+A",
             "System sound only, lowest delay")
         self.mi_audio_id = mi_audio.GetId()
+        if sys.platform != "win32":
+            for item in (mi_screen, mi_window, mi_audio):
+                item.Enable(False)
+                item.SetHelp(CAPTURE_WINDOWS_ONLY)
         m.AppendSeparator()
         mi_file = m.Append(wx.ID_ANY, "&Open file...\tCtrl+O",
                            "Cast a local file")
@@ -2462,6 +2468,16 @@ class MainFrame(wx.Frame):
 
     def _offer_update(self, update) -> None:
         version = ".".join(map(str, update.version))
+        if sys.platform != "win32":
+            # The in-place installer is Windows-only; send people to the page.
+            if wx.MessageBox(
+                    f"Caster {version} is available. Open the download page?",
+                    "Caster update",
+                    wx.YES_NO | wx.YES_DEFAULT | wx.ICON_INFORMATION,
+                    self) == wx.YES:
+                wx.LaunchDefaultBrowser(
+                    f"https://github.com/{caster_update.REPOSITORY}/releases/latest")
+            return
         answer = wx.MessageBox(
             f"Caster {version} is available. Download and install it?\n\n"
             "Caster will close only after the download completes.",
@@ -3977,8 +3993,19 @@ class MainFrame(wx.Frame):
 
     # ---- screen / app-window / system-audio casting ----
 
+    def _capture_supported(self) -> bool:
+        """Screen, window and PC-sound capture use gdigrab/ddagrab, dshow and
+        WASAPI loopback, which exist only on Windows. Every entry point (menu,
+        tray, global hotkey) checks here, so macOS/Linux say so instead."""
+        if sys.platform == "win32":
+            return True
+        self.set_status(CAPTURE_WINDOWS_ONLY)
+        return False
+
     def cast_screen(self) -> None:
         """Cast the whole desktop plus system audio to the selected device."""
+        if not self._capture_supported():
+            return
         self._cast_capture("Screen")
 
     def cast_audio(self) -> None:
@@ -3988,6 +4015,8 @@ class MainFrame(wx.Frame):
         period plus the receiver's own buffer, which is as close to realtime
         as this gets.
         """
+        if not self._capture_supported():
+            return
         self._cast_capture("System audio", audio_only=True)
 
     def cast_window(self) -> None:
@@ -3997,6 +4026,8 @@ class MainFrame(wx.Frame):
         not the whole PC's output, so casting one app does not broadcast
         every notification and other app playing at the same time.
         """
+        if not self._capture_supported():
+            return
         picks = list_windows()
         if not picks:
             self.set_status("No windows found.")
