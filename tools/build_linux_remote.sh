@@ -17,7 +17,7 @@ docker run --rm -v "$work/src:/src" -w /src ubuntu:24.04 bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq --no-install-recommends python3-venv python3-pip python3-wxgtk4.0 binutils xvfb xauth ffmpeg >/dev/null
+  apt-get install -y -qq --no-install-recommends python3-venv python3-pip python3-wxgtk4.0 libpython3.12 git binutils xvfb xauth ffmpeg >/dev/null
   python3 -m venv --system-site-packages /venv
   PYTHON=/venv/bin/python ./build.sh
   set +e
