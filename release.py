@@ -135,6 +135,8 @@ def main() -> None:
         run(["git", "push", "origin", vtag])
         run(["gh", "release", "create", vtag, zp,
              "--title", f"Caster {vtag}", "--generate-notes"])
+        # macOS on a GitHub runner, Linux over SSH (no-op on GitHub Actions).
+        run([sys.executable, os.path.join(ROOT, "tools", "release_other_platforms.py"), vtag])
 
 
 if __name__ == "__main__":

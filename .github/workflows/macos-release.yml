@@ -1,0 +1,39 @@
+name: macOS Release
+
+# The Windows release host builds Windows locally and Linux over SSH; this is
+# its macOS half, dispatched by tools/release_other_platforms.py once the
+# release is published. (cloud-release.yml has its own macOS job.)
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build the macOS app for and attach it to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Attach to release
+        run: |
+          cp "dist/Caster-macos.zip" "Caster-macos.zip"
+          gh release upload "$TAG" "Caster-macos.zip" --clobber --repo "$GITHUB_REPOSITORY"

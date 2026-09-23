@@ -1,6 +1,6 @@
 name: Cloud Release
 
-# Cloud agents ONLY. On the Windows release host run `py release.py patch`.
+# Muse agent and cloud agents ONLY. On the Windows release host run `py release.py patch`.
 # Windows runs the same release.py on a GitHub runner (bump, commit, tag,
 # PyInstaller, ffmpeg, Caster-portable.zip, GitHub release). macOS and Linux
 # then build that tag with build.sh and attach Caster-macos.zip and
