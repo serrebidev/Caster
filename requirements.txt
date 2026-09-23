@@ -1,7 +1,10 @@
 # Caster runtime dependencies.
 wxPython
 pychromecast
-pyatv
+# pyatv 0.18 / miniaudio 1.71 fail tests/test_caster_core.py pipe-decode tests
+# (RAOP from a pipe); keep the tested pair until those pass.
+pyatv==0.17.0
+miniaudio==1.61
 zeroconf
 yt-dlp
 # WASAPI loopback: Windows only.
