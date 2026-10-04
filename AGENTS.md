@@ -186,7 +186,11 @@ Roughly 15 s off both paths. What is left is the receiver's own startup.
 ## Capture
 
 `CONTAINERS`: mp4 -> Chromecast and Roku, mpegts -> DLNA/TV/Kodi, wav -> audio boxes.
-Sonos and AirPlay always get wav — RAOP carries no video, Sonos is speakers.
+Capture sources for Sonos and AirPlay expose audio-only WAV. AirPlay's
+RAOP input is converted to lossless streaming FLAC before pyatv decodes it.
+miniaudio 1.71 scans unknown-length WAV to EOF before opening: this blocks
+live capture and drops buffered audio on finite pipes. Keep the real FLAC
+decoder test checking full PCM output and opening before source EOF.
 
 wav + `pcm_is_directly_usable()` = no ffmpeg in the path at all. Lowest latency route.
 AudioTap = one WASAPI loopback, many subscribers, bounded queue, drop oldest chunk. Never

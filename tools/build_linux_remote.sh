@@ -12,12 +12,13 @@ tag="$1"
 work="$(mktemp -d /tmp/caster-linux-XXXXXX)"
 GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --depth 1 --branch "$tag" https://github.com/serrebidev/Caster.git "$work/src" >&2
 
-# wxPython has no Linux pip wheel; use Ubuntu's in a venv that sees it.
+# Current wxPython has no Linux pip wheel; provide its source-build libraries.
 docker run --rm -v "$work/src:/src" -w /src ubuntu:24.04 bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends python3-venv python3-pip python3-wxgtk4.0 libpython3.12 git binutils xvfb xauth ffmpeg >/dev/null
+  apt-get install -y -qq --no-install-recommends build-essential python3-dev libgtk-3-dev libwebkit2gtk-4.1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libnotify-dev libsdl2-dev libjpeg-dev libpng-dev libtiff-dev libsm-dev libxtst-dev >/dev/null
   python3 -m venv --system-site-packages /venv
   PYTHON=/venv/bin/python ./build.sh
   set +e

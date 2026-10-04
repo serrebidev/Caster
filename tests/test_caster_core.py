@@ -436,33 +436,43 @@ def test_pyatv_decodes_a_pipe_only_through_the_seekable_reader():
 
     with pytest.raises(Exception):
         asyncio.run(frames(_ForwardOnly(data)))
-    assert asyncio.run(frames(_ForwardOnly(_wav_bytes(list_chunk=False)))) == b""
+    # Current miniaudio can decode a simple forward-only WAV, but FFmpeg's
+    # metadata-bearing header still requires the seekable adapter.
+    assert asyncio.run(frames(_ForwardOnly(_wav_bytes(list_chunk=False))))
     plain = _ForwardOnly(data)
     reader = caster.SeekablePipeReader(plain.read)
     reader.prefill()
     assert len(asyncio.run(frames(reader))) > 20000
 
 
-def test_a_pipe_wav_decodes_in_full_through_pyatv():
-    """ffmpeg writes a pipe WAV's sizes as 0xFFFFFFFF.
+def test_a_pipe_flac_decodes_in_full_through_pyatv():
+    """RAOP's lossless FFmpeg pipe must decode fully with bounded buffering.
 
-    pyatv's metadata parse then walked the whole stream by seeking on sample
-    values; the reader trimmed behind it, and 25 s of audio played as 16 s
-    on R&B Room. Every byte must come out of the decoder.
+    miniaudio 1.71 scans an unknown-length WAV to EOF before rewinding;
+    FLAC avoids losing trimmed audio and waiting forever on live sources.
     """
-    import struct
+    import random
+    import subprocess
     from pyatv.protocols.raop.audio_source import BufferedIOBaseSource
     data = bytearray(_wav_bytes(seconds=10))
-    data[4:8] = struct.pack("<I", 0xFFFFFFFF)
     marker = data.find(b"data")
-    data[marker + 4:marker + 8] = struct.pack("<I", 0xFFFFFFFF)
     pcm = len(data) - marker - 8
-    reader = caster.SeekablePipeReader(_ForwardOnly(bytes(data)).read)
+    # Incompressible samples make the stream exceed the retained window.
+    data[marker + 8:] = random.Random(0).randbytes(pcm)
+    encoded = subprocess.run(
+        [caster._find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+         "-i", "pipe:0", "-f", "flac", "-c:a", "flac", "pipe:1"],
+        input=bytes(data), capture_output=True, check=True,
+        **caster._no_window_kwargs(),
+    ).stdout
+    reader = caster.SeekablePipeReader(_ForwardOnly(encoded).read)
     reader.HEAD, reader.BEHIND = 64 << 10, 256 << 10   # force trimming
 
     async def decode():
         await asyncio.get_running_loop().run_in_executor(None, reader.prefill)
         source = await BufferedIOBaseSource.open(reader, 44100, 2, 2)
+        # Opening a live source must not wait for its entire stream.
+        assert reader._available() < len(encoded)
         total, idle = 0, 0
         while idle < 100:
             chunk = await source.readframes(352)
@@ -540,6 +550,8 @@ def test_raop_ffmpeg_uses_http_options_only_where_they_belong(
     assert isinstance(reader, caster.SeekablePipeReader)
     assert frame._air_ffmpeg_procs == {"Room (AirPlay)": proc}
     cmd = commands[0]
+    assert cmd[cmd.index("-f") + 1] == "flac"
+    assert cmd[cmd.index("-c:a") + 1] == "flac"
     assert ("-seekable" in cmd) is unseekable
     assert ("-rw_timeout" in cmd) is timeout
     assert cmd[cmd.index("-ac") + 1] == "2"     # RAOP negotiates stereo

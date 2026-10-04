@@ -3676,8 +3676,8 @@ class MainFrame(wx.Frame):
 
         `source` is a live ScreenSource instead of a URL. RAOP carries audio
         only -- pyatv cannot mirror a screen -- so a live source contributes
-        its system audio, read straight off the capture tap with no encoder,
-        no container and no HTTP hop in between.
+        its system audio through the same lossless streaming FLAC conversion
+        as other media, avoiding an endless WAV decoder probe.
         """
         # AirPlay state shared with the transport handlers on the UI thread.
         self._air_kind = None          # "audio" | "video" | "youtube"
@@ -3739,12 +3739,8 @@ class MainFrame(wx.Frame):
                 # sets `wake` and the loop reopens the source (with seek).
                 while not shutdown.is_set():
                     if source is not None:
-                        # Seekable for the same reason as the ffmpeg pipe:
-                        # pyatv cannot open the capture's plain reader.
-                        live = source.open_wav_reader()
-                        stream = SeekablePipeReader(live.read, live.close)
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, stream.prefill)
+                        stream = await self._raop_source(
+                            source.url, None, dev.label)
                     else:
                         stream = await self._raop_source(url, vid, dev.label)
                     if self._air_play_t0 is None:
@@ -3880,8 +3876,8 @@ class MainFrame(wx.Frame):
 
         Audio URLs stream directly (RAOP decodes them). Everything else
         (YouTube, IPTV TS, provider VOD, screen/app capture) is piped
-        through ffmpeg, which extracts the audio track as WAV; pyatv
-        decodes the WAV stream and resamples to the negotiated format.
+        through ffmpeg, which extracts the audio track as lossless FLAC;
+        pyatv decodes it and resamples to the negotiated format.
         """
         loop = asyncio.get_running_loop()
         if vid:
@@ -3964,7 +3960,10 @@ class MainFrame(wx.Frame):
             "-af", "aresample=44100:async=1000:first_pts=0",
             # RAOP negotiates 44.1 kHz stereo; hand it exactly that.
             "-ac", "2",
-            "-f", "wav", "-c:a", "pcm_s16le",
+            # miniaudio probes an unknown-length WAV to its end before
+            # rewinding. A live pipe never ends; a finite one loses trimmed
+            # audio. FLAC streams losslessly without that seek-and-scan.
+            "-f", "flac", "-c:a", "flac",
             "-flush_packets", "1",
             "-",                             # pipe to stdout
         ]
