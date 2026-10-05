@@ -1890,20 +1890,20 @@ class _Replaying(threading.Thread):
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}/live.ts"
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         try:
             self.sock.close()
         except OSError:
             pass
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 conn, _ = self.sock.accept()
             except OSError:
