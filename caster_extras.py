@@ -49,6 +49,84 @@ def _find_ffmpeg() -> str:
     raise FileNotFoundError("ffmpeg not found")
 
 
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+_breakaway_allowed_cache: "bool | None" = None
+
+
+def _query_breakaway_allowed() -> bool:
+    """Whether a child may leave the job object this process runs in.
+
+    Asking to break away from a job that does not allow it makes Windows
+    refuse the whole CreateProcess with "Access is denied" -- every ffmpeg
+    spawn fails. GitHub's Windows runners are such a job, and so is any
+    launcher that confines its children. Outside a job there is nothing to
+    leave and the flag is harmless. If the question cannot be asked, the
+    answer is yes, which is what Caster always assumed.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.IsProcessInJob.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        in_job = wintypes.BOOL(False)
+        if not kernel32.IsProcessInJob(
+                kernel32.GetCurrentProcess(), None, ctypes.byref(in_job)):
+            return True
+        if not in_job.value:
+            return True
+        limits = _BasicLimits()
+        # A NULL handle asks about the job this process belongs to;
+        # 2 is JobObjectBasicLimitInformation.
+        if not kernel32.QueryInformationJobObject(
+                None, 2, ctypes.byref(limits), ctypes.sizeof(limits), None):
+            return True
+        return bool(limits.LimitFlags & (
+            _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK))
+    except Exception:
+        return True
+
+
+def _breakaway_allowed() -> bool:
+    global _breakaway_allowed_cache
+    if _breakaway_allowed_cache is None:
+        _breakaway_allowed_cache = _query_breakaway_allowed()
+    return _breakaway_allowed_cache
+
+
+def _no_window_creationflags() -> int:
+    """CREATE_NO_WINDOW, plus leaving the job object only where that is
+    allowed (see _query_breakaway_allowed)."""
+    flags = _CREATE_NO_WINDOW
+    if _breakaway_allowed():
+        flags |= _CREATE_BREAKAWAY_FROM_JOB
+    return flags
+
+
 def _no_window_kwargs() -> dict:
     import sys
     if sys.platform == "win32":
@@ -56,8 +134,7 @@ def _no_window_kwargs() -> dict:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
         return {"startupinfo": si,
-                "creationflags": (subprocess.CREATE_NO_WINDOW
-                                  | subprocess.CREATE_BREAKAWAY_FROM_JOB)}
+                "creationflags": _no_window_creationflags()}
     return {}
 
 

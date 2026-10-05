@@ -66,6 +66,7 @@ from caster_extras import (
     FileServer,
     mdns_host,
     upnp_host,
+    _no_window_creationflags,
 )
 
 from caster_config import Settings, preset
@@ -448,10 +449,7 @@ def _no_window_kwargs() -> dict:
         si.wShowWindow = 0  # SW_HIDE
         return {
             "startupinfo": si,
-            "creationflags": (
-                subprocess.CREATE_NO_WINDOW
-                | subprocess.CREATE_BREAKAWAY_FROM_JOB
-            ),
+            "creationflags": _no_window_creationflags(),
         }
     return {}
 

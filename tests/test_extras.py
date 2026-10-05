@@ -1153,3 +1153,24 @@ def test_endless_wav_size_is_the_signed_ceiling():
     the RIFF field (data + header) stays non-negative too.
     """
     assert caster_extras.ENDLESS_WAV_BYTES == 0x7FFFFFFF - 44
+
+
+def test_breakaway_is_only_requested_where_the_job_allows_it(monkeypatch):
+    """CREATE_BREAKAWAY_FROM_JOB in a job that forbids it makes Windows refuse
+    every spawn with "Access is denied" -- GitHub's runners are such a job."""
+    monkeypatch.setattr(caster_extras, "_breakaway_allowed_cache", None)
+    monkeypatch.setattr(caster_extras, "_query_breakaway_allowed", lambda: False)
+    assert caster_extras._no_window_creationflags() == caster_extras._CREATE_NO_WINDOW
+    monkeypatch.setattr(caster_extras, "_breakaway_allowed_cache", None)
+    monkeypatch.setattr(caster_extras, "_query_breakaway_allowed", lambda: True)
+    assert caster_extras._no_window_creationflags() == (
+        caster_extras._CREATE_NO_WINDOW | caster_extras._CREATE_BREAKAWAY_FROM_JOB
+    )
+
+
+def test_the_breakaway_question_is_answered_yes_when_it_cannot_be_asked():
+    # Off Windows there is no kernel32; the old behaviour (ask to break away)
+    # is what an unanswerable question falls back to.
+    import sys
+    if sys.platform != "win32":
+        assert caster_extras._query_breakaway_allowed() is True
