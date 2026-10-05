@@ -112,7 +112,7 @@ import caster_update
 
 APP_TITLE = "Caster"
 CAPTURE_WINDOWS_ONLY = "Screen, window and system audio casting need Windows."
-APP_VERSION = "0.5.28"
+APP_VERSION = "0.5.29"
 
 #: Diagnostic timeline, off unless CASTER_TRACE names a file. Buffering is a
 #: timing problem and timing problems are invisible from a status bar, so this
