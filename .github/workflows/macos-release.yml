@@ -19,7 +19,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     env:
-      GH_TOKEN: ${{ github.token }}
+      FORGEJO_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.release_tag }}
     steps:
       - uses: actions/checkout@v7
@@ -36,4 +36,10 @@ jobs:
       - name: Attach to release
         run: |
           cp "dist/Caster-macos.zip" "Caster-macos.zip"
-          gh release upload "$TAG" "Caster-macos.zip" --clobber --repo "$GITHUB_REPOSITORY"
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          h="Authorization: token $FORGEJO_TOKEN"
+          release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"
+          id="$(echo "$release" | jq -r .id)"
+          old="$(echo "$release" | jq -r '.assets[] | select(.name == "Caster-macos.zip") | .id')"
+          [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
+          curl -sf -o /dev/null -H "$h" -F "attachment=@Caster-macos.zip" "$api/releases/$id/assets?name=Caster-macos.zip"
