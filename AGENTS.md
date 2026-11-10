@@ -35,7 +35,7 @@ to fail with a locked executable. Allow bounded graceful shutdown, then force
 termination and verify exit. Tests substitute unique process names and must
 never terminate a user's running Caster processes.
 
-Local releases (this Windows host): `py release.py patch` does every platform. Windows builds locally; then `tools/release_other_platforms.py` dispatches `.github/workflows/macos-release.yml` (macOS on a GitHub runner), builds Linux over `ssh root@serrebiradio.com` with `tools/build_linux_remote.sh` (throwaway ubuntu:24.04 container, launch check; `LINUX_BUILD_HOST` overrides), uploads it and waits for the macOS asset. If that half fails after publishing, rerun `python tools/release_other_platforms.py vX.Y.Z`. Never use cloud-release.yml from this host.
+Local releases (this Windows host): `py release.py patch` does every platform. Windows builds locally; then `tools/release_other_platforms.py` dispatches `.github/workflows/macos-release.yml` (macOS on a GitHub runner), builds Linux over `ssh wsl-build` (local WSL Ubuntu, Docker) with `tools/build_linux_remote.sh` (throwaway ubuntu:24.04 container, launch check; `LINUX_BUILD_HOST` overrides), uploads it and waits for the macOS asset. If that half fails after publishing, rerun `python tools/release_other_platforms.py vX.Y.Z`. Never use cloud-release.yml from this host.
 Muse agent and cloud agents ONLY: `.github/workflows/cloud-release.yml` builds every platform on
 GitHub runners. Windows runs the same `release.py` (bump input: patch/minor/major;
 real ffmpeg.exe from Chocolatey put first on PATH, never the choco shim). macOS
@@ -47,7 +47,7 @@ macOS/Linux: URL, file and device casting work; screen, window and system-audio
 capture are Windows-only (`_capture_supported` guards menu, tray and hotkeys);
 updater opens the release page; ffmpeg comes from the system. wx.Accessible is
 MSAA/Windows-only: `labelled()` attaches it only on `__WXMSW__` (GTK raised
-NotImplementedError at startup). Test Linux over `ssh root@serrebiradio.com`
+NotImplementedError at startup). Test Linux over `ssh wsl-build`
 (Debian 13, distro `python3-wxgtk4.0` in a `--system-site-packages` venv, xvfb-run).
 
 release.py refuses dirty tree. Deps in requirements.txt. soco optional — without it every

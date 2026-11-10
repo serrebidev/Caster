@@ -1,21 +1,27 @@
 #!/bin/bash
-# Build the Linux release for one tag on the Linux release host, the way
+# Build the Linux release for one tag on the Linux release host (local WSL Ubuntu, ssh alias wsl-build), the way
 # cloud-release.yml's ubuntu-24.04 job does, in a throwaway ubuntu:24.04
 # container. tools/release_other_platforms.py pipes this over SSH:
 #
-#   ssh root@serrebiradio.com bash -s -- vX.Y.Z < tools/build_linux_remote.sh
+#   ssh wsl-build bash -s -- vX.Y.Z < tools/build_linux_remote.sh
 #
 # The last line of output is the release asset's path on the host.
 set -euo pipefail
 
+# Host caches mounted into the container: apt .debs per repo (apt locks its
+# archive dir), pip wheels shared (pip keeps wheels it builds from source).
+# --cpu-shares 26214: build outranks everything except live radio/TV on the host
+# (see /usr/local/bin/live-priority.sh there).
+
 tag="$1"
 work="$(mktemp -d /tmp/caster-linux-XXXXXX)"
-GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --depth 1 --branch "$tag" https://github.com/serrebidev/Caster.git "$work/src" >&2
+GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --depth 1 --branch "$tag" https://git.serrebiradio.com/serrebi/Caster.git "$work/src" >&2
 
 # Current wxPython has no Linux pip wheel; provide its source-build libraries.
-docker run --rm -v "$work/src:/src" -w /src ubuntu:24.04 bash -c '
+docker run --rm --cpu-shares 26214 -v /var/cache/release-build/caster-apt:/var/cache/apt/archives -v /var/cache/release-build/pip:/root/.cache/pip -v "$work/src:/src" -w /src ubuntu:24.04 bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
+  rm -f /etc/apt/apt.conf.d/docker-clean  # keep .debs in the mounted host cache
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends python3-venv python3-pip python3-wxgtk4.0 libpython3.12 git binutils xvfb xauth ffmpeg >/dev/null
   apt-get install -y -qq --no-install-recommends build-essential python3-dev libgtk-3-dev libwebkit2gtk-4.1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libnotify-dev libsdl2-dev libjpeg-dev libpng-dev libtiff-dev libsm-dev libxtst-dev >/dev/null
