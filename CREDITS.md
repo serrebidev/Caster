@@ -8,3 +8,12 @@ Third-party projects it uses:
 - Chromecast, AirPlay (RAOP), UPnP/DLNA, Sonos, Roku, and Kodi are upstream casting protocols and devices, not code from this project.
 
 Questions and bug reports are welcome in the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects). More serrebi projects: [projects.serrebiradio.com](https://projects.serrebiradio.com).
+
+
+## About this project
+
+- GitHub profile: [serrebidev](https://github.com/serrebidev)
+- Repository (GitHub): [https://github.com/serrebidev/Caster](https://github.com/serrebidev/Caster)
+- Repository (Forgejo): [https://git.serrebiradio.com/serrebi/Caster](https://git.serrebiradio.com/serrebi/Caster)
+- Projects site: [projects.serrebiradio.com](https://projects.serrebiradio.com)
+- Questions and bug reports: [SerrebiProjects Telegram group](https://t.me/SerrebiProjects)
