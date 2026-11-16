@@ -25,8 +25,8 @@ import zipfile
 from dataclasses import dataclass
 from typing import Optional
 
-REPOSITORY = "serrebidev/Caster"
-LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+REPOSITORY = "serrebi/Caster"  # Forgejo; GitHub is suspended.
+LATEST_URL = f"https://git.serrebiradio.com/api/v1/repos/{REPOSITORY}/releases/latest"
 ASSET_NAME = "Caster-portable.zip"
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024  # A release must never fill the disk.
 MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
@@ -55,7 +55,7 @@ def latest_update(current: str, timeout: float = 8.0) -> Optional[Update]:
         return None
     request = urllib.request.Request(
         LATEST_URL,
-        headers={"Accept": "application/vnd.github+json",
+        headers={"Accept": "application/json",
                  "User-Agent": "Caster-update-check"},
     )
     try:

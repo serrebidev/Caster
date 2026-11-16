@@ -127,15 +127,23 @@ def main() -> None:
           f"({os.path.getsize(zp) / 1e6:.1f} MB)")
 
     if mode != "--no-bump":
-        # The in-app updater reads GitHub Releases, so a local zip is not a
-        # release until its tag and portable asset are published there.
+        # A local zip is not a release until its tag and portable asset are
+        # published on Forgejo (GitHub is suspended).
         # Release tags are lightweight, so --follow-tags deliberately skips
         # them.  Push the branch and this exact tag explicitly.
         run(["git", "push", "origin", "HEAD"])
         run(["git", "push", "origin", vtag])
-        run(["gh", "release", "create", vtag, zp,
-             "--title", f"Caster {vtag}", "--generate-notes"])
-        # macOS on a GitHub runner, Linux over SSH (no-op on GitHub Actions).
+        notes = os.path.join(ROOT, "dist", f"release-notes-{vtag}.md")
+        prev = subprocess.run(["git", "describe", "--tags", "--abbrev=0", f"{vtag}^"],
+                              cwd=ROOT, text=True, capture_output=True).stdout.strip()
+        log = subprocess.run(["git", "log", "--no-merges", "--format=- %s",
+                              f"{prev}..{vtag}" if prev else vtag],
+                             cwd=ROOT, text=True, capture_output=True).stdout
+        with open(notes, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"## Changes\n\n{log.strip() or '- Maintenance release.'}\n")
+        run([sys.executable, os.path.join(ROOT, "tools", "forgejo_release.py"), "create", vtag,
+             "--title", f"Caster {vtag}", "--notes-file", notes, "--asset", zp])
+        # macOS on the Forgejo Mac runner, Linux over SSH (no-op on Actions).
         run([sys.executable, os.path.join(ROOT, "tools", "release_other_platforms.py"), vtag])
 
 
