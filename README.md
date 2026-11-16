@@ -97,3 +97,9 @@ Caster is under the [MIT license](LICENSE) — use it, change it, redistribute i
 ## Community and support
 
 Report bugs and request features in [Issues](https://github.com/serrebidev/Caster/issues). For questions, feedback, and release news, join the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects).
+
+More serrebi projects: [projects.serrebiradio.com](https://projects.serrebiradio.com)
+
+## Credits
+
+See [CREDITS.md](CREDITS.md) for where the ideas behind this project came from, and the third-party projects it builds on.
