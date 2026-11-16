@@ -2350,7 +2350,11 @@ class MainFrame(wx.Frame):
                       "Casts URLs, files, the screen or an app window to "
                       "Chromecast, Sonos, Roku, Kodi, UPnP/DLNA and "
                       "AirPlay.\n\n"
-                      "Shortcuts: Help, Keyboard shortcuts.",
+                      "Shortcuts: Help, Keyboard shortcuts.\n\n"
+                      "Author: serrebidev. GitHub: https://github.com/serrebidev/Caster. "
+                      "Forgejo: https://git.serrebiradio.com/serrebi/Caster. "
+                      "Projects: https://projects.serrebiradio.com. "
+                      "Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.",
                       APP_TITLE, wx.ICON_INFORMATION),
                   mi_about)
         mb.Append(m, "&Device")
