@@ -170,7 +170,8 @@ def test_real_powershell_installs_nested_payload_with_literal_paths(tmp_path, mo
     try:
         assert all(child.poll() is None for child in children)
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=40)
+                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=40,
+                                env=calls[0][1]["env"])
         assert all(child.poll() is not None for child in children)
     finally:
         for child in children:

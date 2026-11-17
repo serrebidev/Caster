@@ -260,6 +260,10 @@ Remove-Item -LiteralPath $helperDir -Recurse -Force -ErrorAction SilentlyContinu
          "-File", script],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, creationflags=flags,
+        # PowerShell 7 exports its own PSModulePath; Windows PowerShell 5.1
+        # inheriting it (Caster started from a pwsh terminal) cannot load
+        # its built-in modules and the update never installs.
+        env={k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"},
     )
 
 
