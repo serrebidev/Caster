@@ -38,6 +38,8 @@ from typing import Any, Optional
 
 import wx
 
+from about_dialog import serrebi_links, show_about
+
 import pychromecast
 import pyatv
 import zeroconf
@@ -2345,17 +2347,14 @@ class MainFrame(wx.Frame):
         self.mi_update_id = mi_update.GetId()
         mi_about = h.Append(wx.ID_ABOUT, "&About")
         self.Bind(wx.EVT_MENU,
-                  lambda e: wx.MessageBox(
-                      f"{APP_TITLE} {APP_VERSION}\n\n"
+                  lambda e: show_about(
+                      self, f"About {APP_TITLE}", f"{APP_TITLE} {APP_VERSION}",
                       "Casts URLs, files, the screen or an app window to "
                       "Chromecast, Sonos, Roku, Kodi, UPnP/DLNA and "
                       "AirPlay.\n\n"
                       "Shortcuts: Help, Keyboard shortcuts.\n\n"
-                      "Author: serrebidev. GitHub: https://github.com/serrebidev/Caster. "
-                      "Forgejo: https://git.serrebiradio.com/serrebi/Caster. "
-                      "Projects: https://projects.serrebiradio.com. "
-                      "Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.",
-                      APP_TITLE, wx.ICON_INFORMATION),
+                      "Author: serrebidev.",
+                      serrebi_links("serrebidev/Caster", "serrebi/Caster", branch="master")),
                   mi_about)
         mb.Append(m, "&Device")
         mb.Append(self._menu_favourites, "&Favourites")
