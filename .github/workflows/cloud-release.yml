@@ -1,8 +1,8 @@
 name: Cloud Release
 
-# Muse agent and cloud agents ONLY. On the Windows release host run `py release.py patch`.
+# Every public release runs here, on GitHub runners.
 # Windows runs the same release.py on a GitHub runner (bump, commit, tag,
-# PyInstaller, ffmpeg, Caster-portable.zip, GitHub release). macOS and Linux
+# PyInstaller, ffmpeg, Caster-portable.zip, Forgejo release). macOS and Linux
 # then build that tag with build.sh and attach Caster-macos.zip and
 # Caster-linux-x86_64.tar.gz.
 #
@@ -85,9 +85,27 @@ jobs:
         if: ${{ inputs.dry_run }}
         run: python release.py --no-bump
 
+      - name: Send release pushes to Forgejo
+        if: ${{ !inputs.dry_run }}
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: git remote set-url --push origin "https://x-access-token:$env:FORGEJO_TOKEN@git.serrebiradio.com/serrebi/Caster.git"
+
       - name: Release
         if: ${{ !inputs.dry_run }}
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
         run: python release.py ${{ inputs.bump }}
+
+      - name: Push the release commit and tag to GitHub
+        if: ${{ !inputs.dry_run }}
+        run: |
+          $tag = git describe --tags --exact-match HEAD
+          if ($LASTEXITCODE -ne 0) { throw "No release tag on HEAD" }
+          git push "https://github.com/$env:GITHUB_REPOSITORY.git" HEAD:master
+          if ($LASTEXITCODE -ne 0) { throw "git push master failed" }
+          git push "https://github.com/$env:GITHUB_REPOSITORY.git" $tag
+          if ($LASTEXITCODE -ne 0) { throw "git push $tag failed" }
 
       - name: Record tag
         id: tag
@@ -161,4 +179,6 @@ jobs:
 
       - name: Attach to release
         if: ${{ !inputs.dry_run }}
-        run: gh release upload "${{ needs.windows.outputs.tag }}" "dist/${{ matrix.asset }}" --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: python3 tools/forgejo_release.py upload "${{ needs.windows.outputs.tag }}" "dist/${{ matrix.asset }}"

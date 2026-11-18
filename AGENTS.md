@@ -35,8 +35,8 @@ to fail with a locked executable. Allow bounded graceful shutdown, then force
 termination and verify exit. Tests substitute unique process names and must
 never terminate a user's running Caster processes.
 
-Local releases (this Windows host): `py release.py patch` does every platform. Windows builds locally; then `tools/release_other_platforms.py` dispatches `.github/workflows/macos-release.yml` (macOS on a GitHub runner), builds Linux over `ssh wsl-build` (local WSL Ubuntu, Docker) with `tools/build_linux_remote.sh` (throwaway ubuntu:24.04 container, launch check; `LINUX_BUILD_HOST` overrides), uploads it and waits for the macOS asset. If that half fails after publishing, rerun `python tools/release_other_platforms.py vX.Y.Z`. Never use cloud-release.yml from this host.
-Muse agent and cloud agents ONLY: `.github/workflows/cloud-release.yml` builds every platform on
+Recovery only: a local `py release.py patch` does every platform. Windows builds locally; then `tools/release_other_platforms.py` dispatches `.github/workflows/macos-release.yml` (macOS on a GitHub runner), builds Linux over `ssh wsl-build` (local WSL Ubuntu, Docker) with `tools/build_linux_remote.sh` (throwaway ubuntu:24.04 container, launch check; `LINUX_BUILD_HOST` overrides), uploads it and waits for the macOS asset. If that half fails after publishing, rerun `python tools/release_other_platforms.py vX.Y.Z`. Never use cloud-release.yml from this host.
+Publish every release with `.github/workflows/cloud-release.yml`, from any machine. It builds every platform on
 GitHub runners. Windows runs the same `release.py` (bump input: patch/minor/major;
 real ffmpeg.exe from Chocolatey put first on PATH, never the choco shim). macOS
 (`Caster-macos.zip`) and Linux (`Caster-linux-x86_64.tar.gz`) then build the tag with
