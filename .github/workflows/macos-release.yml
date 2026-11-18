@@ -19,7 +19,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     env:
-      FORGEJO_TOKEN: ${{ github.token }}
+      FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
       TAG: ${{ inputs.release_tag }}
     steps:
       - uses: actions/checkout@v7
@@ -36,7 +36,7 @@ jobs:
       - name: Attach to release
         run: |
           cp "dist/Caster-macos.zip" "Caster-macos.zip"
-          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          api="https://git.serrebiradio.com/api/v1/repos/serrebi/Caster"
           h="Authorization: token $FORGEJO_TOKEN"
           release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"
           id="$(echo "$release" | jq -r .id)"
