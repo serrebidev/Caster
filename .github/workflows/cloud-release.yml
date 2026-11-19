@@ -137,7 +137,7 @@ jobs:
           - os: ubuntu-24.04
             asset: Caster-linux-x86_64.tar.gz
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
         with:
@@ -160,6 +160,16 @@ jobs:
             libjpeg-dev libpng-dev libtiff-dev libsm-dev libxtst-dev
           python3 -m venv --system-site-packages .venv
           echo "PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
+
+      # wxPython compiles from source on Linux and outlasted a 45-minute limit.
+      # pip keeps the built wheel here, so later runs skip the compile.
+      - name: Cache built wheels
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: pip-linux-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-linux-
 
       - name: Build
         run: ./build.sh
