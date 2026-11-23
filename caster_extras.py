@@ -28,6 +28,8 @@ import time
 import urllib.parse
 import urllib.request as _urlreq
 
+from caster_metadata import didl_metadata_fields, xml_text
+
 
 def _find_ffmpeg() -> str:
     if getattr(__import__("sys"), "frozen", False):
@@ -398,11 +400,15 @@ def _soap(control_url: str, action: str, inner: str) -> None:
 
 
 def upnp_play(control_url: str, media_url: str, title: str = "Caster",
-              mime: str = "", upnp_class: str = "object.item.videoItem") -> None:
+              mime: str = "", upnp_class: str = "object.item.videoItem",
+              *, track=None) -> None:
     """Send an AVTransport SetAVTransportURI + Play SOAP pair."""
     escaped = (media_url.replace("&", "&amp;")
                .replace("<", "&lt;").replace(">", "&gt;"))
-    t = title.replace("&", "&amp;").replace("<", "&lt;")
+    if track is not None:
+        title = track.title or title
+    t = xml_text(title)
+    metadata = didl_metadata_fields(track)
     proto = mime or "*"
     didl = (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
@@ -410,6 +416,7 @@ def upnp_play(control_url: str, media_url: str, title: str = "Caster",
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
         '<item id="" parentID="0" restricted="1">'
         f"<dc:title>{t}</dc:title>"
+        f"{metadata}"
         f"<upnp:class>{upnp_class}</upnp:class>"
         f"<res protocolInfo=\"http-get:*:{proto}:DLNA.ORG_OP=01;DLNA.ORG_CI=0\">{escaped}</res></item></DIDL-Lite>"
     )
@@ -533,6 +540,7 @@ class FileServer:
                      or mimetypes.guess_type(self.path)[0]
                      or "application/octet-stream")
         self._name = os.path.basename(self.path)
+        self.artwork: tuple[str, bytes] | None = None
         self.httpd = None
         self.port = 0
 
@@ -543,10 +551,30 @@ class FileServer:
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
-                self._serve(include_body=True)
+                self._serve_request(include_body=True)
 
             def do_HEAD(self):
-                self._serve(include_body=False)
+                self._serve_request(include_body=False)
+
+            def _serve_request(self, include_body: bool) -> None:
+                if urllib.parse.urlsplit(self.path).path == "/artwork/cover":
+                    self._serve_artwork(include_body)
+                else:
+                    self._serve(include_body)
+
+            def _serve_artwork(self, include_body: bool) -> None:
+                artwork = fs.artwork
+                if artwork is None:
+                    self.send_error(404)
+                    return
+                mime, data = artwork
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(data)
 
             def _serve(self, include_body: bool) -> None:
                 size = os.path.getsize(fs.path)
