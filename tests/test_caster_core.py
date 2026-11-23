@@ -2394,6 +2394,8 @@ def test_cast_file_makes_the_receiver_a_volume_target(frame, monkeypatch):
     frame.selected_device = lambda: dev
     frame.stop_silent = lambda: None
     frame.set_status = lambda *args, **kwargs: None
+    monkeypatch.setattr(caster.threading, "Thread", _SyncThread)
+    frame._ui = lambda fn, *args: fn(*args)
     frame._play_sonos = lambda *args: None
     frame.cast_file("C:/media/song.mp3")
     assert frame._targets == [dev]
@@ -2403,8 +2405,13 @@ def test_cast_file_makes_the_receiver_a_volume_target(frame, monkeypatch):
 def cast_worker(frame, monkeypatch):
     """_play_chromecast run synchronously against a fake receiver."""
     loads, messages, stopped = [], [], []
-    mc = types.SimpleNamespace(
-        status=None, play_media=lambda *args, **kwargs: loads.append(args))
+    load_kwargs = []
+
+    def play_media(*args, **kwargs):
+        loads.append(args)
+        load_kwargs.append(kwargs)
+
+    mc = types.SimpleNamespace(status=None, play_media=play_media)
     receiver = types.SimpleNamespace(
         wait=lambda *args: None, app_id=MainFrame.CAST_APP_ID,
         media_controller=mc, status=None,
@@ -2424,7 +2431,8 @@ def cast_worker(frame, monkeypatch):
     dev = Device("chromecast", "RB Room",
                  {"host": "192.0.2.73", "port": 8009,
                   "uuid": "0123456789abcdef0123456789abcdef"})
-    return types.SimpleNamespace(dev=dev, loads=loads, messages=messages,
+    return types.SimpleNamespace(dev=dev, loads=loads, load_kwargs=load_kwargs,
+                                 messages=messages,
                                  stopped=stopped)
 
 
@@ -2441,10 +2449,14 @@ def test_a_file_the_receiver_refuses_is_converted_through_the_relay(
         built.append(kwargs)
         return types.SimpleNamespace(start=lambda: "http://192.0.2.1:9/live.m3u8")
     frame._make_relay = make_relay
-    frame._play_chromecast(cast_worker.dev, "http://192.0.2.1:9000/clip.avi")
+    track = caster.TrackMetadata("Movie soundtrack", "Composer")
+    frame._play_chromecast(cast_worker.dev, "http://192.0.2.1:9000/clip.avi",
+                           track=track)
     assert built == [{"live": False}]
     assert cast_worker.loads[-1][:2] == ("http://192.0.2.1:9/live.m3u8",
                                         "application/vnd.apple.mpegurl")
+    assert cast_worker.load_kwargs[-1]["metadata"]["title"] == "Movie soundtrack"
+    assert cast_worker.load_kwargs[-1]["metadata"]["artist"] == "Composer"
 
 
 @pytest.mark.parametrize("codecs,video,audio", [

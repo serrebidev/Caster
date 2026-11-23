@@ -10,3 +10,4 @@ pyaudiowpatch>=0.2.12.8; sys_platform == "win32"
 # Sonos. Optional: without it every other protocol still works and Sonos
 # speakers simply do not appear in the device list.
 soco>=0.31.4
+tinytag>=2.1.2

@@ -14,16 +14,57 @@ import io
 import queue
 import socket
 import struct
+import urllib.error
+import urllib.request
 
 import pytest
 
 import caster_extras
-from caster_extras import (CONTAINERS, AudioTap, ScreenSource,
+from caster_extras import (CONTAINERS, AudioTap, FileServer, ScreenSource,
                            _upnp_fetch_control, grabber_machine_key,
                            mdns_host, pick_screen_grabber, ssdp_sockets,
                            upnp_discover, upnp_sink_mimes, wav_header)
 
 DESC_URL = "http://192.168.1.65:49154/desc/device.xml"
+
+
+def test_file_server_artwork_get_head_and_missing_route(tmp_path):
+    media = tmp_path / "media.mp4"
+    media.write_bytes(b"media payload")
+    server = FileServer(str(media))
+    server.artwork = ("image/jpeg", b"cover bytes")
+    server.start()
+    url = f"http://127.0.0.1:{server.port}/artwork/cover"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"] == "image/jpeg"
+            assert response.headers["Content-Length"] == "11"
+            assert response.headers["Access-Control-Allow-Origin"] == "*"
+            assert response.read() == b"cover bytes"
+        request = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(request, timeout=2) as response:
+            assert response.status == 200
+            assert response.headers["Content-Length"] == "11"
+            assert response.read() == b""
+    finally:
+        server.stop()
+
+    missing = FileServer(str(media))
+    missing.start()
+    url = f"http://127.0.0.1:{missing.port}/artwork/cover"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(url, timeout=2)
+        assert error.value.code == 404
+        error.value.close()
+        request = urllib.request.Request(url, method="HEAD")
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=2)
+        assert error.value.code == 404
+        error.value.close()
+    finally:
+        missing.stop()
 
 
 class _Response(io.BytesIO):

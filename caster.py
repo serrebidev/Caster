@@ -34,6 +34,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import uuid as uuidlib
+from dataclasses import replace
 from typing import Any, Optional
 
 import wx
@@ -45,6 +46,7 @@ import pyatv
 import zeroconf
 from pyatv.const import PairingRequirement, Protocol
 from pychromecast.const import CAST_TYPE_CHROMECAST
+from pychromecast.controllers.media import METADATA_TYPE_MUSICTRACK
 from pychromecast.controllers.youtube import YouTubeController
 from pychromecast.models import CastInfo, HostServiceInfo
 
@@ -72,6 +74,7 @@ from caster_extras import (
 )
 
 from caster_config import Settings, preset
+from caster_metadata import TrackMetadata, read_local_track
 from caster_devices import (
     kodi_discover,
     kodi_pause,
@@ -3208,7 +3211,8 @@ class MainFrame(wx.Frame):
     # ---- Sonos ----
 
     def _play_sonos(self, dev: Device, url: str, mime: str = "",
-                    title: str = APP_TITLE, *, radio_session=None) -> None:
+                    title: str = APP_TITLE, track: TrackMetadata | None = None,
+                    *, radio_session=None) -> None:
         def worker() -> None:
             try:
                 station = None
@@ -3238,10 +3242,14 @@ class MainFrame(wx.Frame):
                 # WAV in its DIDL misdescribes it to the speaker.
                 if station:
                     sonos_play(dev.key["ip"], url,
-                               title, mime or station.mime, station=station)
-                else:
+                               title, mime or station.mime, station=station,
+                               track=track)
+                elif track is None:
                     sonos_play(dev.key["ip"], url,
                                title, mime or guess_mime(url))
+                else:
+                    sonos_play(dev.key["ip"], url,
+                               title, mime or guess_mime(url), track=track)
                 self._ui(self.set_status, f"Playing on {dev.name}.")
             except Exception as exc:
                 message = f"Sonos error: {exc}"
@@ -3288,7 +3296,8 @@ class MainFrame(wx.Frame):
 
     def _play_upnp(self, dev: Device, url: str, mime: str = "",
                    title: str = APP_TITLE,
-                   is_live: Optional[bool] = None) -> None:
+                   is_live: Optional[bool] = None,
+                   track: TrackMetadata | None = None) -> None:
         """Serve the URL through the local HLS relay when needed, then push
         it to the renderer via AVTransport.
 
@@ -3300,7 +3309,7 @@ class MainFrame(wx.Frame):
             relay = None
             try:
                 if mime:
-                    self._upnp_push(dev, url, mime, title)
+                    self._upnp_push(dev, url, mime, title, track)
                     return
                 probe = probe_media(url)
                 if is_live is not None:
@@ -3325,7 +3334,7 @@ class MainFrame(wx.Frame):
                     dev, play_url,
                     probe["mime"] if play_url == url
                     else "application/vnd.apple.mpegurl",
-                    title)
+                    title, track)
             except Exception as exc:
                 message = f"UPnP error: {exc}"
                 self._ui(self.set_status, message)
@@ -3334,7 +3343,7 @@ class MainFrame(wx.Frame):
         self.set_status(f"Connecting to {dev.name}...")
 
     def _upnp_push(self, dev: Device, play_url: str, mime: str,
-                   title: str) -> None:
+                   title: str, track: TrackMetadata | None = None) -> None:
         """SetAVTransportURI + Play, with the DIDL metadata the renderer
         needs to accept the stream."""
         control_url = dev.key["control_url"]
@@ -3349,7 +3358,8 @@ class MainFrame(wx.Frame):
             yxc_set_input(host, "server")
         upnp_play(control_url, play_url, title, mime,
                   "object.item.audioItem.musicTrack"
-                  if mime.startswith("audio/") else "object.item.videoItem")
+                  if mime.startswith("audio/") else "object.item.videoItem",
+                  track=track)
         self._ui(self.set_status, f"Playing on {dev.name}.")
 
     # ---- Chromecast ----
@@ -3468,20 +3478,34 @@ class MainFrame(wx.Frame):
                         startup_seconds=chosen["hls_start_seconds"],
                         codecs=codecs, live=live)
 
-    def _cast_load_options(self, url: str) -> dict:
+    def _cast_load_options(self, url: str,
+                           track: TrackMetadata | None = None) -> dict:
         """Use the buffered start of our live relay; Cast clamps to its window.
 
         With no currentTime, the receiver chooses the live edge and ignores
         most of the retained history. Only apply this to a relay we own, so
         external playlists and finite media retain their normal behaviour.
         """
+        options = {}
+        if track:
+            metadata = {"metadataType": METADATA_TYPE_MUSICTRACK,
+                        "title": track.title}
+            if track.artist:
+                metadata["artist"] = track.artist
+            if track.album:
+                metadata["albumName"] = track.album
+            if track.artwork_url:
+                metadata["images"] = [{"url": track.artwork_url}]
+            options["metadata"] = metadata
         for relay in getattr(self, "_relays", ()):
             if getattr(relay, "play_url", None) == url and relay.live:
-                return {"current_time": 0}
-        return {}
+                options["current_time"] = 0
+                break
+        return options
 
     def _play_chromecast(self, dev: Device, url: str, mime: str = "",
-                         is_live: Optional[bool] = None) -> None:
+                         is_live: Optional[bool] = None,
+                         track: TrackMetadata | None = None) -> None:
         """Load `url` on a Chromecast.
 
         `mime` and `is_live` short-circuit probing for streams this app is
@@ -3635,7 +3659,7 @@ class MainFrame(wx.Frame):
                     before = getattr(mc.status, "media_session_id", None)
                     mc.play_media(play_url, load_mime,
                                   stream_type=stream_type,
-                                  **self._cast_load_options(play_url))
+                                  **self._cast_load_options(play_url, track))
                     trace("cast.load", f"{load_mime} {stream_type} "
                                        f"prev_session={before}")
                     settled = self._await_playing(mc, before)
@@ -3652,7 +3676,7 @@ class MainFrame(wx.Frame):
                             return
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime, stream_type=stream_type,
-                                      **self._cast_load_options(play_url))
+                                      **self._cast_load_options(play_url, track))
                         settled = self._await_playing(mc, before)
                     if not settled:
                         # Load rejected; flip stream type and retry once.
@@ -3661,7 +3685,7 @@ class MainFrame(wx.Frame):
                         before = getattr(mc.status, "media_session_id", None)
                         mc.play_media(play_url, load_mime,
                                       stream_type=stream_type,
-                                      **self._cast_load_options(play_url))
+                                      **self._cast_load_options(play_url, track))
                         trace("cast.retry", stream_type)
                         settled = self._await_playing(mc, before)
                     if (not settled and relay is None and play_url == url
@@ -3682,7 +3706,9 @@ class MainFrame(wx.Frame):
                         load_mime = "application/vnd.apple.mpegurl"
                         stream_type = "BUFFERED"
                         before = getattr(mc.status, "media_session_id", None)
-                        mc.play_media(play_url, load_mime, stream_type=stream_type)
+                        mc.play_media(
+                            play_url, load_mime, stream_type=stream_type,
+                            **self._cast_load_options(play_url, track))
                         settled = self._await_playing(mc, before)
                     if settled:
                         if (probe["is_live"] and not self._stop_flag
@@ -4329,17 +4355,25 @@ class MainFrame(wx.Frame):
         # MPEG-TS reads as a live channel, and the live reader then fetched a
         # 2.8 MB .m2ts, reconnected every 0.2 s, discarded each full copy as
         # a replay, and the Cast never started.
-        def route() -> None:
+        def route(track: TrackMetadata | None = None) -> None:
             if self._stop_flag:
                 return
+            if track and track.artwork:
+                server.artwork = (track.artwork_mime, track.artwork)
+                track = replace(track, artwork_url=urllib.parse.urljoin(
+                    url, "/artwork/cover"))
+            title = track.title if track else name
             if dev.kind == "chromecast":
-                self._play_chromecast(dev, url, is_live=False)
+                self._play_chromecast(dev, url, is_live=False, track=track)
             elif dev.kind == "upnp":
-                self._play_upnp(dev, url, is_live=False)
+                self._play_upnp(dev, url, title=title, is_live=False,
+                                track=track)
             elif dev.kind == "sonos":
-                self._play_sonos(dev, url, server.mime, name)
+                self._play_sonos(dev, url, server.mime, title, track)
             elif dev.kind == "roku":
-                self._play_roku(dev, url, server.mime, name)
+                if track and track.artist:
+                    title = f"{track.artist} — {title}"
+                self._play_roku(dev, url, server.mime, title)
             elif dev.kind == "kodi":
                 self._play_kodi(dev, url)
             else:
@@ -4347,12 +4381,15 @@ class MainFrame(wx.Frame):
                 # the file itself: seekable, and no HTTP hop to the server.
                 self._play_airplay(dev, path, is_live=False)
 
-        if dev.musiccast:
-            # Wake the receiver and select its network input before the push,
-            # exactly as play() does, and off the UI thread for the same reason.
+        read_tags = (server.mime.startswith("audio/")
+                     and dev.kind in {"chromecast", "upnp", "sonos", "roku"})
+        if read_tags or dev.musiccast:
+            # Read optional tags and prepare MusicCast away from the UI thread.
             def prepare() -> None:
-                self._musiccast_prepare([dev])
-                self._ui(route)
+                track = read_local_track(path) if read_tags else None
+                if dev.musiccast:
+                    self._musiccast_prepare([dev])
+                self._ui(route, track)
             threading.Thread(target=prepare, daemon=True, name="play").start()
         else:
             route()
