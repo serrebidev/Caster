@@ -103,6 +103,7 @@ from caster_devices import (
     musiccast_ungroup,
     sonos_stop,
 )
+from caster_radio import radio_candidate, read_station_metadata
 from caster_ui import (
     HotkeyManager,
     NvdaSpeaker,
@@ -3140,6 +3141,7 @@ class MainFrame(wx.Frame):
         self._targets = list(devices)
 
         trace("play", str([d.label for d in devices]))
+        radio_session = self._targets
 
         def start() -> None:
             # Waking a receiver and aiming its input is several HTTP round
@@ -3149,7 +3151,14 @@ class MainFrame(wx.Frame):
             # is waiting to hear what happened. Dispatch goes back to the UI
             # thread, where the protocol handlers expect to be called.
             self._musiccast_prepare(devices)
-            self._ui(lambda: [self._dispatch(dev, url) for dev in devices])
+
+            def dispatch() -> None:
+                if self._stop_flag or self._targets is not radio_session:
+                    return
+                for dev in devices:
+                    self._dispatch(dev, url, radio_session=radio_session)
+
+            self._ui(dispatch)
         threading.Thread(target=start, daemon=True, name="play").start()
 
     def _group_sonos(self, devices: list) -> list:
@@ -3172,14 +3181,19 @@ class MainFrame(wx.Frame):
 
     def _dispatch(self, dev: Device, url: str, mime: str = "",
                   is_live: Optional[bool] = None,
-                  title: str = APP_TITLE) -> None:
+                  title: str = APP_TITLE,
+                  radio_session=None) -> None:
         """Send `url` to one device by whatever protocol it speaks."""
         if dev.kind == "chromecast":
             self._play_chromecast(dev, url, mime, is_live)
         elif dev.kind == "upnp":
             self._play_upnp(dev, url, mime, title)
         elif dev.kind == "sonos":
-            self._play_sonos(dev, url, mime, title)
+            if radio_session is None:
+                self._play_sonos(dev, url, mime, title)
+            else:
+                self._play_sonos(dev, url, mime, title,
+                                 radio_session=radio_session)
         elif dev.kind == "roku":
             self._play_roku(dev, url, mime, title)
         elif dev.kind == "kodi":
@@ -3194,13 +3208,40 @@ class MainFrame(wx.Frame):
     # ---- Sonos ----
 
     def _play_sonos(self, dev: Device, url: str, mime: str = "",
-                    title: str = APP_TITLE) -> None:
+                    title: str = APP_TITLE, *, radio_session=None) -> None:
         def worker() -> None:
             try:
+                station = None
+                if radio_session is not None and radio_candidate(url):
+                    probed = []
+                    complete = threading.Event()
+
+                    def probe() -> None:
+                        try:
+                            probed.append(read_station_metadata(url))
+                        except Exception:
+                            # Metadata is optional; probe failures must not
+                            # prevent the ordinary Sonos URL cast.
+                            probed.append(None)
+                        finally:
+                            complete.set()
+
+                    threading.Thread(target=probe, daemon=True,
+                                     name="sonos-station-metadata").start()
+                    if complete.wait(2.0) and probed:
+                        station = probed[0]
+                # Do not let a delayed lookup replace a newer selection.
+                if (radio_session is not None and
+                        (self._stop_flag or self._targets is not radio_session)):
+                    return
                 # A URL cast has no mime; tagging an MP3 or radio stream as
                 # WAV in its DIDL misdescribes it to the speaker.
-                sonos_play(dev.key["ip"], url,
-                           title, mime or guess_mime(url))
+                if station:
+                    sonos_play(dev.key["ip"], url,
+                               title, mime or station.mime, station=station)
+                else:
+                    sonos_play(dev.key["ip"], url,
+                               title, mime or guess_mime(url))
                 self._ui(self.set_status, f"Playing on {dev.name}.")
             except Exception as exc:
                 message = f"Sonos error: {exc}"

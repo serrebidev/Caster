@@ -138,7 +138,7 @@ def _sonos_coordinator(device):
     return device
 
 
-def sonos_didl(title: str, url: str, mime: str) -> str:
+def sonos_didl(title: str, url: str, mime: str, *, artwork_url: str = "") -> str:
     """DIDL-Lite for a live stream from this machine.
 
     Tagged as a plain music track on purpose. SoCo's play_uri shortcut
@@ -154,19 +154,28 @@ def sonos_didl(title: str, url: str, mime: str) -> str:
         'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
         '<item id="1" parentID="0" restricted="1">'
         f"<dc:title>{escape(title)}</dc:title>"
-        "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+        + (f'<upnp:albumArtURI>{escape(artwork_url)}</upnp:albumArtURI>'
+           if artwork_url else "")
+        + "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
         f'<res protocolInfo="http-get:*:{escape(mime)}:*">{escape(url)}</res>'
         "</item></DIDL-Lite>"
     )
 
 
 def sonos_play(ip: str, url: str, title: str = "Caster",
-               mime: str = "audio/wav") -> None:
+               mime: str = "audio/wav", *, station=None) -> None:
     zone = _sonos_coordinator(_sonos_device(ip))
+    transport_uri = url
+    if (station and station.mime in ("audio/mpeg", "audio/aac", "audio/aacp")
+            and url.lower().startswith("http://")):
+        transport_uri = "x-rincon-mp3radio:" + url.split(":", 1)[1]
+        mime = station.mime
     zone.avTransport.SetAVTransportURI([
         ("InstanceID", 0),
-        ("CurrentURI", url),
-        ("CurrentURIMetaData", sonos_didl(title, url, mime)),
+        ("CurrentURI", transport_uri),
+        ("CurrentURIMetaData", sonos_didl(
+            station.name if station else title, url, mime,
+            artwork_url=station.logo_url if station else "")),
     ])
     zone.avTransport.Play([("InstanceID", 0), ("Speed", 1)])
 
