@@ -28,6 +28,8 @@ import urllib.parse
 import urllib.request as _urlreq
 import uuid
 
+from caster_metadata import didl_metadata_fields, xml_text
+
 from caster_extras import mdns_host, ssdp_sockets
 
 # ---------------------------------------------------------------------------
@@ -138,7 +140,7 @@ def _sonos_coordinator(device):
     return device
 
 
-def sonos_didl(title: str, url: str, mime: str) -> str:
+def sonos_didl(title: str, url: str, mime: str, *, track=None) -> str:
     """DIDL-Lite for a live stream from this machine.
 
     Tagged as a plain music track on purpose. SoCo's play_uri shortcut
@@ -147,26 +149,29 @@ def sonos_didl(title: str, url: str, mime: str) -> str:
     radio rather than audio from a device on the LAN, and makes Sonos
     withhold its tone controls while it plays.
     """
-    from xml.sax.saxutils import escape
+    if track is not None:
+        title = track.title or title
+    details = didl_metadata_fields(track)
     return (
         '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
         'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
         '<item id="1" parentID="0" restricted="1">'
-        f"<dc:title>{escape(title)}</dc:title>"
+        f"<dc:title>{xml_text(title)}</dc:title>"
+        f"{details}"
         "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-        f'<res protocolInfo="http-get:*:{escape(mime)}:*">{escape(url)}</res>'
+        f'<res protocolInfo="http-get:*:{xml_text(mime)}:*">{xml_text(url)}</res>'
         "</item></DIDL-Lite>"
     )
 
 
 def sonos_play(ip: str, url: str, title: str = "Caster",
-               mime: str = "audio/wav") -> None:
+               mime: str = "audio/wav", *, track=None) -> None:
     zone = _sonos_coordinator(_sonos_device(ip))
     zone.avTransport.SetAVTransportURI([
         ("InstanceID", 0),
         ("CurrentURI", url),
-        ("CurrentURIMetaData", sonos_didl(title, url, mime)),
+        ("CurrentURIMetaData", sonos_didl(title, url, mime, track=track)),
     ])
     zone.avTransport.Play([("InstanceID", 0), ("Speed", 1)])
 
