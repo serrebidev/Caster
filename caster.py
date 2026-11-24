@@ -39,7 +39,7 @@ from typing import Any, Optional
 
 import wx
 
-from about_dialog import serrebi_links, show_about
+from about_dialog import report_issue, serrebi_links, show_about
 
 import pychromecast
 import pyatv
@@ -2349,6 +2349,11 @@ class MainFrame(wx.Frame):
         mi_update = h.Append(wx.ID_ANY, "Check for &updates...",
                              "Check GitHub Releases for a newer Caster")
         self.mi_update_id = mi_update.GetId()
+        mi_report = h.Append(wx.ID_ANY, "Report an &issue on GitHub...",
+                             "Describe a problem or an idea, then send it as a GitHub issue")
+        self.Bind(wx.EVT_MENU,
+                  lambda e: report_issue(self, "serrebidev/Caster", f"{APP_TITLE} {APP_VERSION}"),
+                  mi_report)
         mi_about = h.Append(wx.ID_ABOUT, "&About")
         self.Bind(wx.EVT_MENU,
                   lambda e: show_about(
