@@ -1272,6 +1272,23 @@ def list_input_devices() -> list:
     return devices
 
 
+def silence_bytes(rate: int, channels: int, seconds: float) -> bytes:
+    """`seconds` of silent s16le PCM at `rate`/`channels`."""
+    return b"\x00" * (int(rate * seconds) * channels * 2)
+
+
+#: How long a stream consumer waits for captured audio before filling the
+#: gap with silence. Capture normally delivers every PERIOD (20 ms), so a
+#: wait this long means the tap has genuinely stalled -- a paused player
+#: or a track change can stop a WASAPI loopback endpoint delivering at
+#: all on some drivers, whatever it is supposed to do. A receiver left
+#: with nothing to play drains its buffer and stops the stream for good
+#: (a Sonos then needs a fresh cast to start again), so the gap is filled
+#: at the same rate real audio would have arrived: the receiver's clock
+#: keeps running and the next real sound simply takes over.
+STALL_FILL_SECONDS = 0.25
+
+
 def wav_header(rate: int, channels: int, data_bytes: int) -> bytes:
     """A 44-byte canonical PCM WAV header declaring `data_bytes` of samples."""
     block = channels * 2
@@ -1324,15 +1341,24 @@ class LiveWavReader(io.BufferedIOBase):
 
     def read(self, size: int = -1) -> bytes:
         want = 65536 if size in (-1, None) else max(int(size), 1)
+        last = time.monotonic()
         while not self._eof and len(self._buf) < want:
             try:
-                chunk = self._q.get(timeout=5)
+                chunk = self._q.get(timeout=STALL_FILL_SECONDS)
             except queue.Empty:
-                break               # capture stalled; hand back what we have
+                # Capture stalled: fill with silence rather than handing
+                # back a short read, which a decoder can take for the end
+                # of the stream. See STALL_FILL_SECONDS.
+                now = time.monotonic()
+                self._buf += silence_bytes(
+                    self._tap.rate, self._tap.channels, now - last)
+                last = now
+                continue
             if chunk is None:       # unsubscribed
                 self._eof = True
                 break
             self._buf += chunk
+            last = time.monotonic()
         data, self._buf = bytes(self._buf[:want]), self._buf[want:]
         return data
 
@@ -1688,14 +1714,19 @@ class ScreenSource:
         q = tap.subscribe()
         try:
             write(wav_header(tap.rate, tap.channels, ENDLESS_WAV_BYTES))
+            last = time.monotonic()
             while not self._stopped:
                 try:
-                    chunk = q.get(timeout=5)
+                    chunk = q.get(timeout=STALL_FILL_SECONDS)
                 except queue.Empty:
+                    now = time.monotonic()
+                    write(silence_bytes(tap.rate, tap.channels, now - last))
+                    last = now
                     continue
                 if chunk is None:
                     break
                 write(chunk)
+                last = time.monotonic()
         finally:
             tap.unsubscribe(q)
 
@@ -1749,16 +1780,27 @@ class ScreenSource:
 
     def _feed_audio(self, proc, q) -> None:
         """Write captured PCM into ffmpeg's stdin for as long as it wants it."""
+        tap = self.tap
+        last = time.monotonic()
         try:
             while not self._stopped and proc.poll() is None:
                 try:
-                    chunk = q.get(timeout=1)
+                    chunk = q.get(timeout=STALL_FILL_SECONDS)
                 except queue.Empty:
+                    # Same stall fill as _pump_pcm: an encoder starved of
+                    # input produces no output, and the receiver behind it
+                    # drains and stops.
+                    now = time.monotonic()
+                    proc.stdin.write(
+                        silence_bytes(tap.rate, tap.channels, now - last))
+                    proc.stdin.flush()
+                    last = now
                     continue
                 if chunk is None:
                     break
                 proc.stdin.write(chunk)
                 proc.stdin.flush()
+                last = time.monotonic()
         except (BrokenPipeError, OSError, ValueError):
             pass                     # ffmpeg exited, or the client hung up
         finally:

@@ -194,6 +194,23 @@ def sonos_stop(ip: str) -> None:
         pass
 
 
+def sonos_transport_state(ip: str) -> str:
+    """The speaker's transport state ("PLAYING", "PAUSED_PLAYBACK",
+    "STOPPED", "TRANSITIONING", ...), or "" when it cannot be asked.
+
+    This is the only way to tell a Sonos that gave up on a stream apart
+    from one that is happily playing it: it pulls the stream over HTTP,
+    so a speaker that stops simply closes its connection and nothing on
+    this side notices.
+    """
+    try:
+        info = _sonos_coordinator(
+            _sonos_device(ip)).get_current_transport_info()
+        return str(info.get("current_transport_state") or "")
+    except Exception:
+        return ""
+
+
 def sonos_set_volume(ip: str, level: int) -> None:
     try:
         _sonos_device(ip).volume = max(0, min(100, int(level)))

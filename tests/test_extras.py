@@ -14,6 +14,7 @@ import io
 import queue
 import socket
 import struct
+import types
 import urllib.error
 import urllib.request
 
@@ -1035,6 +1036,80 @@ def test_unsubscribe_stops_delivery_and_wakes_a_blocked_reader():
     tap._publish(b"after")
     with pytest.raises(queue.Empty):
         q.get_nowait()
+
+
+# ---------------------------------------------------------------------------
+# Stall fill: a stalled capture must not starve the receiver (issue #5)
+# ---------------------------------------------------------------------------
+
+def _run_until(src, fn, writes, seconds=0.9):
+    import threading
+    import time
+    thread = threading.Thread(target=fn, daemon=True)
+    thread.start()
+    time.sleep(seconds)
+    src._stopped = True
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
+def test_silence_bytes_is_s16le_sized():
+    assert caster_extras.silence_bytes(48000, 2, 0.5) == b"\x00" * 96000
+    assert caster_extras.silence_bytes(44100, 1, 1.0) == b"\x00" * 88200
+
+
+def test_pump_pcm_fills_a_capture_stall_with_silence():
+    """Guards against a paused player ending the cast (issue #5).
+
+    When playback pauses or a track changes, a WASAPI loopback endpoint
+    can stop delivering altogether. The pump used to sit on the queue
+    writing nothing, the Sonos buffer drained, and the speaker stopped
+    the stream for good -- only a fresh cast (Ctrl+Alt+A) brought it
+    back. A stall must now be filled with silence at the capture rate.
+    """
+    src = ScreenSource(container="wav")      # tap never started: no audio
+    writes = []
+    _run_until(src, lambda: src._pump_pcm(writes.append), writes)
+    data = b"".join(writes)
+    assert data[:4] == b"RIFF"
+    assert len(data) > 44 + 48000            # at least ~0.25 s of fill
+    assert set(data[44:]) == {0}             # and it is silence, not noise
+
+
+def test_feed_audio_fills_a_capture_stall_with_silence():
+    """The ffmpeg path starves the same way when its input dries up."""
+    src = ScreenSource(container="wav")
+
+    class Stdin:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, chunk):
+            self.data += chunk
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    proc = types.SimpleNamespace(stdin=Stdin(), poll=lambda: None)
+    q = src.tap.subscribe()
+    _run_until(src, lambda: src._feed_audio(proc, q), [])
+    data = bytes(proc.stdin.data)
+    assert len(data) > 48000
+    assert set(data) == {0}
+
+
+def test_live_wav_reader_fills_a_capture_stall_with_silence():
+    """A short read on a stall can read as end-of-stream to a decoder."""
+    tap = AudioTap()                          # never started: no audio
+    reader = caster_extras.LiveWavReader(tap)
+    data = reader.read(48000 * 4)
+    reader.close()
+    assert len(data) == 48000 * 4
+    assert data[:4] == b"RIFF"
+    assert set(data[44:]) == {0}
 
 
 # ---------------------------------------------------------------------------

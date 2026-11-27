@@ -105,6 +105,7 @@ from caster_devices import (
     musiccast_group,
     musiccast_ungroup,
     sonos_stop,
+    sonos_transport_state,
 )
 from caster_radio import radio_candidate, read_station_metadata
 from caster_ui import (
@@ -2167,6 +2168,7 @@ class MainFrame(wx.Frame):
         self._cast_recovering = set()
         self._cast_progress = {}
         self._cast_retry_at = {}
+        self._sonos_retry_at = {}
         self._atvs: dict[str, object] = {}
         self.stream_task: Optional[asyncio.Task] = None
         self._runner_fut: Optional[concurrent.futures.Future] = None
@@ -4450,6 +4452,7 @@ class MainFrame(wx.Frame):
         self._cast_live_loads = {}
         self._cast_progress = {}
         self._cast_retry_at = {}
+        self._sonos_retry_at = {}
         for cast in casts.values():
             self._release_cast(cast)
         # Also handle self.cast for code that still writes to it directly.
@@ -4927,7 +4930,46 @@ class MainFrame(wx.Frame):
                     return
             except Exception:
                 pass
+        self._check_sonos_reconnect(source)
         self._check_sonos_resync(source)
+
+    def _check_sonos_reconnect(self, source) -> None:
+        """Re-dispatch a live cast a Sonos has stopped on its own.
+
+        A Sonos that gives up on the stream -- its buffer drained during
+        a long pause or a slow track change, a network hiccup -- reports
+        STOPPED and stays there: it will not resume by itself, and until
+        now the only way back was casting again by hand (issue #5). A
+        speaker the user paused reports PAUSED_PLAYBACK instead, and a
+        deliberate pause must never be resumed, so only STOPPED is
+        recovered. The query is several HTTP round trips, so it runs off
+        the UI thread, and retries are spaced by CAST_RECOVERY_INTERVAL
+        so a speaker that keeps refusing is not hammered every tick.
+        """
+        sonos = [d for d in self._targets if d.kind == "sonos"]
+        if not sonos:
+            return
+        now = time.monotonic()
+        due = [d for d in sonos
+               if now >= self._sonos_retry_at.get(d.label, 0.0)]
+        if not due:
+            return
+        for dev in due:
+            self._sonos_retry_at[dev.label] = now + self.CAST_RECOVERY_INTERVAL
+
+        def worker() -> None:
+            for dev in due:
+                if self._stop_flag or dev not in self._targets:
+                    return
+                if sonos_transport_state(dev.key["ip"]) != "STOPPED":
+                    continue
+                self._ui(self.set_status,
+                         f"{dev.name} stopped; reconnecting...")
+                self._play_sonos(dev, source.url, source.mime,
+                                 f"{APP_TITLE}: system audio")
+
+        threading.Thread(target=worker, daemon=True,
+                         name="sonos-reconnect").start()
 
     CAST_STALL_TIMEOUT = 20.0
     CAST_RECOVERY_INTERVAL = 30.0

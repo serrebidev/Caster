@@ -78,6 +78,7 @@ def frame():
     obj._cast_recovering = set()
     obj._cast_progress = {}
     obj._cast_retry_at = {}
+    obj._sonos_retry_at = {}
     obj._atvs = {}
     obj._air_runner_futs = []
     obj._air_ffmpeg_procs = {}

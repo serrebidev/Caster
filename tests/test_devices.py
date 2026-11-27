@@ -19,7 +19,8 @@ import caster_devices
 from caster_devices import (LINK_AUDIO_DELAYS, LINK_CONTROLS,
                             ROKU_AUDIO_FORMATS, ROKU_MEDIA_PLAYER,
                             ROKU_VIDEO_FORMATS, looks_like_sonos,
-                            musiccast_group, sonos_didl, yxc_available,
+                            musiccast_group, sonos_didl, sonos_transport_state,
+                            yxc_available,
                             yxc_can, yxc_features, yxc_max_volume,
                             yxc_request, yxc_set_input,
                             yxc_set_link_audio_delay, yxc_set_link_control,
@@ -489,6 +490,26 @@ def test_musiccast_group_invents_a_group_id_when_the_unit_has_none(yxc,
 # ---------------------------------------------------------------------------
 # Sonos
 # ---------------------------------------------------------------------------
+
+def test_sonos_transport_state_reports_the_speakers_state(monkeypatch):
+    """The reconnect watchdog can only act on what the speaker reports."""
+    import types
+    zone = types.SimpleNamespace(
+        group=None,
+        get_current_transport_info=lambda: {
+            "current_transport_state": "STOPPED"})
+    monkeypatch.setattr(caster_devices, "_sonos_device", lambda ip: zone)
+    assert sonos_transport_state("192.0.2.1") == "STOPPED"
+
+
+def test_sonos_transport_state_is_empty_when_the_speaker_cannot_be_asked(
+        monkeypatch):
+    """An unreachable speaker must read as unknown, never as stopped."""
+    def gone(ip):
+        raise RuntimeError("no route")
+    monkeypatch.setattr(caster_devices, "_sonos_device", gone)
+    assert sonos_transport_state("192.0.2.1") == ""
+
 
 def test_sonos_didl_is_well_formed_and_a_music_track(no_network):
     """Guards against Sonos hiding its tone controls mid-cast.

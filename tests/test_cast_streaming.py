@@ -326,3 +326,44 @@ def test_a_channel_needing_keyframes_starts_that_way_next_time(monkeypatch):
     caster.HlsRelay._keyframe_urls.add(url)
     assert caster.HlsRelay(url, live=True).force_keyframes
     assert not caster.HlsRelay(url, live=False).force_keyframes
+
+
+# ---------------------------------------------------------------------------
+# Sonos reconnect watchdog (issue #5)
+# ---------------------------------------------------------------------------
+
+def _sonos_frame(frame, monkeypatch, state):
+    dev = types.SimpleNamespace(kind="sonos", label="Play:3", name="Play:3",
+                                key={"ip": "192.0.2.1"})
+    frame._targets = [dev]
+    frame._ui = lambda *a, **kw: None
+    frame.set_status = lambda *a, **kw: None
+    plays = []
+    frame._play_sonos = lambda *a, **kw: plays.append(a)
+    monkeypatch.setattr(caster, "sonos_transport_state", lambda ip: state)
+    monkeypatch.setattr(caster.threading, "Thread",
+                        lambda target, **kw: types.SimpleNamespace(
+                            start=target))
+    source = types.SimpleNamespace(url="http://192.0.2.2:9/live.wav",
+                                   mime="audio/wav")
+    return frame, source, plays
+
+
+def test_a_sonos_that_stopped_on_its_own_is_reconnected(frame, monkeypatch):
+    """Guards against issue #5: a Sonos that drops a live cast stayed
+    stopped until the user cast again by hand (Ctrl+Alt+A)."""
+    frame, source, plays = _sonos_frame(frame, monkeypatch, "STOPPED")
+    frame._check_sonos_reconnect(source)
+    assert len(plays) == 1
+    # The retry cooldown stops every watchdog tick re-dispatching.
+    frame._check_sonos_reconnect(source)
+    assert len(plays) == 1
+
+
+@pytest.mark.parametrize("state", ["PLAYING", "PAUSED_PLAYBACK",
+                                   "TRANSITIONING", ""])
+def test_a_sonos_not_stopped_is_left_alone(frame, monkeypatch, state):
+    """A deliberate pause (PAUSED_PLAYBACK) must never be resumed."""
+    frame, source, plays = _sonos_frame(frame, monkeypatch, state)
+    frame._check_sonos_reconnect(source)
+    assert not plays
